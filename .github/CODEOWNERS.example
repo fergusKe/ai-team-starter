@@ -1,0 +1,14 @@
+# 複製成 .github/CODEOWNERS，把 @YOUR_TEAM 換成真的 GitHub 帳號或 team。
+# 留著範例值等於沒設。
+
+# 預設：所有變更都要有人看過
+*                       @YOUR_TEAM
+
+# 執法層自己。CI 與 CODEOWNERS 若能被自由修改，
+# required check 與 required review 都能被安靜地拆掉。
+/.github/               @YOUR_TEAM
+
+# 規格與決策。改這些等於改已經談定的範圍。
+/openspec/              @YOUR_TEAM
+/docs/adr/              @YOUR_TEAM
+/AGENTS.md              @YOUR_TEAM

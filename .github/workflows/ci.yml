@@ -1,0 +1,63 @@
+# 這是**唯一真正擋得住東西的一層**。本地沒有任何 hook。
+#
+# 把它設成 branch ruleset 的 required check，否則它只是一個比較慢的提示。
+# 設完要實測：開一個故意失敗的 PR，親眼看到合併按鈕變灰。
+#
+# 下面是 Node 專案的預設形狀，依你的 stack 改。
+# Spec 那一關不綁 stack —— 任何語言的專案都該留著。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # job 名稱就是 required check 的名稱。改名字要同步改 ruleset 設定。
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      # 規格結構檢查。
+      #
+      # `npx openspec` 不帶套件名，解析到的是 node_modules/.bin/openspec ——
+      # 也就是 package-lock.json 鎖住的那個版本。**不要寫成
+      # `npx @fission-ai/openspec@x.y.z`**，那會去抓網路上的版本，
+      # 就繞過了 lockfile，等於沒鎖。
+      #
+      # 因為要先有 node_modules，這一關只能排在 npm ci 之後。
+      # 換到的是「CI 跟每個人本機跑的是同一份」。
+      #
+      # `--strict` 會抓沒有 Scenario 的 requirement、沒有 delta 的 change、
+      # 太短的 Purpose。真的沒有 spec 變更的 change（純重構、工具、文件）
+      # 要在它的 .openspec.yaml 標 skip_specs: true，不是把這關拿掉。
+      - name: Spec
+        run: npx openspec validate --all --strict
+
+      # 每一步都獨立列出來，不要串成一行 ——
+      # 串起來的話，看 log 分不出是哪一關紅的。
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

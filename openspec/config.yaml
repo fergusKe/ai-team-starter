@@ -1,0 +1,52 @@
+schema: spec-driven
+
+context: |
+  Language: zh-TW
+  All artifacts must be written in zh-TW.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  This project reviews specs on a draft PR before any implementation.
+  Specs are read by teammates who were not in the conversation that produced
+  them: never rely on context that only exists in chat.
+
+rules:
+  proposal:
+    - 必須寫「不做什麼」（Non-goals）。沒寫的話，之後一定有人順手做掉。
+    - 「為什麼現在做」要能回答「不做會怎樣」，不是只描述功能。
+
+  specs:
+    - 主 spec 的 `## Purpose` 至少要 50 個字元。**中文特別容易踩到這條** ——
+      英文 50 字元約 8 個單字，中文 50 字是兩三句話。寫成一句話會不夠。
+      這條在 change 階段驗不出來，是 archive 之後 main spec 才會紅，
+      也就是 PR 全綠、合併後 main 才爆。所以一開始就要寫夠。
+    - 每條 Requirement 至少要有一個 Scenario；沒有 Scenario 的需求不可測試。
+    - 除了正常路徑，必須有**失敗路徑**的 Scenario：輸入不合法、權限不足、
+      資源不存在、超過上限時會怎樣。
+    - 數值限制與預設值要寫進 Requirement 本身（長度、頻率、逾時、筆數上限），
+      不要留給實作決定。
+    - 有權限概念時要明寫誰能做什麼；沒有就寫「不適用：<理由>」。
+    - 併發與順序：同時發生會怎樣、有沒有順序要求。沒有就明寫沒有。
+    - 相容性：會不會破壞既有資料或既有呼叫端、怎麼轉換。
+    - 不適用的面向要**明寫「不適用」加一句理由**，不要留白 ——
+      留白分不出是「不需要」還是「忘了想」。
+    - 「使用者體驗要好」不是需求。每條都要能被一個 Scenario 證明。
+
+  design:
+    - 只寫難逆轉、有取捨的決定。選了什麼、代價是什麼。
+    - 用什麼 log 套件不用寫；資料放哪、認證怎麼做要寫。
+    - 重大決策同時在 `docs/adr/` 留一份 ADR，因為 change 會被 archive，ADR 不會。
+
+  tasks:
+    - 每條任務要對應到 specs 裡的某一條 Requirement。對不上的任務就是範圍蔓延。
+    - 第一條任務永遠是「規格已在 PR 上談定」。
+
+operations:
+  apply:
+    guidance:
+      - 先寫測試再寫實作。測試對應 Scenario。
+      - 發現規格有問題就停下來講，在 PR 上改規格 ——
+        不要一邊寫一邊把規格調整成已經寫出來的樣子。
+  archive:
+    guidance:
+      - archive 前確認 CI 是綠的，而且 PR 已經合併。
+      - sync 到 `openspec/specs/` 之後，那份才是「系統現在是什麼樣子」的答案。
