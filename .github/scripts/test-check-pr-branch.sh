@@ -133,6 +133,39 @@ run 1 main archive/demo-change "archive 之後竄改被封存的規格"        s
   f=$(ls -d openspec/changes/archive/*/specs/demo/spec.md)
   printf "\n#### Scenario: [DEMO-01-S09] 偷加的情境\n- **WHEN** a\n- **THEN** b\n" >> "$f"'
 
+run 1 main archive/demo-change "誘餌 archive 目錄不得遮蔽竄改"     sh -c '
+  npx openspec archive demo-change --yes
+  f=$(ls -d openspec/changes/archive/*/specs/demo/spec.md)
+  # 誘餌：排序在真正的 archive 之後、內容乾淨。
+  # 舊的 regex [^/]*<id>/ 會把它也算進來並覆蓋掉真的那一份 → 假通過。
+  mkdir -p openspec/changes/archive/2099-12-31-x-demo-change/specs/demo
+  cp openspec/changes/archive/*-demo-change/proposal.md openspec/changes/archive/2099-12-31-x-demo-change/
+  cp openspec/changes/archive/*-demo-change/tasks.md    openspec/changes/archive/2099-12-31-x-demo-change/
+  cp "$f" openspec/changes/archive/2099-12-31-x-demo-change/specs/demo/
+  printf "\n#### Scenario: [DEMO-01-S09] 偷加的情境\n- **WHEN** a\n- **THEN** b\n" >> "$f"
+  perl -0pi -e "s/TBD - created by archiving change [^\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md'
+
+run 1 main archive/demo-change "動到別的 change 的 archive"        sh -c '
+  npx openspec archive demo-change --yes
+  perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
+  mkdir -p openspec/changes/archive/2026-01-01-undemo-change
+  echo x > openspec/changes/archive/2026-01-01-undemo-change/proposal.md'
+
+run 1 main archive/demo-change "兩個目錄都配得上同一個 id"        sh -c '
+  npx openspec archive demo-change --yes
+  perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
+  cp -R openspec/changes/archive/*-demo-change openspec/changes/archive/2099-01-01-demo-change'
+
+run 1 main archive/demo-change "archive 裡多出 main 沒有的檔案"   sh -c '
+  npx openspec archive demo-change --yes
+  perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
+  d=$(ls -d openspec/changes/archive/*-demo-change)
+  echo "偷夾帶" > "$d/extra.md"'
+
+run 1 main archive/nonexistent "archive 一個不存在的 change"      sh -c '
+  mkdir -p openspec/specs/demo
+  printf "# demo Specification\n\n## Purpose\n這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。\n\n## Requirements\n\n### Requirement: R\n系統 SHALL 做事。\n\n#### Scenario: [DEMO-01-S01] a\n- **WHEN** a\n- **THEN** b\n" > openspec/specs/demo/spec.md'
+
 echo "── chore 的 lockfile 與 LFS ──"
 run 1 main chore/lock-whitespace "lockfile 塞入大量合法空白"         sh -c 'python3 -c "
 import io,json

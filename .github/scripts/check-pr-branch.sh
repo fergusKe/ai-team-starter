@@ -61,6 +61,9 @@ RANGE="origin/${BASE}...HEAD"
 # `-z` 是因為 git 對含空白或控制字元的路徑會加引號跳脫，
 # 那會讓下面的 grep 比對錯路徑。用 NUL 分隔取回來，再自己確認
 # 沒有任何路徑含換行 —— 有的話直接擋（fail-closed，不猜）。
+# （精度說明：command substitution 會剝掉結尾換行，所以「檔名以換行結尾
+#  且剛好排在輸出最後一筆」這個極端情況不會造成數量不符。它不構成繞法 ——
+#  剝掉之後仍然匹配 openspec/ 那些前綴 —— 但這個檢查不是「任何」都擋得到。）
 NUL_N="$(git diff -z --name-only --no-renames "$RANGE" | tr -dc '\0' | wc -c | tr -d ' ')"
 CHANGED="$(git diff -z --name-only --no-renames "$RANGE" | tr '\0' '\n' | sed '/^$/d')"
 [ "$NUL_N" = "0" ] && { echo "沒有變更。"; exit 0; }
@@ -262,29 +265,56 @@ def tree(ref, path):
 
 src = tree(f"origin/{base}", f"openspec/changes/{cid}/")
 dst = tree("HEAD", "openspec/changes/archive/")
+base_arch = tree(f"origin/{base}", "openspec/changes/archive/")
 
-# 只認這個 change 的 archive 目錄（目錄名是 <date>-<id>）
-pat = re.compile(rf"^openspec/changes/archive/[^/]*{re.escape(cid)}/(.*)$")
-arch = {}
-for fp, sha in dst.items():
-    m = pat.match(fp)
-    if m: arch[m.group(1)] = sha
+fail = []
 
+# ① base 上這個 change 必須存在。不然 src 是空的，下面每一條都真空成立。
+if not src:
+    fail.append(f"main 上沒有 openspec/changes/{cid}/ —— 沒有東西可以 archive")
+
+# ② 目的地必須**恰好一個**，而且目錄名是 <YYYY-MM-DD>-<id>。
+#
+# 日期前綴要錨定。寫成 `[^/]*<id>/` 的話 id `auth` 會配到 `...-unauth/`、
+# id `v2` 會配到 `...-auth-v2/`，而且是**假通過**方向的：
+# 一個排序在後、內容乾淨的誘餌目錄會覆蓋掉真正被竄改的那一份。
+dir_re = re.compile(rf"^openspec/changes/archive/([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-{re.escape(cid)})/(.*)$")
+dirs = {m.group(1) for fp in dst if (m := dir_re.match(fp))}
+if len(dirs) != 1:
+    fail.append(f"應該恰好有一個 archive/<日期>-{cid}/ 目錄，實際有 {len(dirs)} 個：{sorted(dirs)}")
+
+# ③ 不得順手動到別的 change 的 archive。
+touched_other = sorted(
+    fp for fp, sha in dst.items()
+    if not dir_re.match(fp) and base_arch.get(fp) != sha
+)
+if touched_other:
+    fail.append("動到了別的 change 的 archive：\n      " + "\n      ".join(touched_other[:5]))
+
+if fail:
+    print("✗ archive 的目的地不對：", file=sys.stderr)
+    for f in fail: print("    " + f, file=sys.stderr)
+    sys.exit(1)
+
+adir = dirs.pop()
+arch = {m.group(2): sha for fp, sha in dst.items() if (m := dir_re.match(fp)) and m.group(1) == adir}
+srcmap = {fp[len(f"openspec/changes/{cid}/"):]: sha for fp, sha in src.items()}
+
+# ④ **完全相等**，不是「每個來源檔案都找得到」。
+#    子集比對不會拒絕 archive 裡多出來的檔案。
 bad = []
-for fp, sha in sorted(src.items()):
-    rel = fp[len(f"openspec/changes/{cid}/"):]
-    got = arch.get(rel)
-    if got is None:
-        bad.append(f"{rel}：archive 裡找不到")
-    elif got != sha:
-        bad.append(f"{rel}：內容被改過（{sha[:8]} → {got[:8]}）")
+for rel in sorted(set(srcmap) | set(arch)):
+    a, b = srcmap.get(rel), arch.get(rel)
+    if a is None:   bad.append(f"{rel}：archive 裡多出來的檔案，main 上沒有")
+    elif b is None: bad.append(f"{rel}：archive 裡找不到")
+    elif a != b:    bad.append(f"{rel}：內容被改過（{a[:8]} → {b[:8]}）")
 
 if bad:
     print("✗ archive 不是原封不動的搬移：", file=sys.stderr)
     for b in bad: print("    " + b, file=sys.stderr)
     print("  archive 只能搬，不能順手改。要改內容請先開 spec/ 分支改規格。", file=sys.stderr)
     sys.exit(1)
-print(f"  ✓ {len(src)} 個檔案原封不動搬進 archive")
+print(f"  ✓ {len(srcmap)} 個檔案原封不動搬進 {adir}")
 ARCHIVE_IDENTITY
 
     # 兩個 validate 都要過。
