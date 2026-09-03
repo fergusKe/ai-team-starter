@@ -24,15 +24,41 @@ rules:
       資源不存在、超過上限時會怎樣。
     - 數值限制與預設值要寫進 Requirement 本身（長度、頻率、逾時、筆數上限），
       不要留給實作決定。
-    - 有權限概念時要明寫誰能做什麼；沒有就寫「不適用：<理由>」。
-    - 併發與順序：同時發生會怎樣、有沒有順序要求。沒有就明寫沒有。
-    - 相容性：會不會破壞既有資料或既有呼叫端、怎麼轉換。
-    - 不適用的面向要**明寫「不適用」加一句理由**，不要留白 ——
-      留白分不出是「不需要」還是「忘了想」。
+    - |
+      每個 Scenario 標一個穩定 ID，放在標題最前面的中括號裡：
+
+          #### Scenario: [AUTH-01-S01] 首次登入建立 session
+
+      格式是 `<工作項目 ID>-S<兩位數>`，同一個 change 內不重複。
+      前綴用你們工作分解表裡的 ID —— 這樣規格、任務、之後的測試
+      三邊講的是同一個東西。沒有工作分解表就用 capability 名稱。
+      **ID 一旦寫進 main 就不要改** —— 之後測試會用它對應回來，
+      改 ID 等於把那條對應關係悄悄拆掉。
+    - |
+      權限、併發、相容性這三項**不要在每條 Requirement 裡各寫一次
+      「不適用」**。整份 delta spec 最上面放一個 Applicability 區塊，
+      寫一次就好：
+
+          ## Applicability
+          權限：不適用 —— 本 change 不做授權判斷
+          併發：適用 —— render loop 與 network snapshot 同時寫入
+          持久資料相容性：不適用 —— 不讀寫持久資料
+          失敗路徑：適用 —— WebGL 不可用、WS 斷線、payload 不合法
+
+      逐條重複「不適用：純前端渲染」會讓每份規格多出三五行沒有資訊的字，
+      而 reviewer 會學會跳過那幾段 —— **然後連夾在中間真正的 Scenario
+      也一起跳過**。這個 repo 的信任錨是人讀規格，不要訓練他們略讀。
+    - Requirement 本身只寫真正適用、而且能被一個 Scenario 證明的事。
     - 「使用者體驗要好」不是需求。每條都要能被一個 Scenario 證明。
 
   design:
     - 只寫難逆轉、有取捨的決定。選了什麼、代價是什麼。
+    - |
+      **還不知道答案的常數不要寫進 Requirement。** threshold、係數、
+      collider 形狀這種要靠實作量出來的東西，列成 design 的待答問題。
+      把猜測寫成「需求」之後，實作只會回頭去改那個數字，規格 review 就白做了。
+      量出來之後如果它改變了某條 Requirement 或 Scenario，
+      **回去重開 spec PR 讓人重新批准**，不要就地改。
     - 用什麼 log 套件不用寫；資料放哪、認證怎麼做要寫。
     - 重大決策同時在 `docs/adr/` 留一份 ADR，因為 change 會被 archive，ADR 不會。
 
@@ -48,5 +74,18 @@ operations:
         不要一邊寫一邊把規格調整成已經寫出來的樣子。
   archive:
     guidance:
-      - archive 前確認 CI 是綠的，而且 PR 已經合併。
+      - archive 前確認 CI 是綠的，而且實作 PR 已經合併。
+      - |
+        archive 走自己的分支 `archive/<change-id>`，是獨立的一個 PR。
+        沒有這個類別它開不出來 —— spec/ 超出範圍、feat/ 禁止刪 specs、
+        chore/ 禁止碰 openspec。
+      - |
+        **archive 產生的 main spec，Purpose 會是
+        「TBD - created by archiving change ...」，一定要改掉。**
+        不改的話 `validate --all --strict` 會紅。這是實測過的必然，
+        不是偶發 —— archive 之後那一關立刻 exit 1。
       - sync 到 `openspec/specs/` 之後，那份才是「系統現在是什麼樣子」的答案。
+      - |
+        archive PR 的 diff 會顯示 `openspec/specs/` 被改成什麼樣子。
+        **那是整個流程裡唯一能看見「兩個 change 互相覆蓋」的地方**，
+        要把它當規格 diff 來讀，不是當機器產生的雜訊。

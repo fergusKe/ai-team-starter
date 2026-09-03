@@ -10,6 +10,7 @@
     "build": "echo '✗ build 還沒設定。編輯 package.json 的 scripts，或刪掉 ci.yml 的 Build 那一步。' && exit 1"
   },
   "devDependencies": {
-    "@fission-ai/openspec": "1.11.0"
+    "@fission-ai/openspec": "1.11.0",
+    "lockfile-lint": "5.0.1"
   }
 }

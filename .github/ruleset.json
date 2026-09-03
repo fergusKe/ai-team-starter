@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "GitHub branch ruleset 的快照。ruleset 本身不在版控裡 —— 它是 GitHub 上的設定，",
+    "clone 這個 repo 的人或 agent 看不到它。這份檔案讓它變成看得見、可 review、可重新套用的東西。",
+    "",
+    "**這是快照，不是執法。** 改這個檔案不會改變 GitHub 上的任何設定。",
+    "反過來也一樣：有人在 GitHub UI 上改了設定，這個檔案不會自己更新。",
+    "跑 .github/scripts/check-ruleset.sh 可以偵測兩者是否已經漂開。",
+    "",
+    "第一次建立（會回傳新的 id，填進下面的 _ruleset_id）：",
+    "  gh api -X POST repos/<owner>/<repo>/rulesets --input .github/ruleset.json --jq .id",
+    "",
+    "之後更新：",
+    "  gh api -X PUT repos/<owner>/<repo>/rulesets/<id> --input .github/ruleset.json",
+    "",
+    "（_comment、_ruleset_id、_why 這些底線開頭的欄位會被 GitHub 忽略。）",
+    "",
+    "⚠️ 建立之前先讀 SETUP-GITHUB.md 的〈Branch Ruleset〉。",
+    "   下面有兩個欄位一定要自己決定，不能照抄：integration_id 與 bypass_actors。"
+  ],
+  "_ruleset_id": null,
+
+  "name": "main protection",
+  "target": "branch",
+  "enforcement": "active",
+
+  "_bypass_note": [
+    "留空 = 沒有人能繞過，包含 repo admin。",
+    "",
+    "要讓某個角色能繞過（例如一人專案，或需要有人在緊急時能硬推），加進去：",
+    "  {\"actor_id\": 1, \"actor_type\": \"OrganizationAdmin\", \"bypass_mode\": \"always\"}",
+    "  {\"actor_id\": 5, \"actor_type\": \"RepositoryRole\",   \"bypass_mode\": \"always\"}",
+    "",
+    "⚠️ bypass 是整組的：它同時繞過 required status check，",
+    "   也就是 CI 紅的時候一樣按得下合併。GitHub 的 ruleset 沒辦法",
+    "   只繞過 review 而保留 CI。",
+    "",
+    "確認自己有沒有 bypass：",
+    "  gh api repos/<owner>/<repo>/rulesets/<id> --jq .current_user_can_bypass",
+    "  always = 有（PR 頁面會多一個 bypass rules 勾選框）；null = 沒有。"
+  ],
+  "bypass_actors": [],
+
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/main"],
+      "exclude": []
+    }
+  },
+
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "dismiss_stale_reviews_on_push": true,
+        "required_review_thread_resolution": false,
+        "allowed_merge_methods": ["merge", "squash", "rebase"]
+      }
+    },
+
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          {
+            "_why_integration_id": "15368 是 GitHub Actions 的 app id。綁定它之後，只有 GitHub Actions 回報的 ci 才算數 —— 拿到 write token 的人不能再直接 POST 一個假的 ci: success。拿掉這個欄位等於 any source，任何有 write 權限的人或整合都能設定任何 status 的狀態。**但它只擋外部偽造，不保護 workflow 檔案的內容**，見 AGENTS.md〈這些閘門各自保護什麼〉。",
+            "context": "ci",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ]
+}

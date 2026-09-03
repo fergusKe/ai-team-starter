@@ -112,37 +112,160 @@ mv .github/CODEOWNERS.example .github/CODEOWNERS
 
 ## 4. Branch Ruleset
 
-Settings → Rules → Rulesets → New branch ruleset
-
-| 欄位 | 值 |
-|---|---|
-| Enforcement status | **Active**（留在 Disabled 等於沒設） |
-| Target branches | default branch |
-| Require a pull request before merging | ☑ |
-| Require review from Code Owners | ☑ |
-| Require status checks to pass | ☑ → 加入 `ci` |
-| Bypass list | **留空** |
-
-> 免費方案需要 **Public** repository 才能設 ruleset；private 要付費方案。
-
-## 5. 實測 —— 這步不能跳
-
-開一個帶著故意失敗測試的 PR，**親眼看到合併按鈕變灰**。
+**不要用 UI 一格一格點。** 模板附了 `.github/ruleset.json`，那就是 API payload 本身。
 
 ```bash
-git switch -c test/ruleset
-# 故意寫一條會失敗的測試
-git commit -am "test: 驗證 required check"
-git push -u origin test/ruleset
-gh pr create --title "驗證 ruleset" --body "故意失敗，測完就關"
+gh api -X POST repos/<owner>/<repo>/rulesets --input .github/ruleset.json --jq .id
 ```
+
+回傳一個數字，填進 `.github/ruleset.json` 的 `_ruleset_id`，然後：
+
+```bash
+bash .github/scripts/check-ruleset.sh
+```
+
+它會把線上設定抓下來跟這份檔案逐欄比對。**這一步的價值不在建立，在之後** ——
+ruleset 不在版控裡，有人在 UI 上改了什麼不會有任何人知道。這支腳本讓漂移查得出來。
+
+> 免費方案需要 **Public** repository 才能設 repo ruleset；private 要付費方案。
+
+### 設定完 stack 之後，把 `quality` 也加進 required checks
+
+`ci.yml` 有**兩個 job**：
+
+| job | 內容 | 模板出貨時 |
+|---|---|---|
+| `ci` | Branch、`npm ci`、Lockfile、Spec —— **不綁 stack** | 綠 |
+| `quality` | Lint、Typecheck、Test、Build | **紅**（四個 script 是刻意失敗的佔位） |
+
+分開是刻意的：混在同一個 job 的話，你還沒設定 stack 的期間整個 CI 都是紅的，
+而 Branch / Lockfile / Spec 壞掉時沒有人會發現。**永遠紅的 CI 等於沒有 CI。**
+
+模板附的 `ruleset.json` 只把 `ci` 設成 required。
+**第 2 步設定完那四個 script 之後，把 `quality` 也加進去**：
+
+```json
+"required_status_checks": [
+  { "context": "ci",      "integration_id": 15368 },
+  { "context": "quality", "integration_id": 15368 }
+]
+```
+
+不加的話，lint 紅了、測試紅了，照樣合併得進 main。
+
+### 兩個一定要自己決定的欄位
+
+**① `required_status_checks[0].integration_id`**
+
+模板填的 `15368` 是 GitHub Actions 的 app id。留著它，只有 GitHub Actions
+回報的 `ci` 才算數。**拿掉的話等於 any source** —— GitHub 文件寫得很清楚：
+
+> Any person or integration with write permissions to a repository can set the state of any status check.
+
+也就是任何拿到 write token 的人可以直接
+`POST /repos/.../statuses/<sha>` 送一個 `context: ci, state: success`，
+CI 一秒都不用跑。**建議留著。**
+
+但它只擋外部偽造，**不保護 workflow 檔案的內容**。在 PR 裡把 `ci.yml` 的某一步
+改成 `run: true` 會產生一個來源完全合法的綠燈。那個只有 CODEOWNERS +
+第二個人的 review 擋得住。詳見 `AGENTS.md`〈這些閘門各自保護什麼、不保護什麼〉。
+
+**② `bypass_actors`**
+
+模板預設是**空的** —— 沒有人能繞過，包含 repo admin。
+
+要讓某個角色能在緊急時硬推（一人專案通常會要），加進去：
+
+```json
+"bypass_actors": [
+  {"actor_id": 1, "actor_type": "OrganizationAdmin", "bypass_mode": "always"},
+  {"actor_id": 5, "actor_type": "RepositoryRole",    "bypass_mode": "always"}
+]
+```
+
+⚠️ **bypass 是整組的**：它同時繞過 required status check，也就是 CI 紅的時候
+一樣按得下合併。GitHub 的 ruleset 沒辦法只繞過 review 而保留 CI。
+
+清單上的人在 PR 頁面會多一個勾選框：
+
+> ☐ Merge without waiting for requirements to be met (bypass rules)
+
+確認自己有沒有：
+
+```bash
+gh api repos/<owner>/<repo>/rulesets/<id> --jq .current_user_can_bypass
+```
+
+`always` 就是有，`null` 就是沒有。
+
+**加了誰就要寫進 `AGENTS.md`。** 不寫的話，讀文件的人（和 agent）會以為
+「每個 PR 都要第二個人看過」對所有人成立 —— 而對清單上的人那是自願，不是機制。
+
+## 5. 分支命名從第一天就被擋
+
+`.github/scripts/check-pr-branch.sh` 是**封閉列舉**，沒列到的前綴一律紅：
+
+| 分支 | 能改什麼 | 機器上界 |
+|---|---|---|
+| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` | 目錄 + `openspec validate <id> --strict` |
+| `feat/<id>--<slice>` `fix/…` | 不限，但不得回改任何 change 的 proposal/design/specs | `<id>` 必須已在 main 上 |
+| `chore/<描述>` | 不得碰 `openspec/` 與 `.github/` | diff ≤ 20000 bytes（不含 lockfile），拒絕 binary / symlink / submodule |
+| `archive/<id>` | 只有三種 openspec 路徑 | `validate --archived` **與** `--all` 都要過 |
+| `governance/<描述>` | 規則本身（CI、CODEOWNERS、AGENTS.md、config.yaml） | 不得夾帶產品程式碼或規格 |
+
+base 不是 `main` 一律擋 —— ruleset 只保護 main，別處拿到的綠燈可以被帶過來。
+
+**所以上面第 1～3 步的設定，本身就要走一個 `governance/` 分支的 PR。**
+這是刻意的：改執法層的 PR 要單獨出現，讓人看得見。
+
+`chore/` 的 20000 bytes 上界是 `check-pr-branch.sh` 開頭的 `CHORE_MAX_BYTES`，
+依你們的習慣調。調的理由要寫進 `AGENTS.md` 的注意力預算那張表。
+
+### 改閘門之前先跑測試
+
+```bash
+bash .github/scripts/test-check-pr-branch.sh
+```
+
+33 個案例，含各種負向情境（base 不是 main、回改規格、symlink、submodule、
+binary、一行 minified、archive 沒補 Purpose、未知前綴）。
+
+**改完再跑一次。** 那支腳本是執法層本體 —— 調一個上界、加一個分類、
+動一條 regex，都可能在別的地方開一個洞，而**洞是安靜的**：
+它不會讓任何東西變紅，只會讓本來該紅的東西變綠。
+
+## 6. 實測 —— 這步不能跳
+
+**沒有親眼看過閘門擋下東西，就不能宣稱這一層存在。** 四個：
+
+**① 直接推 main**
+
+```bash
+git switch main && git commit --allow-empty -m "test" && git push
+```
+要看到 `GH013: Repository rule violations found` / `Changes must be made through a pull request`。
+
+**② CI 紅的 PR 合併不了**
+
+開一個帶著故意失敗測試的 PR，看合併按鈕變灰、`gh pr merge` 回
+`the base branch policy prohibits the merge`。
 
 按鈕還是綠的，代表 ruleset 沒 Active、target 沒涵蓋這個分支、
 或 check 名稱選錯 —— 三個都要回頭查。
 
-測完關掉 PR、刪分支。
+**③ 作者不能批准自己**
 
-**沒看過按鈕變灰，就不能宣稱這一層存在。**
+在自己的 PR 上按 Approve，GitHub 會拒絕。所以「1 個批准」實際上
+等於「至少一個別人」。
+
+**④ 亂取的分支名會紅**
+
+```bash
+git switch -c wip/whatever
+```
+`Branch` 那一關要紅，訊息列出五種合法前綴。
+
+測完關掉 PR、刪分支。
 
 ---
 

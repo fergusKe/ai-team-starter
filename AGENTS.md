@@ -4,8 +4,12 @@
 Repository 內其他文件與本檔衝突時，以本檔為準。
 
 **沒有任何本機機制在執行本檔。** 這裡寫的是規範，不是閘門。真正擋得住東西的
-只有 GitHub 上的 required status check 與 CODEOWNERS review。你可以違反本檔，
+只有 GitHub 上的 required status check 與 code owner review。你可以違反本檔，
 但那會在 PR 上被人看到。
+
+本檔裡**哪幾條真的有機器在執行、哪幾條只是文字**，寫在
+〈這些閘門各自保護什麼、不保護什麼〉。先讀那一節再讀其他 ——
+把只是文字的規則當成閘門，比沒有規則更危險。
 
 ## 職責分界
 
@@ -44,36 +48,55 @@ openspec status --change <name>
 
 ## 一個 change 的順序
 
+**一個 change 有兩個 phase，每個 phase 是自己的分支與 PR。**
+
 ```
 /opsx:explore（可跳過）
       ↓
-/opsx:propose        產生 artifacts 後停下來
+/opsx:propose             產生 artifacts 後停下來
       ↓
-開 draft PR          規格先給人看，這時還沒有任何 code
+spec/<change-id>          規格 PR。這時還沒有任何 code
       ↓
-在 PR 上談定
+在 PR 上談定 → 合併        規格進 main，被凍住
       ↓
-/opsx:apply          才開始實作
+/opsx:apply               才開始實作
+      ↓
+feat/<change-id>--<slice> 實作 PR。可以有很多個
       ↓
 CI 綠 → review → 合併
       ↓
-/opsx:archive        delta 同步進 openspec/specs/
+archive/<change-id>       delta 同步進 openspec/specs/
 ```
 
-**規格要先開 PR。** 不要寫完 code 才讓人看規格 —— 那時候規格已經是實作的
-說明書，不是討論的對象。
+**為什麼規格要單獨合併，而不是同一個分支從頭走到尾**：規格留在同一個分支上，
+它隨時可以被改成「已經寫出來的樣子」，而那正是下面〈你不可以做的事〉
+明文禁止、卻沒有任何機制擋得住的事。規格先合併進 main，
+`check-pr-branch.sh` 才有辦法用 git object database 證明實作 PR 沒有回頭改它。
+
+**實作可以是很多個小 PR。** 一個 change 大到塞不進 400 行的時候，
+用 `--` 後面的 slice 切開：`feat/<change-id>--camera`、`feat/<change-id>--realtime`。
+它們共用同一個 change id，各自是一個可以被讀完的 review 單位。
 
 ## 你不可以做的事
 
-- **不得在 specs 談定前寫產品程式碼。** 探索性的 spike 可以，但要說明是 spike，
-  而且不進 PR。
+- **不得在 specs 談定前寫產品程式碼。** spike 分兩類，只有第一類不進 PR：
+  - **Disposable spike**：只為了學會某件事，成果丟掉。不進 PR，不用寫規格。
+  - **Foundation spike**：有時限、有 Go/No-Go 驗收、成果**預期合併**，
+    是後面幾週的地基。**它要走完整的 OpenSpec 與 PR 流程。**
+    典型的踩法是：規劃文件把某個階段叫做「技術 spike」，但同一份文件
+    又把它的產出當成後面幾週的地基 —— 那就是 Foundation，不是 Disposable。
+    這種 change 的規格只固定**已知的 Go/No-Go 可觀察結果**，
+    把還不知道的常數（threshold、係數、collider 形狀）列成
+    design 的待答問題，**不要假裝它們是事前需求**。
 - **不得為了讓實作順利而修改 specs。** 發現規格有問題就停下來講，
   在 PR 上改規格、讓人重新看過，不要一邊寫一邊把規格調整成已經寫出來的樣子。
 - **不得擴大範圍。** 規格沒寫的功能不要順手做。想做就先提，寫進規格。
 - **不得宣稱「已完成」而沒有證據。** 貼實際的指令輸出。
 - **不得手工造 `openspec/` 的目錄結構。** 用 `openspec new change` 或 `/opsx:propose`。
 - **不得為了讓 `openspec validate` 過而編造 requirement。** 真的沒有 spec 變更
-  （純重構、工具、文件），在 `.openspec.yaml` 標 `skip_specs: true`。
+  （純重構、工具、文件），走 `chore/` 分支 —— 那條通道不需要 change。
+  但它有 20000 bytes 的上界，而且不得碰 `openspec/` 與 `.github/`。
+  超過上界就代表它其實需要一份規格。
 
 ## 寫規格的判準
 
@@ -82,13 +105,176 @@ CI 綠 → review → 合併
 
 要調整規格的品質要求，改 `config.yaml`，不要改這裡。
 
+## 分支命名
+
+**封閉列舉。沒列到的一律被 CI 擋下。** 分支名是 change id 的機器權威來源 ——
+PR 標題和內文都不是（它們隨時可以改，而且不影響 CI 看到的東西）。
+
+| 分支 | 能改什麼 | 機器上界 |
+|---|---|---|
+| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` | 目錄，加 `openspec validate <id> --strict`，加 **Scenario ID 格式與唯一性** |
+| `feat/<id>--<slice>` | 不限，但**不得回改**任何 change 的 proposal/design/specs | `<id>` 必須已經在 main 上 |
+| `fix/<id>--<slice>` | 同上 | 同上 |
+| `chore/<描述>` | 不得碰 `openspec/`、`.github/` 與 `.gitattributes` | diff ≤ **20000 bytes**（lockfile 另計 ≤ 1000000），拒絕 binary / symlink / submodule / LFS pointer |
+| `archive/<id>` | 只有那三種 openspec 路徑 | `validate --archived --strict` **與** `validate --all --strict` 都要過 |
+| `governance/<描述>` | 規則本身（CI、CODEOWNERS、AGENTS.md、config.yaml） | 只允許列舉的治理路徑；**機器不判斷那些檔案的內容是不是真的治理變更** |
+
+**base 一定要是 main。** 對其他分支開 PR 拿到的綠燈不算數，CI 會直接擋 ——
+ruleset 只保護 main，別處的綠燈可以被帶過來。
+
+`<id>` 只准小寫、數字、單個連字號，**不得含 `--`**。這樣 `--` 就永遠是
+change id 與 slice 的分界，不需要任何消歧邏輯。
+
+這些分類**為什麼長這樣、拒絕過哪些替代方案**，寫在 `docs/DECISIONS.md`。
+改閘門之前先讀那一份。
+
+判定在 `.github/scripts/check-pr-branch.sh`，它的測試在旁邊：
+
+```bash
+bash .github/scripts/test-check-pr-branch.sh
+```
+
+**改那支腳本之前跑一次，改完再跑一次。** 它是執法層本體，
+而它壞掉的方式是安靜的 —— 不會有東西變紅，只會有本來該紅的東西變綠。
+
 ## 平行開發
 
-一個 change = 一個目錄 = 一個分支 = 一個 PR。彼此獨立。
+一個 change = 一個目錄。一個 phase = 一個分支 = 一個 PR。
+實作 phase 可以有多個 PR，共用同一個 change id。
 
 兩個 change 會動到同一個 capability 的 spec 時，**先講**。
 不要各自 archive 完才發現 `openspec/specs/` 被覆蓋 ——
 那是這套流程唯一會安靜壞掉的地方。
+
+## 注意力預算
+
+**這套流程最終的信任錨是三個人的 approval，而 agent 的產出速度沒有上限。**
+
+上面所有的閘門都在保護「人類有批准」這件事，但**沒有任何機制能保護
+「人類批准的時候真的有在看」** —— approve 的簽章永遠是真的，
+橡皮圖章偵測不出來。所以稀缺資源不是 CI 算力，是人的注意力。
+
+| 上限 | 值 | 為什麼 |
+|---|---|---|
+| 一個 PR 的 diff | **400 行**（不含 lockfile 與生成物） | 超過就沒有人會真的讀完 |
+| 每人同時進行的 change | **2 個** | 平行做三件事的人，三件都不會被看仔細 |
+
+超過上限就拆。拆不動的話，那是 change 的範圍定錯了，回去改規格。
+
+### 人類該深讀什麼
+
+| 深讀 | 抽查 |
+|---|---|
+| `specs` 的 Requirement 與 Scenario | 有規格的產品程式碼 |
+| **測試的 diff** | |
+| 驗證輸出的證據 | |
+| **`chore/` PR 的每一行** | |
+
+**`chore/` 一律深讀，不抽查。** 那是唯一一條不需要規格的通道，
+所以它沒有「規格說它該做什麼」可以對照 —— **diff 本身就是規格**。
+機器只保證它小到讀得完（20000 bytes），保證不了它不是功能。
+跳過規格的代價就是有人要把每一行讀過。
+
+理由：規格和測試是「這個系統該做什麼」的定義，錯了之後面全錯。
+產品程式碼有 CI、有型別、有測試在擋，人重複做機器做得比較好的事沒有效益。
+
+## 新增流程閘門的門檻
+
+**新增任何流程 gate，必須先有一次真實事故作為證據。**
+
+沒有這條規則的話，這個 repo 會長成一套沒有人違反過、卻要三個人維護的免疫系統，
+而注意力會從「審規格」被抽走 —— 那正是這整套設計想保護的東西。
+
+想加閘門時先回答：**哪一個 PR、哪一次合併，因為缺少它而出事？**
+答不出來就先記在待辦，不要加。
+
+**而且先讀 `docs/DECISIONS.md`。** 你想加的東西可能已經被提過、
+評估過、拒絕過 —— 那份記的是「拒絕了什麼、為什麼」，
+不是「做了什麼」。有幾條看起來像改進的東西，實際上會讓保護變弱。
+
+**「事故」包含可重現的繞法，不限於已經污染 main 的損害。** ——
+把門檻定成「必須先讓已知漏洞真的傷害 main」會產生荒謬的誘因。
+這條規則要擋的是**臆測性**的閘門，不是已經被實測重現的洞。
+判準是：你能不能在一個測試 repo 裡把繞法跑一次給人看。
+跑得出來就算證據；跑不出來就是臆測。
+
+## 這些閘門各自保護什麼、不保護什麼
+
+**每一條都寫清楚邊界。** 高估一個閘門比沒有它更危險 ——
+以為被擋住的地方，沒有人會再去看。
+
+| 機制 | 真的保證 | **不**保證 |
+|---|---|---|
+| ruleset：1 個 approval + code owner review | 每個 PR 有第二個人簽章（作者不能批准自己） | 那個人真的看了。橡皮圖章偵測不出來。**而且 bypass 清單上的人可以繞過全部** —— 見下一節 |
+| required check 綁 `integration_id` | 外部拿 write token 直接 POST 一個假 `ci: success` 會被拒 | **workflow 檔案的內容**。在 PR 裡把某一步改成 `run: true`，綠燈來源完全合法 |
+| `check-pr-branch.sh` 的 `feat/` 那條 | phase ordering：規格已經在 main 上、實作沒有回頭改它（含 rename 搬走） | **diff 真的對應那份規格**。引用 change A 然後寫 change B 的程式碼會全綠 |
+| `check-pr-branch.sh` 的 `spec/` 那條 | 每個 Scenario 有唯一且格式正確的 ID | ID 取得對不對、Scenario 寫得好不好 |
+| `check-pr-branch.sh` 的 `archive/` 那條 | 封存的內容跟 main 上那份**逐檔 blob 相同**（不是只看檔案有沒有被刪） | `openspec/specs/` 有沒有被另一個 change 覆蓋掉 |
+| `chore/` 的 bytes 上界 | review 面積小到人讀得完（lockfile 另有上界，不是無限） | 「這不是功能」。80 行的功能可以冒充 chore |
+| `openspec validate --strict` | 規格的**結構**：有沒有 Scenario、Purpose 夠不夠長 | 規格的**內容**對不對 |
+| `archive/` 的雙重 validate | tasks 全部完成、archive 後 main spec 不會紅 | `openspec/specs/` 有沒有被另一個 change 覆蓋掉 |
+
+**最重要的那一格是空的：沒有任何機制能證明 diff 對應規格。**
+能逼近它的是 Scenario ID ↔ 測試的對應，而那要等第一批測試存在才有意義。
+在那之前，「這段程式碼是不是這份規格要的東西」只有人回答得了。
+
+**`governance/` 只擋路徑，不擋內容。** 它保證這個 PR 只碰了列舉的治理檔案，
+**不保證那些檔案裡放的是治理變更** —— `package.json` 的 inline script、
+`.github/actions/` 底下的 JavaScript、workflow 裡的 shell，都是能執行的東西
+而且都在允許清單內。精確的說法是：
+
+> governance PR 只能使用列舉的治理／設定 carrier path；
+> 內容是不是真的治理變更，機器不判斷。
+
+**`.github/` 的保護是人，不是機器。** GitHub 在 `pull_request` 事件跑的是
+PR 分支上的 workflow，所以 CI 保護不了 CI。能機械封住的是 ruleset 的
+「Require workflows to pass」（workflow 檔從 main 取），但那需要
+org ruleset + Team/Enterprise 方案，這個 org 是 free。
+所以看到 file list 裡有 `.github/` 的時候，那就是要用眼睛的時候。
+
+## GitHub 上的設定在哪裡看
+
+**ruleset 不在版控裡。** 它是 GitHub 上的設定，clone 這個 repo 看不到它。
+所以有一份快照：
+
+| 檔案 | 是什麼 |
+|---|---|
+| `.github/ruleset.json` | 實際設定的快照，就是 API payload 本身 |
+| `.github/scripts/check-ruleset.sh` | 把線上設定抓下來跟快照比對，不一致就列出差在哪 |
+
+```bash
+bash .github/scripts/check-ruleset.sh
+```
+
+**那份快照不是執法。** 改它不會改變 GitHub 上任何東西；有人在 UI 上改了設定，
+它也不會自己更新。它存在的理由是**讓漂移查得出來** ——
+這個 repo 發生過：`AGENTS.md` 寫著「CODEOWNERS review 擋得住東西」，
+而實際設定是 `require_code_owner_review: false`，那三行 CODEOWNERS 完全沒有效力。
+**沒有任何東西會告訴你這件事。**
+
+### 誰能繞過
+
+`.github/ruleset.json` 的 `bypass_actors` 列出誰能繞過。**模板的預設是空的**
+—— 沒有人能繞過，包含 repo admin。
+
+清單上的人在 PR 頁面會看到一個勾選框：
+
+> ☐ Merge without waiting for requirements to be met (bypass rules)
+
+勾了就能直接合併，**包含 CI 紅的時候**。GitHub 的 ruleset 沒辦法只繞過 review
+而保留 required status check —— bypass 是整組的。
+
+其他協作者看不到那個勾選框。要確認自己有沒有：
+
+```bash
+gh api repos/<owner>/<repo>/rulesets/<id> --jq .current_user_can_bypass
+```
+
+`always` 就是有，`null` 就是沒有。（`<id>` 在 `.github/ruleset.json` 的 `_ruleset_id`。）
+
+**只要 bypass 清單不是空的，上面那張閘門表的第一列對清單上的人就不成立。**
+所有「一定要有第二個人看過」的推論，在他們身上都是自願的，不是機制。
+**把是誰寫在這裡** —— 不寫的話，讀這份文件的人（和 agent）會以為那條防護對所有人都在。
 
 ## 測試
 
@@ -100,8 +286,8 @@ Tests 不得碰 production data。破壞性的 DB 操作前必須先證明連的
 
 ## Git / CI
 
-- 分支命名：`feat/<change>`、`fix/<change>`
-- 一個 PR 對應一個 change
+- 分支命名見上面〈分支命名〉那張表。**CI 會擋，不是建議**
+- 一個 PR 對應一個 phase；實作 phase 可以有多個 PR
 - **不得 `git commit --no-verify`**（就算本機沒有 hook，這個習慣要留著）
 - **不得改 `.github/`**（CI 與 CODEOWNERS 是執法層自己，改它要獨立 PR 並讓人明確看到）
 - CI 紅燈不要靠 re-run 賭它變綠，去看為什麼紅
