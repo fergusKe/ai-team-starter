@@ -21,6 +21,11 @@ set -uo pipefail
 # repo 從 git remote 推出來，不要寫死 —— 這是模板，會被複製到別的地方。
 REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)}"
 [ -n "$REPO" ] || { echo "✗ 認不出這是哪個 repo。設 REPO=owner/name 再跑一次。" >&2; exit 2; }
+
+# **一定要印出來。** `gh repo view` 用的是「目前目錄的 default repository」，
+# 在 fork 或多 remote 的情況下可能不是你以為的那一個。
+# 建立或更新 ruleset 的時候不要靠推導，明確帶 REPO=owner/name。
+echo "REPO=${REPO}"
 # RULESET_FILE 可以指到別份快照。用途是負向測試 ——
 # 一個從來沒紅過的檢查等於沒有檢查。
 FILE="${RULESET_FILE:-$(git rev-parse --show-toplevel)/.github/ruleset.json}"
@@ -50,8 +55,9 @@ fi
 # **不要用兩個 heredoc 疊在同一個指令上** —— bash 只認最後一個 stdin 重導，
 # python 會收到 JSON 而不是腳本。（踩過。）
 #
-# 固定路徑、每次覆蓋，所以不需要清理。
-LIVE_JSON="${TMPDIR:-/tmp}/guildhub-ruleset-live.json"
+# 每次一個新的暫存檔。**不要用固定可預測的路徑** ——
+# 兩個 repo 同時檢查會互相覆蓋，而且固定路徑可以被預先放一個 symlink 進去。
+LIVE_JSON="$(mktemp -t ruleset-live)"
 
 gh api "repos/${REPO}/rulesets/${ID}" > "$LIVE_JSON" 2>/dev/null || {
   echo "✗ 讀不到 ruleset ${ID}。需要對這個 repo 有 admin 權限。" >&2
@@ -82,11 +88,23 @@ for k in ("name", "target", "enforcement"):
 cmp("conditions.ref_name", expected["conditions"]["ref_name"],
     live.get("conditions", {}).get("ref_name"))
 
-# actor_id 不比：GET 對 OrganizationAdmin 回傳 null，PUT 要 1。
-# 真正有意義的是「哪一類角色、什麼模式」。
-def actors(o):
-    return sorted((a["actor_type"], a["bypass_mode"]) for a in o.get("bypass_actors", []))
-cmp("bypass_actors（型別與模式）", actors(expected), actors(live))
+# actor_id 只在 GitHub 自己回傳 null 的時候略過（OrganizationAdmin 就是這樣：
+# PUT 要填 1，GET 回 null）。**其他情況一定要比** ——
+# RepositoryRole 的 5 是 admin、4 是 write，型別與模式相同但 id 不同
+# 是完全不同的授權範圍，全域丟棄 actor_id 會讓那種變更驗不出來。
+def actors(o, live_ids):
+    out = []
+    for a in o.get("bypass_actors", []):
+        t, m = a["actor_type"], a["bypass_mode"]
+        aid = a.get("actor_id")
+        if live_ids.get((t, m), "MISSING") is None:
+            aid = None          # GitHub 對這一類就是回 null，兩邊都正規化掉
+        out.append((t, m, aid))
+    return sorted(out, key=lambda x: (x[0], x[1], str(x[2])))
+
+live_ids = {(a["actor_type"], a["bypass_mode"]): a.get("actor_id")
+            for a in live.get("bypass_actors", [])}
+cmp("bypass_actors（型別、模式、id）", actors(expected, live_ids), actors(live, live_ids))
 
 live_rules = {r["type"]: r.get("parameters") or {} for r in live.get("rules", [])}
 exp_rules  = {r["type"]: r.get("parameters") or {} for r in expected.get("rules", [])}

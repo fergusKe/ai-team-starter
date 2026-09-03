@@ -112,12 +112,12 @@ PR 標題和內文都不是（它們隨時可以改，而且不影響 CI 看到�
 
 | 分支 | 能改什麼 | 機器上界 |
 |---|---|---|
-| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` | 目錄，加 `openspec validate <id> --strict` |
+| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` | 目錄，加 `openspec validate <id> --strict`，加 **Scenario ID 格式與唯一性** |
 | `feat/<id>--<slice>` | 不限，但**不得回改**任何 change 的 proposal/design/specs | `<id>` 必須已經在 main 上 |
 | `fix/<id>--<slice>` | 同上 | 同上 |
-| `chore/<描述>` | 不得碰 `openspec/` 與 `.github/` | diff ≤ **20000 bytes**（不含 lockfile），拒絕 binary / symlink / submodule |
+| `chore/<描述>` | 不得碰 `openspec/`、`.github/` 與 `.gitattributes` | diff ≤ **20000 bytes**（lockfile 另計 ≤ 1000000），拒絕 binary / symlink / submodule / LFS pointer |
 | `archive/<id>` | 只有那三種 openspec 路徑 | `validate --archived --strict` **與** `validate --all --strict` 都要過 |
-| `governance/<描述>` | 規則本身（CI、CODEOWNERS、AGENTS.md、config.yaml） | 不得夾帶產品程式碼或規格 |
+| `governance/<描述>` | 規則本身（CI、CODEOWNERS、AGENTS.md、config.yaml） | 只允許列舉的治理路徑；**機器不判斷那些檔案的內容是不是真的治理變更** |
 
 **base 一定要是 main。** 對其他分支開 PR 拿到的綠燈不算數，CI 會直接擋 ——
 ruleset 只保護 main，別處的綠燈可以被帶過來。
@@ -200,14 +200,24 @@ bash .github/scripts/test-check-pr-branch.sh
 |---|---|---|
 | ruleset：1 個 approval + code owner review | 每個 PR 有第二個人簽章（作者不能批准自己） | 那個人真的看了。橡皮圖章偵測不出來。**而且 bypass 清單上的人可以繞過全部** —— 見下一節 |
 | required check 綁 `integration_id` | 外部拿 write token 直接 POST 一個假 `ci: success` 會被拒 | **workflow 檔案的內容**。在 PR 裡把某一步改成 `run: true`，綠燈來源完全合法 |
-| `check-pr-branch.sh` 的 `feat/` 那條 | phase ordering：規格已經在 main 上、實作沒有回頭改它 | **diff 真的對應那份規格**。引用 change A 然後寫 change B 的程式碼，全部檢查都會綠 |
-| `chore/` 的 bytes 上界 | review 面積小到人讀得完 | 「這不是功能」。80 行的功能可以冒充 chore |
+| `check-pr-branch.sh` 的 `feat/` 那條 | phase ordering：規格已經在 main 上、實作沒有回頭改它（含 rename 搬走） | **diff 真的對應那份規格**。引用 change A 然後寫 change B 的程式碼會全綠 |
+| `check-pr-branch.sh` 的 `spec/` 那條 | 每個 Scenario 有唯一且格式正確的 ID | ID 取得對不對、Scenario 寫得好不好 |
+| `check-pr-branch.sh` 的 `archive/` 那條 | 封存的內容跟 main 上那份**逐檔 blob 相同**（不是只看檔案有沒有被刪） | `openspec/specs/` 有沒有被另一個 change 覆蓋掉 |
+| `chore/` 的 bytes 上界 | review 面積小到人讀得完（lockfile 另有上界，不是無限） | 「這不是功能」。80 行的功能可以冒充 chore |
 | `openspec validate --strict` | 規格的**結構**：有沒有 Scenario、Purpose 夠不夠長 | 規格的**內容**對不對 |
 | `archive/` 的雙重 validate | tasks 全部完成、archive 後 main spec 不會紅 | `openspec/specs/` 有沒有被另一個 change 覆蓋掉 |
 
 **最重要的那一格是空的：沒有任何機制能證明 diff 對應規格。**
 能逼近它的是 Scenario ID ↔ 測試的對應，而那要等第一批測試存在才有意義。
 在那之前，「這段程式碼是不是這份規格要的東西」只有人回答得了。
+
+**`governance/` 只擋路徑，不擋內容。** 它保證這個 PR 只碰了列舉的治理檔案，
+**不保證那些檔案裡放的是治理變更** —— `package.json` 的 inline script、
+`.github/actions/` 底下的 JavaScript、workflow 裡的 shell，都是能執行的東西
+而且都在允許清單內。精確的說法是：
+
+> governance PR 只能使用列舉的治理／設定 carrier path；
+> 內容是不是真的治理變更，機器不判斷。
 
 **`.github/` 的保護是人，不是機器。** GitHub 在 `pull_request` 事件跑的是
 PR 分支上的 workflow，所以 CI 保護不了 CI。能機械封住的是 ruleset 的

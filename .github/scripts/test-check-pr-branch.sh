@@ -119,6 +119,34 @@ run 0 main governance/fix-agents "改 AGENTS.md"           sh -c 'echo "" >> AGE
 run 1 main governance/sneak-code "夾帶產品程式碼"           sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main governance/sneak-spec "動 changes/"            sh -c 'echo "x" >> openspec/changes/demo-change/proposal.md'
 
+echo "── rename / 路徑轉移（Codex R4 找到的整類空白）──"
+run 1 main feat/demo-change--rn1 "rename 掉 proposal.md"           sh -c 'git mv openspec/changes/demo-change/proposal.md openspec/changes/demo-change/approved.txt'
+run 1 main feat/demo-change--rn2 "把 approved spec 搬成產品程式碼"   sh -c 'mkdir -p src && git mv openspec/changes/demo-change/specs/demo/spec.md src/interpolation.ts'
+run 1 main spec/demo-change      "spec 把自己的檔案搬出目錄"         sh -c 'mkdir -p src && git mv openspec/changes/demo-change/proposal.md src/p.md'
+run 1 main chore/rename-out      "chore 把 openspec 檔案搬出來"      sh -c 'git mv openspec/config.yaml cfg.yaml'
+run 1 main chore/weird-name      "檔名含換行字元"                   sh -c 'printf x > "$(printf "a\nb.txt")"'
+
+echo "── archive 內容身分 ──"
+run 1 main archive/demo-change "archive 之後竄改被封存的規格"        sh -c '
+  npx openspec archive demo-change --yes
+  perl -0pi -e "s/TBD - created by archiving change [^\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
+  f=$(ls -d openspec/changes/archive/*/specs/demo/spec.md)
+  printf "\n#### Scenario: [DEMO-01-S09] 偷加的情境\n- **WHEN** a\n- **THEN** b\n" >> "$f"'
+
+echo "── chore 的 lockfile 與 LFS ──"
+run 1 main chore/lock-whitespace "lockfile 塞入大量合法空白"         sh -c 'python3 -c "
+import io,json
+d=json.load(io.open(\"package-lock.json\",encoding=\"utf-8\"))
+io.open(\"package-lock.json\",\"w\",encoding=\"utf-8\").write(json.dumps(d,indent=250))
+"'
+run 1 main chore/lfs-attrs       "chore 改 .gitattributes"          sh -c 'echo "assets/* filter=lfs diff=lfs merge=lfs -text" > .gitattributes'
+run 1 main chore/lfs-pointer     "chore 加 LFS pointer"             sh -c 'printf "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 999999\n" > payload.bin'
+
+echo "── Scenario ID ──"
+run 1 main spec/demo-change "Scenario 沒有 ID"       sh -c 'printf "\n#### Scenario: 沒有 ID 的情境\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
+run 1 main spec/demo-change "Scenario ID 重複"       sh -c 'printf "\n#### Scenario: [DEMO-01-S01] 重複的 ID\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
+run 1 main spec/demo-change "Scenario ID 格式不合"   sh -c 'printf "\n#### Scenario: [demo-1-x] 格式不合\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
+
 echo "── 未知前綴 ──"
 run 1 main wip/whatever "未知前綴" sh -c 'echo x > z.md'
 run 1 main hotfix       "沒有前綴" sh -c 'echo x > z.md'
