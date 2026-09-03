@@ -348,7 +348,7 @@ ARCHIVE_IDENTITY
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|SETUP-GITHUB\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
