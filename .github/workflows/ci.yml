@@ -3,8 +3,17 @@
 # 把它設成 branch ruleset 的 required check，否則它只是一個比較慢的提示。
 # 設完要實測：開一個故意失敗的 PR，親眼看到合併按鈕變灰。
 #
+# ⚠️ 但要知道它的邊界：GitHub 在 `pull_request` 事件跑的是 **PR 分支上的**
+# 這個檔案。所以在 PR 裡把下面任何一步改成 `run: true`，CI 照樣綠 ——
+# 而且那個綠燈來源完全合法，required check 的 integration_id 綁定擋不住。
+#
+# 能機械封住它的是 ruleset 的「Require workflows to pass」（workflow 檔從
+# main 的 ref 取，不從 PR 分支取），但那要 org ruleset + Team/Enterprise 方案。
+# **免費方案下，改這個檔案唯一的防線是 CODEOWNERS + 第二個人的 review。**
+# 不要以為 CI 保護得了 CI。
+#
 # 下面是 Node 專案的預設形狀，依你的 stack 改。
-# Spec 那一關不綁 stack —— 任何語言的專案都該留著。
+# Branch 與 Spec 那兩關不綁 stack —— 任何語言的專案都該留著。
 
 name: CI
 
@@ -24,13 +33,44 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Branch 那一關要跟 base 比對整個 diff，需要完整歷史。
+          fetch-depth: 0
 
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
 
+      # 分支類別閘門。
+      #
+      # 用**分支前綴**決定這個 PR 能改什麼，而不是用路徑白名單決定
+      # 「什麼是產品程式碼」—— 路徑 allow-list 沒列到的地方是 fail-OPEN，
+      # 把程式碼放進 `scripts/`、`types/`、`server/` 就整個逃逸。
+      #
+      # 封閉列舉 + 每類一個不看檔案性質的上界，漏掉的方向是 fail-CLOSED。
+      # 分類與上界寫在 AGENTS.md〈分支命名〉，實作在腳本裡。
+      - name: Branch
+        if: github.event_name == 'pull_request'
+        run: bash .github/scripts/check-pr-branch.sh "${{ github.base_ref }}" "${{ github.head_ref }}"
+
       - run: npm ci
+
+      # lockfile 的來源檢查。
+      #
+      # 為什麼需要：chore/ 的大小上界**刻意排除 package-lock.json**
+      # （它是機器產生的，人不讀它，算進去的話任何套件更新都會被擋）。
+      # 那個排除留下一個洞 —— 一個很小的 package.json diff 可以搭配
+      # 一個把 `resolved` 指向非 registry host 的巨大 lockfile 改動。
+      #
+      # 這一關補那個洞：驗每一筆 resolved 都指向 npm registry、走 https、
+      # 有 integrity。它不看大小，也不管 package.json 有沒有動 ——
+      # 所以 `npm audit fix` 這種只動 lockfile 的安全修補不會被誤擋。
+      #
+      # （lockfile 與 package.json 是否一致，上面的 `npm ci` 已經免費驗了 ——
+      # 不一致會直接報錯。所以這裡不必再做一次。）
+      - name: Lockfile
+        run: npx lockfile-lint --path package-lock.json --type npm --allowed-hosts npm --validate-https --validate-integrity
 
       # 規格結構檢查。
       #
@@ -43,13 +83,17 @@ jobs:
       # 換到的是「CI 跟每個人本機跑的是同一份」。
       #
       # `--strict` 會抓沒有 Scenario 的 requirement、沒有 delta 的 change、
-      # 太短的 Purpose。真的沒有 spec 變更的 change（純重構、工具、文件）
-      # 要在它的 .openspec.yaml 標 skip_specs: true，不是把這關拿掉。
+      # 太短的 Purpose。最後一項只有在 archive 之後才會對 main spec 生效，
+      # 所以 archive/ 分支的閘門會額外再跑一次 —— 讓它在 PR 上就紅，
+      # 而不是合併後 main 才爆。
       - name: Spec
         run: npx openspec validate --all --strict
 
       # 每一步都獨立列出來，不要串成一行 ——
       # 串起來的話，看 log 分不出是哪一關紅的。
+      #
+      # 用不到的關就把對應那一步刪掉。**不要留一個永遠失敗的步驟** ——
+      # 永遠紅的 CI 等於沒有 CI，團隊很快就會開始無視紅燈。
       - name: Lint
         run: npm run lint
 
