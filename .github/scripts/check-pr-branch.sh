@@ -112,9 +112,9 @@ case "$HEAD" in
     # 之後測試要靠這個 ID 對應回規格，而 ID 是**寫進 main 就不能改**的鍵 ——
     # 所以格式與唯一性要在規格進 main 之前就擋住，不能等有測試才補。
     # 補的時候要做 migration，那比一開始就擋貴得多。
-    python3 - "$ID" <<'SCENARIO_IDS'
-import sys, re, pathlib
-cid = sys.argv[1]
+    python3 - "$ID" "$BASE" <<'SCENARIO_IDS'
+import sys, re, pathlib, subprocess
+cid, base = sys.argv[1], sys.argv[2]
 root = pathlib.Path("openspec/changes") / cid / "specs"
 if not root.is_dir():
     sys.exit(0)                       # 沒有 delta spec 的 change，交給 validate 管
@@ -148,7 +148,51 @@ if bad:
     print("  格式 <工作項目 ID>-S<兩位數>，同一個 change 內不重複。", file=sys.stderr)
     print("  判準寫在 openspec/config.yaml 的 rules.specs。", file=sys.stderr)
     sys.exit(1)
-print(f"  ✓ {n} 個 Scenario 都有唯一 ID")
+
+# ── ID 進 main 之後就不能改 ──────────────────────────────────────
+#
+# 上面驗的是「這一份格式對不對、有沒有重複」。但那不夠：
+# 一個後續的 spec PR 仍然可以把 [AUTH-01-S01] 改成 [AUTH-01-S09]，
+# 格式與唯一性都還是對的 —— 而 ID 是之後測試要靠它對回規格的鍵，
+# 改掉等於把那條對應關係**悄悄**拆掉。
+#
+# 所以 base 上已經有的 ID，head 必須還在。新增可以，改名與刪除不行。
+# 要淘汰一條 Scenario 的話，用 OpenSpec 的 REMOVED delta，讓它留下痕跡。
+def ids_at(ref):
+    prefix = f"openspec/changes/{cid}/specs/"
+    try:
+        listing = subprocess.run(
+            ["git", "ls-tree", "-r", "-z", "--name-only", ref, "--", prefix],
+            capture_output=True, text=True, check=True).stdout
+    except subprocess.CalledProcessError:
+        return set()
+    out = set()
+    for fp in filter(None, listing.split("\0")):
+        if not fp.endswith(".md"):
+            continue
+        body = subprocess.run(["git", "show", f"{ref}:{fp}"],
+                              capture_output=True, text=True, check=True).stdout
+        for line in body.splitlines():
+            m = HEAD_RE.match(line)
+            if m:
+                im = ID_RE.match(m.group(1).strip())
+                if im:
+                    out.add(im.group(1))
+    return out
+
+before = ids_at(f"origin/{base}")
+gone = sorted(before - set(seen))
+if gone:
+    print("✗ 這些 Scenario ID 已經在 main 上了，不能改名或刪除：", file=sys.stderr)
+    for g in gone: print(f"    [{g}]", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  ID 是之後測試對回規格的鍵，改掉會把那條對應關係悄悄拆掉。", file=sys.stderr)
+    print("  真的要淘汰一條 Scenario，用 OpenSpec 的 REMOVED delta，", file=sys.stderr)
+    print("  讓它留下痕跡而不是消失。", file=sys.stderr)
+    sys.exit(1)
+
+kept = f"，其中 {len(before)} 個沿用自 main" if before else ""
+print(f"  ✓ {n} 個 Scenario 都有唯一 ID{kept}")
 SCENARIO_IDS
 
     echo "✓ spec 階段：${ID}"

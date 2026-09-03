@@ -182,6 +182,9 @@ echo "── Scenario ID ──"
 run 1 main spec/demo-change "Scenario 沒有 ID"       sh -c 'printf "\n#### Scenario: 沒有 ID 的情境\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
 run 1 main spec/demo-change "Scenario ID 重複"       sh -c 'printf "\n#### Scenario: [DEMO-01-S01] 重複的 ID\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
 run 1 main spec/demo-change "Scenario ID 格式不合"   sh -c 'printf "\n#### Scenario: [demo-1-x] 格式不合\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
+run 1 main spec/demo-change "把 main 上的 ID 改名"    sh -c 'perl -pi -e "s/\[DEMO-01-S01\]/[DEMO-01-S09]/" openspec/changes/demo-change/specs/demo/spec.md'
+run 1 main spec/demo-change "刪掉 main 上的 Scenario" sh -c 'perl -0pi -e "s/#### Scenario: \[DEMO-01-S02\].*?\n\n?//s" openspec/changes/demo-change/specs/demo/spec.md'
+run 0 main spec/demo-change "沿用舊 ID 並新增一條"    sh -c 'printf "\n#### Scenario: [DEMO-01-S03] 新增的情境\n- **WHEN** a\n- **THEN** b\n" >> openspec/changes/demo-change/specs/demo/spec.md'
 
 echo "── 未知前綴 ──"
 run 1 main wip/whatever "未知前綴" sh -c 'echo x > z.md'
