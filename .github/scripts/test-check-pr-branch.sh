@@ -116,6 +116,8 @@ run 1 main archive/demo-change "archive 但 Purpose 留 TBD"  sh -c 'npx openspe
 echo "── governance/ ──"
 run 0 main governance/fix-ci     "改 CI"                  sh -c 'echo "#" >> .github/workflows/ci.yml'
 run 0 main governance/fix-agents "改 AGENTS.md"           sh -c 'echo "" >> AGENTS.md'
+run 0 main governance/decisions   "改 docs/DECISIONS.md"     sh -c 'mkdir -p docs && echo "x" >> docs/DECISIONS.md'
+run 1 main governance/sneak-docs  "夾帶 docs/ 底下別的檔案"    sh -c 'mkdir -p docs && echo "x" > docs/RANDOM.md'
 run 1 main governance/sneak-code "夾帶產品程式碼"           sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main governance/sneak-spec "動 changes/"            sh -c 'echo "x" >> openspec/changes/demo-change/proposal.md'
 

@@ -45,6 +45,16 @@ fail() { echo "✗ $*" >&2; exit 1; }
 # 但錯誤訊息會讓人完全看不出真正的原因。
 [ "$BASE" = "main" ] || fail "base 是 '${BASE}'，只接受 main。ruleset 只保護 main，其他分支上的綠燈帶不過來。"
 
+# 本機跑的時候提醒一次：這個閘門看的是**已經 commit 的東西**。
+# 在 git add 之後、git commit 之前跑它會拿到假綠燈 ——
+# 還沒進 commit 的檔案不在 origin/main...HEAD 的範圍裡。（踩過。）
+# CI 的工作區永遠是乾淨的，所以這段在 CI 不會出現。
+if [ -z "${CI:-}" ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "⚠️  工作區有未 commit 的變更，下面的判定不包含它們。" >&2
+  echo "    這個閘門看的是 origin/${BASE}...HEAD，也就是已經 commit 的狀態。" >&2
+  echo "" >&2
+fi
+
 RANGE="origin/${BASE}...HEAD"
 
 # **`--no-renames` 不能拿掉。**
@@ -338,7 +348,7 @@ ARCHIVE_IDENTITY
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
