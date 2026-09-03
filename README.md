@@ -176,6 +176,29 @@ git object database 證明實作 PR 沒有回頭改它。
 **最後 archive 那一步也不要省。** 沒 archive，`openspec/specs/`
 就不會知道這次做了什麼，半年後「這系統現在做得到什麼」沒有人答得出來。
 
+## 怎麼看「現在做到哪裡」
+
+```bash
+bash .github/scripts/progress.sh          # 有哪些 change、各自做到哪
+bash .github/scripts/progress.sh --all    # 連還沒開始的一起列（需要 docs/WBS.md）
+bash .github/scripts/progress.sh --week W1
+```
+
+**它是算出來的，沒有人維護。** 資料來自 `openspec/changes/` 的 `tasks.md`
+打勾狀態與遠端分支 —— 也就是說**它不會漂**。
+
+> 刻意不做一份手動維護的 `STATUS.md`。手寫的狀態一定會過期，
+> 而**過期的狀態文件比沒有更危險** —— 讀的人會相信它。
+
+想看「還剩哪些沒做」的話，把工作分解表放進 `docs/WBS.md`：
+第一欄放工作項目 ID（`FE-C01` 這種格式）、第四欄週次、第五欄點數，
+同一項目的續行第一欄留空。然後**把 change 命名成以那個 ID 開頭**
+（`fe-c01-appshell`），對應就自動成立。
+
+`tasks.md` 的打勾由 `/opsx:apply` 邊做邊更新，而
+`openspec validate --archived --strict` 會擋住「還有 `- [ ]` 就 archive」——
+所以打勾不是裝飾，它是 archive 的前提。
+
 ## 目錄
 
 | | |
@@ -189,7 +212,9 @@ git object database 證明實作 PR 沒有回頭改它。
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
 | `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
+| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做 |
 | `prompts/` | 每個階段貼給 AI 的提示 |
+| `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |
 | `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |
 | `.github/scripts/test-check-pr-branch.sh` | 45 個案例。閘門壞掉的方式是安靜的 |
 | `.github/ruleset.json` | GitHub ruleset 的快照兼 API payload。ruleset 不在版控裡，這份讓它看得見 |

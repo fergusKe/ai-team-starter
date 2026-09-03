@@ -3,7 +3,15 @@
 Claude Code 進入此 Repository 後：
 
 1. 先讀 `AGENTS.md`；它是唯一 normative workflow 規範。
-2. 跑 `git branch --show-current` 與 `openspec list`，確認你在哪個 change 上。
+2. 跑 `git branch --show-current`，以及：
+
+   ```bash
+   bash .github/scripts/progress.sh      # 現在有哪些 change、各自做到哪
+   ```
+
+   **那份是算出來的，沒有人維護它**，所以它不會漂。資料來自
+   `openspec/changes/` 的 `tasks.md` 打勾與遠端分支；
+   如果專案有 `docs/WBS.md`，它還會告訴你**還有哪些沒開始**。
 3. 讀 `CONTEXT.md` 與那個 change 的 artifacts。
 4. 確認規格在 PR 上談定了沒有 —— **沒有就不要寫產品程式碼**。
 5. 除非使用者指定其他語言，對人類使用繁體中文。
