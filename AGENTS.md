@@ -125,6 +125,11 @@ ruleset 只保護 main，別處的綠燈可以被帶過來。
 `<id>` 只准小寫、數字、單個連字號，**不得含 `--`**。這樣 `--` 就永遠是
 change id 與 slice 的分界，不需要任何消歧邏輯。
 
+專案有工作分解表（`docs/WBS.md`）的話，**change id 要以那個工作項目 ID
+開頭（小寫）**，例如 `fe-c01-appshell` 對應 `FE-C01`。
+這不是美觀問題 —— `.github/scripts/progress.sh` 靠它把 change 對回工作項目，
+對不上的會被單獨列成紅字。
+
 這些分類**為什麼長這樣、拒絕過哪些替代方案**，寫在 `docs/DECISIONS.md`。
 改閘門之前先讀那一份。
 
