@@ -11,22 +11,40 @@ AI 寫程式會**做了你沒要求的事**，也會**沒做完就說做完了**
 一般做法是在 `CLAUDE.md` 寫「請先跟我確認規格再實作」—— 那是一句話，
 AI 讀得到，也可以說服自己這次情況特殊。**規勸不是機制。**
 
-這個模板把規勸換成兩個真的擋得住的東西。
+這個模板把規勸換成三個真的擋得住的東西。
 
 **一、OpenSpec 管規格的形狀。** 什麼算一份完整的規格、每條需求有沒有
 可驗證的 Scenario、這次的變更怎麼合併回「系統現況」—— 由 CLI 判定，
-不靠團隊自己約定。`openspec validate --strict` 過不了就是過不了，
-而它是 CI 的第一關。
+不靠團隊自己約定。`openspec validate --strict` 過不了就是過不了。
 
-**二、GitHub 的 required check 是唯一的門。** 本機沒有任何 hook。
+**二、分支前綴決定這個 PR 能改什麼。** `spec/` 只能動規格，`feat/` 引用的
+change **必須已經在 main 上**（也就是規格 PR 已經被人批准並合併），
+而且不得回頭改它。`chore/` 是唯一不需要規格的通道，代價是有大小上界。
+判定只看分支名、檔案路徑、diff 大小與 git mode，**不做任何語意判斷**。
+
+**三、GitHub 的 ruleset 是唯一的門。** 本機沒有任何 hook。
+`.github/ruleset.json` 出貨的設定要求每個 PR 有一個 code owner 批准，
+而 GitHub 不允許作者批准自己的 PR。
 
 > CI/CD 就是那道不管是人還是 AI 寫的 Code，都得通過的關卡。
 
+**每個閘門各自保護什麼、不保護什麼，逐條寫在 `AGENTS.md`。**
+那張表有一格是空的 —— 先讀它再用這套東西。
+
 ## 它做不到什麼
 
-**沒有人類批准的閘門。** 沒有任何機制強制「規格被人看過才能開始寫 code」——
-那條規則寫在 `AGENTS.md` 裡，靠團隊自律加 PR review 落實。
-你需要機器強制批准的話，這個模板不適合。
+**沒有任何機制能證明 diff 對應規格。** `feat/` 那條只保證「規格已經在
+main 上、而且這個 PR 沒有回頭改它」。引用 change A 然後寫 change B 的
+程式碼，全部檢查都會綠。那件事只有人做得到。
+
+**擋不住在 PR 裡把 CI 自己改掉。** GitHub 在 `pull_request` 事件跑的是
+**PR 分支上的** workflow，所以把某一步改成 `run: true`，綠燈來源完全合法。
+能機械封住的 ruleset `workflows` 規則需要 org ruleset + Team/Enterprise 方案。
+免費方案下，`.github/` 的防線是 CODEOWNERS + 第二個人的眼睛。
+
+**「有人批准」不等於「那個人看了」。** 橡皮圖章偵測不出來，
+approve 的簽章永遠是真的。`AGENTS.md` 的注意力預算那一節是為了這件事 ——
+它是規範，不是機制。
 
 **本機擋不住任何東西。** 沒設 GitHub 的 branch ruleset 之前，
 這整套只是幾份文件。`SETUP-GITHUB.md` 那一步不是選配。
@@ -123,26 +141,37 @@ npx openspec validate --all --strict
 
 每個功能一個 change，各自獨立，可以平行。
 
+**一個 change 兩個 phase，各自是一個分支與一個 PR。**
+
 ```
-   訪談需求          prompts/01-discovery.md
+   訪談需求               prompts/01-discovery.md
         ↓
-/opsx:propose        產生 proposal → specs → design → tasks，產完就停
+/opsx:propose             產生 proposal → specs → design → tasks，產完就停
         ↓
-   開 draft PR       讓隊友先看規格，這時還沒有任何 code
+   spec/<change-id>       規格 PR。這時還沒有任何 code
         ↓
-   規格審查          prompts/03-spec-review.md + openspec validate --strict
+   規格審查                prompts/03-spec-review.md
         ↓
-/opsx:apply          談定之後才實作
+   合併                    規格進 main，被凍住
         ↓
-   驗證              prompts/05-verify.md
+/opsx:apply               談定之後才實作
+        ↓
+   feat/<id>--<slice>     實作 PR，可以有很多個
+        ↓
+   驗證                    prompts/05-verify.md
         ↓
    CI 綠 + review → 合併
         ↓
-/opsx:archive        delta 同步進 openspec/specs/
+   archive/<change-id>    delta 同步進 openspec/specs/
 ```
 
-**開 draft PR 那一步是重點。** 規格先給人看，讓討論發生在寫 code 之前 ——
-這是「規格先行」在沒有閘門時唯一能落實的方式。
+**為什麼規格要單獨合併，而不是同一個分支從頭走到尾**：規格留在同一個
+分支上，它隨時可以被改成「已經寫出來的樣子」，而那正是 `AGENTS.md`
+明文禁止、卻沒有任何機制擋得住的事。規格先進 main，閘門才有辦法用
+git object database 證明實作 PR 沒有回頭改它。
+
+**archive 也是獨立的一個 PR。** 沒有那個分類它開不出來 ——
+`spec/` 超出範圍、`feat/` 禁止刪 specs、`chore/` 禁止碰 openspec。
 
 **最後 archive 那一步也不要省。** 沒 archive，`openspec/specs/`
 就不會知道這次做了什麼，半年後「這系統現在做得到什麼」沒有人答得出來。
@@ -159,7 +188,12 @@ npx openspec validate --all --strict
 | `openspec/specs/` | 系統現在是什麼樣子（archive 時自動同步） |
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
+| `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
 | `prompts/` | 每個階段貼給 AI 的提示 |
+| `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |
+| `.github/scripts/test-check-pr-branch.sh` | 45 個案例。閘門壞掉的方式是安靜的 |
+| `.github/ruleset.json` | GitHub ruleset 的快照兼 API payload。ruleset 不在版控裡，這份讓它看得見 |
+| `.github/scripts/check-ruleset.sh` | 偵測線上設定與快照的漂移 |
 
 ## 規則只有幾條
 
