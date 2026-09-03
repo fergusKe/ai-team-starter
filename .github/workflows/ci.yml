@@ -89,11 +89,37 @@ jobs:
       - name: Spec
         run: npx openspec validate --all --strict
 
+  # 工程品質那四關**刻意跟 ci 分成兩個 job**。
+  #
+  # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——
+  # 混在同一個 job 的話，模板自己的 CI 永遠是紅的，
+  # 而 Branch / Lockfile / Spec 壞掉時沒有人會發現（整個 run 本來就紅）。
+  # 那正是這份檔案自己警告的「永遠紅的 CI 等於沒有 CI」。
+  #
+  # 分開之後：`ci` 綠代表流程層是好的，`quality` 紅代表「你還沒設定你的 stack」。
+  # 兩個訊號不會互相遮蔽。
+  #
+  # **設定完你的 stack 之後，把 `quality` 也加進 ruleset 的 required checks。**
+  # 只留 `ci` 的話，lint / test 紅了照樣合併得進去。
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
       # 每一步都獨立列出來，不要串成一行 ——
       # 串起來的話，看 log 分不出是哪一關紅的。
       #
       # 用不到的關就把對應那一步刪掉。**不要留一個永遠失敗的步驟** ——
-      # 永遠紅的 CI 等於沒有 CI，團隊很快就會開始無視紅燈。
+      # 設定好或刪掉，兩者選一個。
       - name: Lint
         run: npm run lint
 

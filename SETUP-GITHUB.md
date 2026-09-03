@@ -129,6 +129,30 @@ ruleset 不在版控裡，有人在 UI 上改了什麼不會有任何人知道�
 
 > 免費方案需要 **Public** repository 才能設 repo ruleset；private 要付費方案。
 
+### 設定完 stack 之後，把 `quality` 也加進 required checks
+
+`ci.yml` 有**兩個 job**：
+
+| job | 內容 | 模板出貨時 |
+|---|---|---|
+| `ci` | Branch、`npm ci`、Lockfile、Spec —— **不綁 stack** | 綠 |
+| `quality` | Lint、Typecheck、Test、Build | **紅**（四個 script 是刻意失敗的佔位） |
+
+分開是刻意的：混在同一個 job 的話，你還沒設定 stack 的期間整個 CI 都是紅的，
+而 Branch / Lockfile / Spec 壞掉時沒有人會發現。**永遠紅的 CI 等於沒有 CI。**
+
+模板附的 `ruleset.json` 只把 `ci` 設成 required。
+**第 2 步設定完那四個 script 之後，把 `quality` 也加進去**：
+
+```json
+"required_status_checks": [
+  { "context": "ci",      "integration_id": 15368 },
+  { "context": "quality", "integration_id": 15368 }
+]
+```
+
+不加的話，lint 紅了、測試紅了，照樣合併得進 main。
+
 ### 兩個一定要自己決定的欄位
 
 **① `required_status_checks[0].integration_id`**
