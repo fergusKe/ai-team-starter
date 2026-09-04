@@ -154,7 +154,25 @@ def plain(s: str) -> str:
 MARKS_EXCLUSIVE = {"TBD", "Pending", "Cancelled", "Regular"}
 MARKS_FLAG = {"Alarm"}
 violations = []
-refs = []      # (被提到的 ID, 檔名, 行號)
+refs = []      # (被提到的工作項目 ID, 檔名, 行號)
+grefs = []     # (被提到的群組 ID, 檔名, 行號)
+
+# 哪些文件裡的 ID 要驗。**這是每個專案自己的選擇，預設保守。**
+#
+# `docs/WBS.md` 與 `docs/ROADMAP.md` 一定要驗 —— 前者是表本身，
+# 後者靠指向它的 ID 活著。要不要加 AGENTS.md／CLAUDE.md／README.md／
+# CONTEXT.md，看那份文件裡的 ID 是**真的引用**還是**格式範例**：
+#
+#   會直接點名「哪一組負責什麼」的 AGENTS.md 是真引用，斷掉會讓人
+#   去翻一組不存在的東西 —— 那就加進來。
+#   （實際發生過：重切群組之後 `FE-D`／`FE-I` 在四個地方躺著沒人發現。）
+#
+#   反過來，這個模板的 README 用 `APP-C01` 示範表格長相 ——
+#   把它加進來，每個複製模板的專案一開工就是紅的。所以預設不加。
+#
+# 圍籬程式碼區塊（``` 之間）一律跳過 —— 那裡面是範例，不是引用。
+# `docs/DECISIONS.md` 刻意不驗：它是歷史，會引用當時的 ID 當例子。
+REF_SOURCES = ["docs/WBS.md", "docs/ROADMAP.md"]
 _groups, _milestones, _deps = [], [], []
 
 def parse_mark(mark: str):
@@ -348,17 +366,31 @@ if wbs_path.exists():
     #
     # 〈舊 ID 去哪了〉那一節例外 —— 它的工作就是提舊 ID。
     #
+    # **群組 ID（`FE-O` 這種沒有數字的）也要驗。** 只驗工作項目的話，
+    # 重切群組之後 `FE-D`／`FE-I` 這類引用會躺著沒人發現 ——
+    # 它們指向的是「整組能力」，斷掉的時候讀的人會去翻一組不存在的東西。
+    #
     # **docs/ROADMAP.md 也一起掃**（有的話）。產品意圖那一份靠指向這裡的 ID 活著；
     # 它一旦自己養一份排程或功能表，工作分解表重排之後不會有任何東西發現，
     # 於是同一個 W8 在兩份文件裡變成兩件事 —— 頂端加警告沒有用，
     # 讀的人滑過警告就看表了。排程只放一份，剩下的 ID 由這裡看著。
-    for _src in (wbs_path, pathlib.Path("docs/ROADMAP.md")):
+    #
+    # 掃哪幾份見上面的 REF_SOURCES。
+    for _src in [pathlib.Path(x) for x in REF_SOURCES]:
         if not _src.exists():
             continue
         in_legacy = False
+        in_fence = False
         for lineno, line in enumerate(
                 _src.read_text(encoding="utf-8").splitlines(), 1):
             s = line.strip()
+            # 圍籬裡是範例，不是引用。**先判斷再跳過** —— 圍籬本身這一行
+            # 也不該被掃（``` 後面可能接語言名）。
+            if s.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
             if s.startswith("## "):
                 in_legacy = "舊 ID" in s
                 continue
@@ -366,9 +398,13 @@ if wbs_path.exists():
                 continue
             # `APP-S02/03/04` 這種縮寫也要展開
             for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
-                refs.append((m.group(1) + m.group(2), _src.name, lineno))
+                refs.append((m.group(1) + m.group(2), str(_src), lineno))
                 for tail in re.findall(r"[0-9]{2}", m.group(3)):
-                    refs.append((m.group(1) + tail, _src.name, lineno))
+                    refs.append((m.group(1) + tail, str(_src), lineno))
+            # 群組 ID：後面**不能**接英數，否則 `APP-C01` 會被當成群組 `APP-C`。
+            # `外部-拒` 這種非 A-Z 的分類詞不會 match，那是分類詞不是群組。
+            for m in re.finditer(r"\b([A-Z]{2,4}-[A-Z])(?![0-9A-Za-z])", s):
+                grefs.append((m.group(1), str(_src), lineno))
 
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
@@ -622,12 +658,23 @@ for wid in order:
         if not info["fallback"]:
             violations.append(f"{wid}：缺口沒有 fallback（在敘述裡寫 `【沒答案就】…`）")
 
+_gids = {g["id"] for g in _groups}
+seen_gref = set()
+for gid, fname, ln in grefs:
+    # 一張群組都認不出來的話不驗 —— 那是別的問題（沒有 WBS 或標題格式壞了），
+    # 在這裡報一堆「群組不存在」只會蓋掉真正的訊號。
+    if not _gids or gid in _gids or (gid, fname) in seen_gref:
+        continue
+    seen_gref.add((gid, fname))
+    violations.append(f"{fname} 第 {ln} 行提到的群組 {gid} 不存在"
+                      f"（重整群組之後斷掉的引用？）")
+
 seen_ref = set()
 for rid, fname, ln in refs:
     if rid in wbs or (rid, fname) in seen_ref:
         continue
     seen_ref.add((rid, fname))
-    violations.append(f"docs/{fname} 第 {ln} 行提到的 {rid} 不存在"
+    violations.append(f"{fname} 第 {ln} 行提到的 {rid} 不存在"
                       f"（重整群組之後斷掉的引用？）")
 
 for wid in order:

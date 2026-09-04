@@ -36,6 +36,14 @@ baseline() {
 
 APP-Z99 已經改名。**這一節提到不存在的 ID 是它的工作**，不該被當成違規。
 
+## DEP-G 外部缺口
+
+## APP-C 應用
+
+## APP-P 清單
+
+## APP-O 平台與交付
+
 ## 工作項目
 
 | ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |
@@ -62,8 +70,38 @@ APP-Z98 已經改名。這一節在兩份文件裡都是例外。
 |---|---|
 | 骨架 | `APP-C01` |
 | 清單 | `APP-P03` |
+
+整組能力在 `APP-O`；外部缺口見 `DEP-G`。
+`外部-缺` 是分類詞，不是群組 —— 不該被當成引用。
+
+圍籬裡是格式範例，不是引用：
+
+```markdown
+| XYZ-Q99 | 範例 | 示範表格長相 | W1 | 3 | | |
+```
 RM
   ( cd "$W" && git init -q 2>/dev/null; git -C "$W" add -A 2>/dev/null; ) >/dev/null 2>&1
+}
+
+# run_absent <期望退出碼> <說明> <訊息裡**不該**出現的字>
+#
+# 只斷言「該出現的出現了」不夠 —— 一個誤報會照樣讓那種斷言通過。
+# 群組檢查最可能的誤報是把 `APP-C01` 的前五個字當成群組引用。
+run_absent() {
+  local want="$1" desc="$2" needle="$3"
+  local out rc
+  out="$(cd "$W" && bash .github/scripts/progress.sh --check 2>&1)"; rc=$?
+  if [ "$rc" != "$want" ]; then
+    echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
+    FAIL=$((FAIL + 1)); return
+  fi
+  if printf '%s' "$out" | grep -q "$needle"; then
+    echo "✗ ${desc} —— 訊息裡不該出現「${needle}」，但它出現了"
+    echo "$out" | sed 's/^/      /' | head -20
+    FAIL=$((FAIL + 1)); return
+  fi
+  echo "✓ $desc"
+  PASS=$((PASS + 1))
 }
 
 # run <期望退出碼> <說明> <關鍵字>
@@ -287,6 +325,38 @@ run 0 "ROADMAP 沒有工作分解表：不影響綠燈" ""
 baseline
 edit_roadmap "APP-Z98 已經改名。" "APP-Z98 與 APP-Z97 都已經改名。"
 run 0 "ROADMAP 的〈舊 ID 去哪了〉可以提舊 ID：綠" ""
+
+# ── 群組 ID ───────────────────────────────────────────────────────
+# 群組 ID 沒有數字，原本整套檢查都看不到它們。重切群組之後 `FE-D`／`FE-I`
+# 這類引用會躺著沒人發現 —— 實際發生過，其中兩個就在工作分解表自己裡面。
+baseline
+edit_roadmap "整組能力在 \`APP-O\`" "整組能力在 \`APP-D\`"
+run 1 "提到不存在的群組：紅" "群組 APP-D 不存在"
+
+baseline
+edit "## APP-C 應用" "## APP-C 應用（改名了）"
+run 0 "群組標題後面的說明可以改：綠" ""
+
+# 工作項目的 ID 不可以被誤判成群組 —— `APP-C01` 的前五個字是 `APP-C`
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C02\` |"
+run 1 "項目不存在要報出來" "APP-C02 不存在"
+run_absent 1 "但不該順便把它的前五個字當成不存在的群組" "群組 APP-C 不存在"
+
+# 非 A-Z 結尾的分類詞不是群組（`外部-缺`、`BE-拒` 這種）
+baseline
+edit_roadmap "\`外部-缺\` 是分類詞" "\`外部-缺\` 與 \`外部-拒\` 是分類詞"
+run 0 "非 A-Z 結尾的分類詞不算群組引用：綠" ""
+
+# 圍籬裡的 ID 是格式範例。**不跳過的話，每個複製模板的專案一開工就是紅的**
+# —— README 用 `APP-C01` 示範表格長相，而那個專案的 ID 是別的前綴。
+baseline
+run_absent 0 "圍籬裡的範例 ID 不算引用：綠" "XYZ-Q99"
+
+# 但圍籬外的同一個 ID 要照樣被抓 —— 免得「跳過圍籬」變成一個萬用消音器
+baseline
+edit_roadmap "圍籬裡是格式範例，不是引用：" "圍籬外提到 \`XYZ-Q99\`："
+run 1 "圍籬外的同一個 ID 照樣要紅" "XYZ-Q99 不存在"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
