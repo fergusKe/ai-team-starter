@@ -179,9 +179,11 @@ git object database 證明實作 PR 沒有回頭改它。
 ## 怎麼看「現在做到哪裡」
 
 ```bash
-bash .github/scripts/progress.sh          # 有哪些 change、各自做到哪
-bash .github/scripts/progress.sh --all    # 連還沒開始的一起列（需要 docs/WBS.md）
+bash .github/scripts/progress.sh            # 有哪些 change、各自做到哪
+bash .github/scripts/progress.sh --all      # 連還沒開始的一起列（需要 docs/WBS.md）
 bash .github/scripts/progress.sh --week W1
+bash .github/scripts/progress.sh --blocked  # 現在做不了的，以及被什麼擋住
+bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束（CI 在跑）
 ```
 
 **它是算出來的，沒有人維護。** 資料來自 `openspec/changes/` 的 `tasks.md`
@@ -191,9 +193,63 @@ bash .github/scripts/progress.sh --week W1
 > 而**過期的狀態文件比沒有更危險** —— 讀的人會相信它。
 
 想看「還剩哪些沒做」的話，把工作分解表放進 `docs/WBS.md`：
-第一欄放工作項目 ID（`FE-C01` 這種格式）、第四欄週次、第五欄點數，
-同一項目的續行第一欄留空。然後**把 change 命名成以那個 ID 開頭**
-（`fe-c01-appshell`），對應就自動成立。
+
+```markdown
+| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |
+|---|---|---|---|---|---|---|
+| APP-C01 | 應用骨架 | 專案骨架與路由 | W1 | 3 | | |
+| | | 全域 Layout 與 Provider | W1 | 2 | | |
+| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | |
+| | | 搜尋與篩選 | — | — | DEP-G01 | Pending｜對方還沒提供 |
+| DEP-G01 | 外部服務沒有搜尋 | 去問。**【沒答案就】**介面誠實地叫「瀏覽」 | 決策≤W1 | — | `外部-缺` | Alarm｜這是核心價值 |
+```
+
+前五欄是必要的：**ID、名稱、工作、週、點**。同一項目的續行第一欄留空。
+然後**把 change 命名成以那個 ID 開頭**（`app-c01-shell`），對應就自動成立。
+
+第六、七欄是選用的，但**一旦用了就會被 CI 驗**：
+
+| 欄 | 放什麼 |
+|---|---|
+| `阻塞` | 這一項被什麼擋住。可以指向另一個工作項目的 ID |
+| `標記` | 機器算不出來的人為決定，格式固定 **`標記｜理由`** |
+
+`標記` 只有五個值。前四個互斥，`Alarm` 可以跟它們並存（`Alarm＋Pending｜理由`）：
+
+| 標記 | 什麼時候用 |
+|---|---|
+| `TBD` | **要不要做**還沒決定 |
+| `Pending` | 決定要做，但在等一件具體的事 |
+| `Cancelled` | 決定不做。**那一列不要刪** —— 「考慮過並決定不做」跟「沒想到」是兩件事 |
+| `Regular` | 常態性工作，沒有完成點 |
+| `Alarm` | 有風險、或會擋住別的東西。它不是處置 |
+
+### 現在做不了的事，要跟「還沒排到」分開
+
+一個**沒有週次**（寫 `—`）的項目，代表它現在做不了。它不算進「未開始」，
+另外列 —— 把卡住的東西算進「還沒做」，進度看起來只是慢，其實是卡住。
+
+被別的項目擋著、又沒有週次的「缺口」，必須寫清楚兩件事：
+
+```
+週欄    決策≤W2          最晚哪一週要有答案（是決策期限，不是交付估時）
+敘述欄  【沒答案就】…      期限到了還沒答案要怎麼辦
+```
+
+**沒有 fallback 的缺口，會變成下游偷偷假設一個還不存在的能力。**
+
+`progress.sh` 會反推「這個缺口解掉會解鎖幾項」並排序 —— 那是決定先問哪一個的依據。
+
+### 這些規則是 CI 在驗的，不是建議
+
+`--check` 會紅的情況：標記沒附理由、互斥的處置並存、缺口少了決策期限或
+fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依賴指向不存在的 ID。
+
+解析本身也 fail-closed：找不到表、表頭壞了、表格被空行截斷、欄數對不上、
+第一筆漏了 ID、ID 重複 —— 全部會紅，**不會安靜地跳過**。
+
+負向測試在 `.github/scripts/test-progress-check.sh`，每一條都是**先實測繞過成功**
+才補起來的。**沒有 `docs/WBS.md` 的專案不受影響**，`--check` 直接通過。
 
 `tasks.md` 的打勾由 `/opsx:apply` 邊做邊更新，而
 `openspec validate --archived --strict` 會擋住「還有 `- [ ]` 就 archive」——
@@ -212,11 +268,12 @@ bash .github/scripts/progress.sh --week W1
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
 | `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
-| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做 |
+| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住 |
 | `prompts/` | 每個階段貼給 AI 的提示 |
 | `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |
 | `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |
-| `.github/scripts/test-check-pr-branch.sh` | 45 個案例。閘門壞掉的方式是安靜的 |
+| `.github/scripts/test-check-pr-branch.sh` | 分支閘門的負向測試。閘門壞掉的方式是安靜的 |
+| `.github/scripts/test-progress-check.sh` | 工作分解表閘門的負向測試 |
 | `.github/ruleset.json` | GitHub ruleset 的快照兼 API payload。ruleset 不在版控裡，這份讓它看得見 |
 | `.github/scripts/check-ruleset.sh` | 偵測線上設定與快照的漂移 |
 
