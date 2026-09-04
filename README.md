@@ -184,7 +184,23 @@ bash .github/scripts/progress.sh --all      # 連還沒開始的一起列（需�
 bash .github/scripts/progress.sh --week W1
 bash .github/scripts/progress.sh --blocked  # 現在做不了的，以及被什麼擋住
 bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束（CI 在跑）
+bash .github/scripts/progress.sh --json     # 解析結果 ＋ 算好的狀態，給別的工具吃
+bash .github/scripts/wbs-page.sh --open     # 整份計畫的網頁版（要 review 時用）
 ```
+
+### 狀態只算一次
+
+`--json` 存在的理由：**別的工具不要自己再算一次。**
+
+這一條是被實測逼出來的 —— 在一個真實專案裡，指令、網頁、Excel 匯出
+三個地方各自實作了同一套狀態判定，**同一份 WBS 給出三個不同的答案**。
+原因是各自對「標記要不要看續行」「阻塞欄要不要看原文」做了不同假設。
+
+> **同一件事寫在兩個地方一定會漂。**
+> 解法不是「寫個文件提醒兩邊要同步」，是**讓它只有一份**。
+
+`wbs-page.sh` 就是這樣做的：它不解析 `WBS.md`，它吃 `--json`。
+產物 `docs/wbs.html` **不進版控** —— 從來源產，就沒有第二份要對齊的東西。
 
 **它是算出來的，沒有人維護。** 資料來自 `openspec/changes/` 的 `tasks.md`
 打勾狀態與遠端分支 —— 也就是說**它不會漂**。
@@ -304,6 +320,7 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 | `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |
 | `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |
 | `.github/scripts/test-check-pr-branch.sh` | 分支閘門的負向測試。閘門壞掉的方式是安靜的 |
+| `.github/scripts/wbs-page.sh` | 把工作分解表產成一頁可以點開收合的網頁。**產物不進版控** |
 | `.github/scripts/test-progress-check.sh` | 工作分解表閘門的負向測試 |
 | `.github/ruleset.json` | GitHub ruleset 的快照兼 API payload。ruleset 不在版控裡，這份讓它看得見 |
 | `.github/scripts/check-ruleset.sh` | 偵測線上設定與快照的漂移 |
