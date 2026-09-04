@@ -87,6 +87,9 @@
 #   第一筆資料列漏了 ID           畫面上仍是正常的表，那一列卻整個不見
 #   同一個 ID 出現兩次            前一段被蓋掉，後一段被重複計數
 #   依賴 ID 打錯或夾了格式        `BE-GO1`、`BE-G**O**1`、非 ASCII 連字號
+#   敘述裡指向不存在的項目         「由 XXX 取代」而 XXX 已經不在了。
+#                                重整群組之後最容易斷的就是這種，實測過一次斷五處。
+#                                〈舊 ID 去哪了〉那一節例外，它的工作就是提舊 ID
 #
 # 比對與抽 token 之前一律先 `plain()` 正規化（剝 Markdown／HTML、統一連字號）——
 # **不要拿原始字串去比對**，加個星號就能讓整段檢查失效。
@@ -101,11 +104,13 @@ ONLY_WEEK=""
 SHOW_ALL=0
 ONLY_BLOCKED=0
 CHECK=0
+JSON=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)     SHOW_ALL=1 ;;
     --blocked) ONLY_BLOCKED=1 ;;
     --check)   CHECK=1 ;;
+    --json)    JSON=1 ;;
     --week)    shift; ONLY_WEEK="${1:-}" ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
@@ -115,12 +120,13 @@ done
 
 git fetch -q origin 2>/dev/null || true
 
-SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" python3 - <<'PY'
+SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" python3 - <<'PY'
 import os, re, subprocess, pathlib, collections
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
 ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
 CHECK = os.environ.get("CHECK") == "1"
+JSON = os.environ.get("JSON") == "1"
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
 
 G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
@@ -147,6 +153,8 @@ def plain(s: str) -> str:
 MARKS_EXCLUSIVE = {"TBD", "Pending", "Cancelled", "Regular"}
 MARKS_FLAG = {"Alarm"}
 violations = []
+refs = []      # (被提到的 ID, 行號)
+_groups, _milestones, _deps = [], [], []
 
 def parse_mark(mark: str):
     """回傳 (標記集合, 理由)。格式是 `標記｜理由`，標記之間用 ＋ 串。"""
@@ -268,7 +276,8 @@ if wbs_path.exists():
             cur = wid
             wbs[wid] = {"name": name, "weeks": set(), "pts": 0,
                         "blocked": "", "mark": "", "blockers": set(),
-                        "deadline": None, "fallback": False, "rows": []}
+                        "deadline": None, "fallback": False, "rows": [],
+                        "detail": []}
             order.append(wid)
         if cur is None:
             # 表格的第一筆資料列沒有 ID —— 漏貼或誤刪都很平常，
@@ -320,6 +329,8 @@ if wbs_path.exists():
 
         # 標記的格式在**每一列**都驗。續行上的處置只管那一列，但格式一樣要對 ——
         # 一個沒有理由的 `Cancelled`，六個月後沒有人敢刪它。
+        wbs[cur]["detail"].append({"work": _work, "week": week, "pts": pts,
+                                   "blk": blocked, "mark": mark})
         if mark:
             violations.extend(check_mark(wid or cur, mark))
 
@@ -330,11 +341,56 @@ if wbs_path.exists():
             wbs[cur]["blocked"] = blocked
             wbs[cur]["mark"] = mark
 
+    # 全文提到的工作項目 ID。**不只阻塞欄** ——
+    # 敘述與理由裡也會指來指去（「由 FE-M09 取代」「擋住 FE-S02/03」），
+    # 而重整群組之後那些會斷掉，沒有任何東西會發現。實測過：一次斷了五處。
+    #
+    # 〈舊 ID 去哪了〉那一節例外 —— 它的工作就是提舊 ID。
+    in_legacy = False
+    for lineno, line in enumerate(_lines, 1):
+        s = line.strip()
+        if s.startswith("## "):
+            in_legacy = "舊 ID" in s
+            continue
+        if in_legacy:
+            continue
+        # `FE-S02/03/04` 這種縮寫也要展開
+        for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
+            refs.append((m.group(1) + m.group(2), lineno))
+            for tail in re.findall(r"[0-9]{2}", m.group(3)):
+                refs.append((m.group(1) + tail, lineno))
+
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
         # 所有檢查都會「通過」，因為根本沒有東西被檢查。
         violations.append("docs/WBS.md 裡找不到任何工作分解表"
                           "（表頭要是 `| ID | 項目 | 工作 | 週 | 點 | …`，5 欄以上）")
+
+    # 群組、里程碑、跨項依賴 —— --json 的消費端需要，順手在同一趟解析裡收
+    _text = wbs_path.read_text(encoding="utf-8")
+    for m in re.finditer(r"^## ((?:FE|BE)-[A-Z]) (.+)$", _text, re.M):
+        _groups.append({"id": m.group(1), "title": m.group(2).strip(), "desc": ""})
+    for g in _groups:
+        seg = _text.split("## " + g["id"] + " ", 1)
+        if len(seg) > 1:
+            g["desc"] = "\n".join(l[2:] for l in seg[1].split("\n|", 1)[0].splitlines()
+                                   if l.startswith("> "))
+    _mi = _text.find("## 里程碑")
+    if _mi > 0:
+        for line in _text[_mi:].splitlines():
+            if not line.strip().startswith("| **W"):
+                continue
+            cc = [x.strip() for x in line.strip().strip("|").split("|")]
+            if len(cc) >= 2:
+                _milestones.append({"w": re.sub(r"[*]", "", cc[0]), "text": cc[1]})
+    _di = _text.find("已知的跨項依賴")
+    if _di > 0:
+        for line in _text[_di:_di + 2000].splitlines():
+            if not line.startswith("| `"):
+                continue
+            cc = [x.strip() for x in line.strip().strip("|").split("|")]
+            if len(cc) == 2:
+                _deps.append({"a": cc[0], "b": cc[1]})
 
 # ── OpenSpec 的實際狀態 ────────────────────────────────────────────
 def tasks_progress(d: pathlib.Path):
@@ -385,6 +441,7 @@ rows, tally = [], collections.Counter()
 by_group = collections.defaultdict(collections.Counter)
 # 缺口 → 它擋住哪些項目。從各項目的「阻塞」欄反推，沒有人維護。
 blocks = collections.defaultdict(set)
+_state_of = {}
 for wid in order:
     info = wbs[wid]
     wk = sorted(info["weeks"])
@@ -466,6 +523,7 @@ for wid in order:
         detail = detail[:43] + "…"
 
     tally[state] += 1
+    _state_of[wid] = state
     by_group[re.sub(r"[0-9]+$", "", wid)][state] += 1
     if ONLY_BLOCKED and state not in ("等外部", "待裁決"):
         continue
@@ -474,6 +532,31 @@ for wid in order:
     # 名稱裡的 markdown 強調符號在終端機是雜訊，拿掉。
     label = re.sub(r"[*`]", "", info["name"])[:18]
     rows.append((colour, wid, label, weeks, info["pts"], state, detail))
+
+if JSON:
+    # **狀態只算一次，別的工具吃這一份。**
+    # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
+    # 那正是這份文件到處在防的「同一件事寫在兩個地方」。
+    import json as _json
+    out = {"items": [], "groups": _groups, "affects": {},
+           "milestones": _milestones, "deps": _deps}
+    _aff = collections.defaultdict(list)
+    for wid in order:
+        info = wbs[wid]
+        marks, reason = parse_mark(info["mark"])
+        out["items"].append({
+            "id": wid, "group": re.sub(r"[0-9]+$", "", wid), "name": info["name"],
+            "weeks": sorted(info["weeks"], key=lambda s: int(re.findall(r"\d+", s)[0])),
+            "pts": info["pts"], "blockers": sorted(info["blockers"]),
+            "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
+            "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
+        })
+        for g in info["blockers"]:
+            _aff[g].append(wid)
+    out["affects"] = dict(_aff)
+    out["violations"] = violations
+    print(_json.dumps(out, ensure_ascii=False))
+    raise SystemExit(1 if (CHECK and violations) else 0)
 
 if not wbs:
     # 沒有工作分解表 —— 只列 change 本身。
@@ -525,6 +608,14 @@ for wid in order:
             violations.append(f"{wid}：缺口沒有決策期限（週欄寫 `決策≤Wn`）")
         if not info["fallback"]:
             violations.append(f"{wid}：缺口沒有 fallback（在敘述裡寫 `【沒答案就】…`）")
+
+seen_ref = set()
+for rid, ln in refs:
+    if rid in wbs or rid in seen_ref:
+        continue
+    seen_ref.add(rid)
+    violations.append(f"docs/WBS.md 第 {ln} 行提到的 {rid} 不存在"
+                      f"（重整群組之後斷掉的引用？）")
 
 for wid in order:
     info = wbs[wid]

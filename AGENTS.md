@@ -157,7 +157,11 @@ change id 與 slice 的分界，不需要任何消歧邏輯。
 ```bash
 bash .github/scripts/progress.sh --blocked   # 現在做不了的，以及被什麼擋住
 bash .github/scripts/progress.sh --check     # 有規則違規就以非零結束
+bash .github/scripts/wbs-page.sh --open      # 整份計畫的網頁版
 ```
+
+**要拿工作分解表的資料去做別的東西，跟 `progress.sh --json` 要。**
+不要自己再解析一次、也不要自己再算一次狀態 —— 那樣做過一次，三邊給出三個答案。
 
 `--check` 在 CI 裡。它驗的是這張表自己訂的規則，包含**工作的週次必須嚴格
 晚於它依賴的裁決期限**，以及**解析 fail-closed**（表頭壞了、表格被截斷、

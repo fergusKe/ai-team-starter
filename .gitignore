@@ -11,3 +11,8 @@ build/
 coverage/
 playwright-report/
 test-results/
+
+# wbs-page.sh 的產物。**產出來的東西不進版控** ——
+# 一份「從 WBS.md 產出來、卻自己存在版控裡」的 HTML 會漂：
+# 有人改了 WBS 但忘了重產，那一頁就開始說謊，而且沒有人會發現。
+docs/wbs.html
