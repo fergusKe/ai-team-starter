@@ -89,6 +89,24 @@ jobs:
       - name: Spec
         run: npx openspec validate --all --strict
 
+      # 工作分解表自己訂的規則（沒有 docs/WBS.md 的專案會直接通過）。
+      #
+      # 為什麼它在 CI 而 check-ruleset.sh 不在：這一支**不需要任何額外權限**，
+      # 只讀 repo 裡的檔案；ruleset 那支要 administration:read，
+      # 為它擴大 CI 的權限面不划算。判準是權限，不是重要性。
+      #
+      # 驗的是：標記要附理由、互斥的處置不得並存、缺口要有決策期限與
+      # fallback、工作的週次必須嚴格晚於它依賴的裁決期限、依賴不得懸空，
+      # 以及**解析本身 fail-closed**（表頭壞了、表格被截斷、欄數對不上、
+      # ID 重複或漏掉，全部會紅，不會安靜跳過）。
+      - name: WBS
+        run: bash .github/scripts/progress.sh --check
+
+      # 上面那支閘門自己的測試。**閘門壞掉的方式是安靜的** ——
+      # 不會有東西變紅，只會有本來該紅的東西變綠。
+      - name: WBS gate tests
+        run: bash .github/scripts/test-progress-check.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——

@@ -388,11 +388,17 @@ ARCHIVE_IDENTITY
     # 它們要能被改，但必須單獨出現在一個 PR 裡讓人看見 ——
     # 夾在功能 PR 裡改 ci.yml 是這套設計最怕的事。
     #
+    # `docs/WBS.md` 也在清單裡：**它是 CI 在驗的產物。**
+    # `progress.sh --check` 從它讀決策期限、fallback 與依賴，
+    # 改它會直接改變閘門的判定，所以它屬於規則面，不是文件面。
+    # `docs/ROADMAP.md` 一起放進來的理由**不一樣**：它不是 --check 的輸入，
+    # 純粹是防漂移的治理選擇（工作分解表會對照它）。
+    #
     # 注意：這一關擋不住「在 PR 裡把 ci.yml 改成 run: true」。
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|SETUP-GITHUB\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
