@@ -17,6 +17,7 @@
 #
 # 資料來源全部是機器可查的事實：
 #   docs/WBS.md              有哪些工作項目（ID 是第一欄）
+#   docs/ROADMAP.md          產品意圖。只檢查它提到的 ID 存不存在
 #   openspec/changes/<id>/   進行中的 change 與它的 tasks.md 打勾狀態
 #   openspec/changes/archive/ 已經完成並封存的
 #   git branch -r            有沒有人正在某個 change 上開分支
@@ -153,7 +154,7 @@ def plain(s: str) -> str:
 MARKS_EXCLUSIVE = {"TBD", "Pending", "Cancelled", "Regular"}
 MARKS_FLAG = {"Alarm"}
 violations = []
-refs = []      # (被提到的 ID, 行號)
+refs = []      # (被提到的 ID, 檔名, 行號)
 _groups, _milestones, _deps = [], [], []
 
 def parse_mark(mark: str):
@@ -346,19 +347,28 @@ if wbs_path.exists():
     # 而重整群組之後那些會斷掉，沒有任何東西會發現。實測過：一次斷了五處。
     #
     # 〈舊 ID 去哪了〉那一節例外 —— 它的工作就是提舊 ID。
-    in_legacy = False
-    for lineno, line in enumerate(_lines, 1):
-        s = line.strip()
-        if s.startswith("## "):
-            in_legacy = "舊 ID" in s
+    #
+    # **docs/ROADMAP.md 也一起掃**（有的話）。產品意圖那一份靠指向這裡的 ID 活著；
+    # 它一旦自己養一份排程或功能表，工作分解表重排之後不會有任何東西發現，
+    # 於是同一個 W8 在兩份文件裡變成兩件事 —— 頂端加警告沒有用，
+    # 讀的人滑過警告就看表了。排程只放一份，剩下的 ID 由這裡看著。
+    for _src in (wbs_path, pathlib.Path("docs/ROADMAP.md")):
+        if not _src.exists():
             continue
-        if in_legacy:
-            continue
-        # `FE-S02/03/04` 這種縮寫也要展開
-        for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
-            refs.append((m.group(1) + m.group(2), lineno))
-            for tail in re.findall(r"[0-9]{2}", m.group(3)):
-                refs.append((m.group(1) + tail, lineno))
+        in_legacy = False
+        for lineno, line in enumerate(
+                _src.read_text(encoding="utf-8").splitlines(), 1):
+            s = line.strip()
+            if s.startswith("## "):
+                in_legacy = "舊 ID" in s
+                continue
+            if in_legacy:
+                continue
+            # `APP-S02/03/04` 這種縮寫也要展開
+            for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
+                refs.append((m.group(1) + m.group(2), _src.name, lineno))
+                for tail in re.findall(r"[0-9]{2}", m.group(3)):
+                    refs.append((m.group(1) + tail, _src.name, lineno))
 
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
@@ -368,7 +378,10 @@ if wbs_path.exists():
 
     # 群組、里程碑、跨項依賴 —— --json 的消費端需要，順手在同一趟解析裡收
     _text = wbs_path.read_text(encoding="utf-8")
-    for m in re.finditer(r"^## ((?:FE|BE)-[A-Z]) (.+)$", _text, re.M):
+    # **不要把前綴寫死成 FE/BE。** 這支腳本是共用的；別的專案用 APP-、DEP-、
+    # SVC-⋯⋯ 的話整組會被當成不存在，而它的項目照樣算進總數 ——
+    # 網頁上少了一整組、計數卻是對的，兩邊都不會報錯。
+    for m in re.finditer(r"^## ([A-Z]+-[A-Z]) (.+)$", _text, re.M):
         _groups.append({"id": m.group(1), "title": m.group(2).strip(), "desc": ""})
     for g in _groups:
         seg = _text.split("## " + g["id"] + " ", 1)
@@ -610,11 +623,11 @@ for wid in order:
             violations.append(f"{wid}：缺口沒有 fallback（在敘述裡寫 `【沒答案就】…`）")
 
 seen_ref = set()
-for rid, ln in refs:
-    if rid in wbs or rid in seen_ref:
+for rid, fname, ln in refs:
+    if rid in wbs or (rid, fname) in seen_ref:
         continue
-    seen_ref.add(rid)
-    violations.append(f"docs/WBS.md 第 {ln} 行提到的 {rid} 不存在"
+    seen_ref.add((rid, fname))
+    violations.append(f"docs/{fname} 第 {ln} 行提到的 {rid} 不存在"
                       f"（重整群組之後斷掉的引用？）")
 
 for wid in order:

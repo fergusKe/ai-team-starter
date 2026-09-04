@@ -10,8 +10,13 @@ ITEMS.forEach(it => {
   it.alarm = it.marks.includes("Alarm");
 });
 
-const FE = ITEMS.filter(i => i.group !== "BE-G");
-const GAPS = ITEMS.filter(i => i.group === "BE-G");
+// **銜接清單是哪一組，用算的。** 寫死組名的話，換個命名
+// （BE-G、DEP-G、EXT-G⋯⋯）整個側欄會靜靜地空掉，而且沒有人會發現。
+// 定義：被別的項目寫在「阻塞」欄的那些項目，它們所屬的組。
+const GAP_GROUPS = new Set(
+  ITEMS.filter(i => AFFECTS[i.id] && AFFECTS[i.id].length).map(i => i.group));
+const GAPS = ITEMS.filter(i => GAP_GROUPS.has(i.group));
+const FE = ITEMS.filter(i => !GAP_GROUPS.has(i.group));
 const wkNum = w => parseInt(String(w).match(/\d+/)[0], 10);
 
 // 行內 markdown：粗體與行內碼。內容是我們自己寫的，但還是只認這兩種
@@ -104,7 +109,11 @@ function match(it) {
 
 function rowHTML(it) {
   const hit = ui.gap && it.blockers.includes(ui.gap);
-  const wks = it.weeks.map(w => `<span class="wk">${w}</span>`).join("");
+  // 銜接清單沒有週次 —— 它的「週」欄放的是決策期限，不是工期。
+  // 少了這一行，那些項目在清單裡看起來像「忘了排」。
+  const wks = it.weeks.length
+    ? it.weeks.map(w => `<span class="wk">${w}</span>`).join("")
+    : (it.deadline ? `<span class="wk dl">決策≤W${it.deadline}</span>` : "");
   const dep = it.blockers.length
     ? `<span class="dep" title="這幾列要跟後端對齊：${it.blockers.join("、")}">↗${it.blockers.length}</span>` : "";
   const st = it.st.t === "未開始" ? "" : `<span class="st ${it.st.k}">${it.st.t}</span>`;
@@ -133,15 +142,19 @@ function render() {
   [...$("bars").children].forEach(b => b.setAttribute("aria-pressed", +b.dataset.w === ui.week));
   [...$("gaps").querySelectorAll("button")].forEach(b => b.setAttribute("aria-pressed", b.dataset.g === ui.gap));
 
-  const shown = FE.filter(match);
-  $("count").textContent = shown.length === FE.length
-    ? FE.length + " 項" : shown.length + " / " + FE.length + " 項";
+  // **銜接清單也在主清單裡。** 側欄那份只有 ID 與名稱，
+  // 於是那些項目的實際內容在整頁上一個字都讀不到。側欄留著當索引與篩選器。
+  const shown = ITEMS.filter(match);
+  $("count").textContent = shown.length === ITEMS.length
+    ? ITEMS.length + " 項" : shown.length + " / " + ITEMS.length + " 項";
 
   if (!shown.length) { $("list").innerHTML = `<p class="empty">沒有符合的項目。</p>`; return; }
 
   let html = "";
   if (ui.view === "grp") {
-    GROUPS.filter(g => g.id !== "BE-G").forEach(g => {
+    // 銜接清單擺最後 —— 它不是我們的待辦，是給對方讀的
+    [...GROUPS.filter(g => !GAP_GROUPS.has(g.id)),
+     ...GROUPS.filter(g => GAP_GROUPS.has(g.id))].forEach(g => {
       const its = shown.filter(i => i.group === g.id); if (!its.length) return;
       const note = (GID[g.id].desc || "").split("\n").find(l => l.trim() && !l.startsWith("|")) || "";
       html += `<section class="grp"><div class="grp-h">
@@ -150,20 +163,38 @@ function render() {
         ${note ? `<p class="grp-note">${md(note)}</p>` : ""}
         ${its.map(rowHTML).join("")}</section>`;
     });
+    // **落在任何已知群組之外的項目要露出來。** 群組是從 `## <ID> 標題`
+    // 解析的；標題漏寫或格式不對，那一組的項目就會從畫面上消失，
+    // 而計數仍然是對的 —— 沒有任何一邊會報錯。寧可難看，不要靜靜少掉。
+    const orphan = shown.filter(i => !GID[i.group]);
+    if (orphan.length) {
+      html += `<section class="grp"><div class="grp-h">
+          <span class="gid">?</span><h2>沒有群組標題的項目</h2>
+          <span class="gn">${orphan.length} 項</span></div>
+        <p class="grp-note">這些項目的 <code>## ${
+          [...new Set(orphan.map(o => o.group))].join("／")
+        } …</code> 標題在 WBS.md 裡找不到 —— 補上標題它們就會歸位。</p>
+        ${orphan.map(rowHTML).join("")}</section>`;
+    }
   } else {
     const buckets = new Map();
     shown.forEach(it => {
-      const k = it.weeks.length ? wkNum(it.weeks[0]) : 999;
+      const k = it.weeks.length ? wkNum(it.weeks[0]) : (it.deadline || 999);
       if (!buckets.has(k)) buckets.set(k, []);
       buckets.get(k).push(it);
     });
     [...buckets.keys()].sort((a, b) => a - b).forEach(k => {
       const its = buckets.get(k);
       const label = k === 999 ? "沒有排程" : "W" + k;
+      // 決策期限跟工期混在同一週會誤讀，所以標題要說得出來。
+      // **要看 deadline，不是「沒有週次」** —— 已取消的缺口兩者都沒有，
+      // 用後者數，「沒有排程」那一桶會被說成「N 項是決策期限」。
+      const gaps = its.filter(i => !i.weeks.length && i.deadline).length;
       const mile = D.milestones.find(m => m.w === label);
       html += `<section class="grp"><div class="grp-h">
           <span class="gid">${label}</span><h2>${mile ? esc(mile.text.replace(/\*\*/g, "").split("。")[0]) : "尚未排程"}</h2>
-          <span class="gn">${its.length} 項 · ${its.reduce((a, b) => a + b.pts, 0)} 點</span></div>
+          <span class="gn">${its.length} 項 · ${its.reduce((a, b) => a + b.pts, 0)} 點${
+            gaps ? " · " + gaps + " 項是決策期限" : ""}</span></div>
         ${its.map(rowHTML).join("")}</section>`;
     });
   }

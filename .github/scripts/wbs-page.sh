@@ -58,7 +58,9 @@ html = ("<!doctype html>\n<html lang=\"zh-Hant\">\n<head>\n<meta charset=\"utf-8
         + "</body>\n</html>\n")
 pathlib.Path(out_path).write_text(html, encoding="utf-8")
 
-fe = [i for i in data["items"] if i["group"] != "BE-G"]
+# 銜接清單是哪一組用算的，不要寫死組名 —— 見 app.js 的同一段
+_gap = {i["group"] for i in data["items"] if data["affects"].get(i["id"])}
+fe = [i for i in data["items"] if i["group"] not in _gap]
 print("✓ " + out_path)
 print("  " + str(len(data["items"])) + " 項（" + str(len(fe)) + " 項在前端手上、"
       + str(len(data["items"]) - len(fe)) + " 項待銜接）、"

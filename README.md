@@ -315,7 +315,8 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
 | `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
-| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住 |
+| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住。**週次只放這裡** |
+| `docs/ROADMAP.md` | **選用。** 產品意圖：場景、功能地圖、不做的事。**不要放週次** —— 用 ID 指向 `WBS.md`，`--check` 會驗那些 ID |
 | `prompts/` | 每個階段貼給 AI 的提示 |
 | `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |
 | `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |
