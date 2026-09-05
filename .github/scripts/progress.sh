@@ -135,6 +135,10 @@ G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\0
 # ── 規則違規 ───────────────────────────────────────────────────────
 # **這一段是重點。** 前面那些規則如果只寫在文件裡，它們就只是規範；
 # 規範不會擋住任何人。這裡把它們變成看得到的違規。
+# 圍籬：``` 或 ~~~，後面可以接語言名。
+_FENCE = re.compile(r"^(?:`{3,}|~{3,})")
+
+
 def plain(s: str) -> str:
     """剝掉 Markdown 與 HTML 的裝飾，只留下讀者實際看到的字。
 
@@ -167,8 +171,11 @@ grefs = []     # (被提到的群組 ID, 檔名, 行號)
 #   去翻一組不存在的東西 —— 那就加進來。
 #   （實際發生過：重切群組之後 `FE-D`／`FE-I` 在四個地方躺著沒人發現。）
 #
-#   反過來，這個模板的 README 用 `APP-C01` 示範表格長相 ——
-#   把它加進來，每個複製模板的專案一開工就是紅的。所以預設不加。
+#   反過來，**判準是「圍籬外有沒有範例 ID」**，不是「這份文件有沒有範例」。
+#   這個模板的 README 用 `APP-C01` 示範表格長相，但那張表在 ```markdown
+#   圍籬裡，掃它是安全的（實測 0 個違規）。預設仍然只放 WBS 與 ROADMAP，
+#   理由是**複製模板的專案，它的 README 寫什麼我們不知道** ——
+#   預設掃一份還沒寫的文件，第一天就會紅得莫名其妙。
 #
 # 圍籬程式碼區塊（``` 之間）一律跳過 —— 那裡面是範例，不是引用。
 # `docs/DECISIONS.md` 刻意不驗：它是歷史，會引用當時的 ID 當例子。
@@ -383,28 +390,49 @@ if wbs_path.exists():
         in_fence = False
         for lineno, line in enumerate(
                 _src.read_text(encoding="utf-8").splitlines(), 1):
-            s = line.strip()
+            # **結構看原始行，ID 看正規化後的字串。** plain() 會剝掉
+            # 反引號與 `~`，圍籬那一行過完它就變成空字串了 ——
+            # 拿正規化後的字串去認圍籬，等於整個跳過機制失效。
+            raw = line.strip()
             # 圍籬裡是範例，不是引用。**先判斷再跳過** —— 圍籬本身這一行
-            # 也不該被掃（``` 後面可能接語言名）。
-            if s.startswith("```"):
+            # 也不該被掃（``` 後面可能接語言名）。`~~~` 也是合法圍籬，
+            # 不認得它就等於把裡面的範例當成真引用。
+            if _FENCE.match(raw):
                 in_fence = not in_fence
                 continue
             if in_fence:
                 continue
-            if s.startswith("## "):
-                in_legacy = "舊 ID" in s
+            if raw.startswith("## "):
+                in_legacy = "舊 ID" in raw
                 continue
             if in_legacy:
                 continue
+            # 抽 ID 之前正規化。只認原始字串的話，`FE\u2011D`（非 ASCII
+            # 連字號）跟 `<!-- FE-D -->`（註解裡的舊名）一個漏報一個誤報 ——
+            # 同一個字串在兩個地方有兩種讀法，就是這支腳本一直在抓的那種漂移。
+            s = plain(raw)
             # `APP-S02/03/04` 這種縮寫也要展開
-            for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
+            for m in re.finditer(
+                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])([0-9]{2})"
+                    r"((?:/[0-9]{2})*)(?![0-9A-Za-z])", s):
                 refs.append((m.group(1) + m.group(2), str(_src), lineno))
                 for tail in re.findall(r"[0-9]{2}", m.group(3)):
                     refs.append((m.group(1) + tail, str(_src), lineno))
             # 群組 ID：後面**不能**接英數，否則 `APP-C01` 會被當成群組 `APP-C`。
             # `外部-拒` 這種非 A-Z 的分類詞不會 match，那是分類詞不是群組。
-            for m in re.finditer(r"\b([A-Z]{2,4}-[A-Z])(?![0-9A-Za-z])", s):
+            # 左邊界不能用 `\b`：Python 的 `\w` 認得中文，`依賴FE-D完成`
+            # 在 `賴` 與 `F` 之間**沒有**邊界，整個引用就漏掉了。
+            # 前綴長度也不能寫死 `{2,4}` —— 工作項目那條是 `[A-Z]+`，
+            # 兩條不對稱的話 `ADMIN-Z` 這種群組只有一半會被驗到。
+            for m in re.finditer(
+                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])(?![0-9A-Za-z])", s):
                 grefs.append((m.group(1), str(_src), lineno))
+        if in_fence:
+            # 一個沒關的圍籬會讓**檔案後半段的引用全部消音**，而且是綠的。
+            # 「跳過圍籬」本來是為了放過格式範例，不是給人一個萬用消音器。
+            violations.append(f"{_src} 有沒關起來的程式碼圍籬"
+                              f"（``` 或 ~~~ 數量是奇數）—— "
+                              f"後面的引用全部不會被檢查")
 
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
@@ -582,64 +610,6 @@ for wid in order:
     label = re.sub(r"[*`]", "", info["name"])[:18]
     rows.append((colour, wid, label, weeks, info["pts"], state, detail))
 
-if JSON:
-    # **狀態只算一次，別的工具吃這一份。**
-    # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
-    # 那正是這份文件到處在防的「同一件事寫在兩個地方」。
-    import json as _json
-    out = {"items": [], "groups": _groups, "affects": {},
-           "milestones": _milestones, "deps": _deps}
-    _aff = collections.defaultdict(list)
-    for wid in order:
-        info = wbs[wid]
-        marks, reason = parse_mark(info["mark"])
-        out["items"].append({
-            "id": wid, "group": re.sub(r"[0-9]+$", "", wid), "name": info["name"],
-            "weeks": sorted(info["weeks"], key=lambda s: int(re.findall(r"\d+", s)[0])),
-            "pts": info["pts"], "blockers": sorted(info["blockers"]),
-            "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
-            "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
-        })
-        for g in info["blockers"]:
-            _aff[g].append(wid)
-    out["affects"] = dict(_aff)
-    out["violations"] = violations
-    print(_json.dumps(out, ensure_ascii=False))
-    raise SystemExit(1 if (CHECK and violations) else 0)
-
-if not wbs:
-    # 沒有工作分解表 —— 只列 change 本身。
-    if not changes:
-        print(f"{D}還沒有任何 OpenSpec change。{X}")
-        print(f"{D}用 /opsx:propose 開第一個，或看 prompts/01-discovery.md。{X}")
-    else:
-        print(f"{B}{'change':<34} {'狀態':<10} {'tasks'}{X}")
-        print("─" * 60)
-        for cid in sorted(changes):
-            c = changes[cid]
-            br = branches.get(cid, set())
-            prog = c.get("prog")
-            bar = f"{prog[0]}/{prog[1]}" if prog and prog[1] else "—"
-            if c["state"] == "archived":
-                st, colour = "已封存", G
-            elif "feat" in br or "fix" in br:
-                st, colour = "實作中", Y
-            elif "spec" in br:
-                st, colour = "規格審查中", Y
-            else:
-                st, colour = "規格已合併", Y
-            print(f"{colour}{cid:<34} {st:<10} {bar}{X}")
-        print()
-        print(f"{D}（沒有 docs/WBS.md，所以沒有「還有哪些沒做」的視角。{X}")
-        print(f"{D} 有工作分解表的話把它放在 docs/WBS.md，格式見這支腳本的開頭註解。）{X}")
-elif rows:
-    print(f"{B}{'ID':<9} {'項目':<20} {'週':<8} {'點':>3}  {'狀態':<12} {'change'}{X}")
-    print("─" * 78)
-    for colour, wid, name, weeks, pts, state, detail in rows:
-        pad = 20 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in name)
-        print(f"{colour}{wid:<9} {name}{' ' * max(pad,1)}{weeks:<8} {pts:>3}  {state:<12} {detail}{X}")
-    print()
-
 # ── 治理不變量 ─────────────────────────────────────────────────────
 def week_min(wk):
     """一個項目最早的週次。`W1–W5` 取 1。"""
@@ -698,6 +668,64 @@ for wid in order:
                 violations.append(
                     f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
                     f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
+
+if JSON:
+    # **狀態只算一次，別的工具吃這一份。**
+    # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
+    # 那正是這份文件到處在防的「同一件事寫在兩個地方」。
+    import json as _json
+    out = {"items": [], "groups": _groups, "affects": {},
+           "milestones": _milestones, "deps": _deps}
+    _aff = collections.defaultdict(list)
+    for wid in order:
+        info = wbs[wid]
+        marks, reason = parse_mark(info["mark"])
+        out["items"].append({
+            "id": wid, "group": re.sub(r"[0-9]+$", "", wid), "name": info["name"],
+            "weeks": sorted(info["weeks"], key=lambda s: int(re.findall(r"\d+", s)[0])),
+            "pts": info["pts"], "blockers": sorted(info["blockers"]),
+            "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
+            "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
+        })
+        for g in info["blockers"]:
+            _aff[g].append(wid)
+    out["affects"] = dict(_aff)
+    out["violations"] = violations
+    print(_json.dumps(out, ensure_ascii=False))
+    raise SystemExit(1 if (CHECK and violations) else 0)
+
+if not wbs:
+    # 沒有工作分解表 —— 只列 change 本身。
+    if not changes:
+        print(f"{D}還沒有任何 OpenSpec change。{X}")
+        print(f"{D}用 /opsx:propose 開第一個，或看 prompts/01-discovery.md。{X}")
+    else:
+        print(f"{B}{'change':<34} {'狀態':<10} {'tasks'}{X}")
+        print("─" * 60)
+        for cid in sorted(changes):
+            c = changes[cid]
+            br = branches.get(cid, set())
+            prog = c.get("prog")
+            bar = f"{prog[0]}/{prog[1]}" if prog and prog[1] else "—"
+            if c["state"] == "archived":
+                st, colour = "已封存", G
+            elif "feat" in br or "fix" in br:
+                st, colour = "實作中", Y
+            elif "spec" in br:
+                st, colour = "規格審查中", Y
+            else:
+                st, colour = "規格已合併", Y
+            print(f"{colour}{cid:<34} {st:<10} {bar}{X}")
+        print()
+        print(f"{D}（沒有 docs/WBS.md，所以沒有「還有哪些沒做」的視角。{X}")
+        print(f"{D} 有工作分解表的話把它放在 docs/WBS.md，格式見這支腳本的開頭註解。）{X}")
+elif rows:
+    print(f"{B}{'ID':<9} {'項目':<20} {'週':<8} {'點':>3}  {'狀態':<12} {'change'}{X}")
+    print("─" * 78)
+    for colour, wid, name, weeks, pts, state, detail in rows:
+        pad = 20 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in name)
+        print(f"{colour}{wid:<9} {name}{' ' * max(pad,1)}{weeks:<8} {pts:>3}  {state:<12} {detail}{X}")
+    print()
 
 if violations:
     print()
