@@ -49,7 +49,9 @@ header{border-bottom:1px solid var(--line);background:var(--surface);margin-bott
 .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;
   color:var(--muted);margin-bottom:9px}
 h1{font-size:26px;font-weight:700;letter-spacing:-.018em;line-height:1.2}
-.sub{color:var(--ink-2);font-size:13.5px;margin-top:8px;max-width:60ch}
+.lede{color:var(--ink-2);font-size:13.5px;margin-top:8px;max-width:60ch}
+/* `.sub` 是工作列的 ul，兩者曾經同名 —— 後面那條的 flex-direction:column
+   把副標的每個 <strong>／<span> 拆成獨立一行。名字不要重用。 */
 .tally{display:flex;gap:22px;flex-wrap:wrap}
 .tally div{display:flex;flex-direction:column;gap:1px}
 .tally b{font-family:var(--mono);font-size:21px;font-weight:600;line-height:1.1;
@@ -150,6 +152,8 @@ input[type=search]{font:inherit;font-size:13px;padding:6px 12px;border:1px solid
 .gaps .gt{font-size:12px;line-height:1.45;min-width:0}
 .gaps .gc{font-family:var(--mono);font-size:10.5px;color:var(--muted);display:block;margin-top:2px}
 .gaps .no{color:var(--stop);text-decoration:line-through}
+.gaps .none{padding:10px 8px;font-size:12px;line-height:1.55;color:var(--muted)}
+.wk.dl{color:var(--wait);border-color:var(--wait-line);background:var(--wait-soft)}
 .panel-f{padding:10px 15px 13px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);line-height:1.55}
 
 /* ── milestones ── */
@@ -172,7 +176,8 @@ footer code{font-family:var(--mono);background:var(--surface-2);padding:1px 5px;
     <div>
       <div class="eyebrow">docs/WBS.md</div>
       <h1>工作分解</h1>
-      <p class="sub">群組是照<strong>誰擁有這個產品能力</strong>切的，不是照技術層。
+      <p class="lede">群組是照<strong>誰擁有這個產品能力</strong>切的，不是照技術層。
+        最後一組 <span class="mono" id="gapname"></span> 不是待辦 —— 那是給外部團隊讀的銜接清單。
         狀態由 <span class="mono">progress.sh</span> 從 OpenSpec 與 git 算出來，沒有人手動維護。</p>
     </div>
     <div class="tally" id="tally"></div>
@@ -205,7 +210,7 @@ footer code{font-family:var(--mono);background:var(--surface-2);padding:1px 5px;
     <aside>
       <div class="panel">
         <div class="panel-h">
-          <h3>後端銜接清單</h3>
+          <h3 id="gaph">銜接清單</h3>
           <p>這一組<strong>不擋任何前端工作</strong> —— 前端有自己的後端。
             它是「這一項我們自己先做了，之後要跟後端對齊什麼」。點一項會標出受影響的工作。</p>
         </div>

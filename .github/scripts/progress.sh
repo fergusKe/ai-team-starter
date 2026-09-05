@@ -17,6 +17,7 @@
 #
 # 資料來源全部是機器可查的事實：
 #   docs/WBS.md              有哪些工作項目（ID 是第一欄）
+#   docs/ROADMAP.md          產品意圖。只檢查它提到的 ID 存不存在
 #   openspec/changes/<id>/   進行中的 change 與它的 tasks.md 打勾狀態
 #   openspec/changes/archive/ 已經完成並封存的
 #   git branch -r            有沒有人正在某個 change 上開分支
@@ -134,6 +135,10 @@ G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\0
 # ── 規則違規 ───────────────────────────────────────────────────────
 # **這一段是重點。** 前面那些規則如果只寫在文件裡，它們就只是規範；
 # 規範不會擋住任何人。這裡把它們變成看得到的違規。
+# 圍籬：``` 或 ~~~，後面可以接語言名。
+_FENCE = re.compile(r"^(?:`{3,}|~{3,})")
+
+
 def plain(s: str) -> str:
     """剝掉 Markdown 與 HTML 的裝飾，只留下讀者實際看到的字。
 
@@ -153,7 +158,28 @@ def plain(s: str) -> str:
 MARKS_EXCLUSIVE = {"TBD", "Pending", "Cancelled", "Regular"}
 MARKS_FLAG = {"Alarm"}
 violations = []
-refs = []      # (被提到的 ID, 行號)
+refs = []      # (被提到的工作項目 ID, 檔名, 行號)
+grefs = []     # (被提到的群組 ID, 檔名, 行號)
+
+# 哪些文件裡的 ID 要驗。**這是每個專案自己的選擇，預設保守。**
+#
+# `docs/WBS.md` 與 `docs/ROADMAP.md` 一定要驗 —— 前者是表本身，
+# 後者靠指向它的 ID 活著。要不要加 AGENTS.md／CLAUDE.md／README.md／
+# CONTEXT.md，看那份文件裡的 ID 是**真的引用**還是**格式範例**：
+#
+#   會直接點名「哪一組負責什麼」的 AGENTS.md 是真引用，斷掉會讓人
+#   去翻一組不存在的東西 —— 那就加進來。
+#   （實際發生過：重切群組之後 `FE-D`／`FE-I` 在四個地方躺著沒人發現。）
+#
+#   反過來，**判準是「圍籬外有沒有範例 ID」**，不是「這份文件有沒有範例」。
+#   這個模板的 README 用 `APP-C01` 示範表格長相，但那張表在 ```markdown
+#   圍籬裡，掃它是安全的（實測 0 個違規）。預設仍然只放 WBS 與 ROADMAP，
+#   理由是**複製模板的專案，它的 README 寫什麼我們不知道** ——
+#   預設掃一份還沒寫的文件，第一天就會紅得莫名其妙。
+#
+# 圍籬程式碼區塊（``` 之間）一律跳過 —— 那裡面是範例，不是引用。
+# `docs/DECISIONS.md` 刻意不驗：它是歷史，會引用當時的 ID 當例子。
+REF_SOURCES = ["docs/WBS.md", "docs/ROADMAP.md"]
 _groups, _milestones, _deps = [], [], []
 
 def parse_mark(mark: str):
@@ -346,19 +372,67 @@ if wbs_path.exists():
     # 而重整群組之後那些會斷掉，沒有任何東西會發現。實測過：一次斷了五處。
     #
     # 〈舊 ID 去哪了〉那一節例外 —— 它的工作就是提舊 ID。
-    in_legacy = False
-    for lineno, line in enumerate(_lines, 1):
-        s = line.strip()
-        if s.startswith("## "):
-            in_legacy = "舊 ID" in s
+    #
+    # **群組 ID（`FE-O` 這種沒有數字的）也要驗。** 只驗工作項目的話，
+    # 重切群組之後 `FE-D`／`FE-I` 這類引用會躺著沒人發現 ——
+    # 它們指向的是「整組能力」，斷掉的時候讀的人會去翻一組不存在的東西。
+    #
+    # **docs/ROADMAP.md 也一起掃**（有的話）。產品意圖那一份靠指向這裡的 ID 活著；
+    # 它一旦自己養一份排程或功能表，工作分解表重排之後不會有任何東西發現，
+    # 於是同一個 W8 在兩份文件裡變成兩件事 —— 頂端加警告沒有用，
+    # 讀的人滑過警告就看表了。排程只放一份，剩下的 ID 由這裡看著。
+    #
+    # 掃哪幾份見上面的 REF_SOURCES。
+    for _src in [pathlib.Path(x) for x in REF_SOURCES]:
+        if not _src.exists():
             continue
-        if in_legacy:
-            continue
-        # `FE-S02/03/04` 這種縮寫也要展開
-        for m in re.finditer(r"([A-Z]+-[A-Z])([0-9]{2})((?:/[0-9]{2})*)", s):
-            refs.append((m.group(1) + m.group(2), lineno))
-            for tail in re.findall(r"[0-9]{2}", m.group(3)):
-                refs.append((m.group(1) + tail, lineno))
+        in_legacy = False
+        in_fence = False
+        for lineno, line in enumerate(
+                _src.read_text(encoding="utf-8").splitlines(), 1):
+            # **結構看原始行，ID 看正規化後的字串。** plain() 會剝掉
+            # 反引號與 `~`，圍籬那一行過完它就變成空字串了 ——
+            # 拿正規化後的字串去認圍籬，等於整個跳過機制失效。
+            raw = line.strip()
+            # 圍籬裡是範例，不是引用。**先判斷再跳過** —— 圍籬本身這一行
+            # 也不該被掃（``` 後面可能接語言名）。`~~~` 也是合法圍籬，
+            # 不認得它就等於把裡面的範例當成真引用。
+            if _FENCE.match(raw):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if raw.startswith("## "):
+                in_legacy = "舊 ID" in raw
+                continue
+            if in_legacy:
+                continue
+            # 抽 ID 之前正規化。只認原始字串的話，`FE\u2011D`（非 ASCII
+            # 連字號）跟 `<!-- FE-D -->`（註解裡的舊名）一個漏報一個誤報 ——
+            # 同一個字串在兩個地方有兩種讀法，就是這支腳本一直在抓的那種漂移。
+            s = plain(raw)
+            # `APP-S02/03/04` 這種縮寫也要展開
+            for m in re.finditer(
+                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])([0-9]{2})"
+                    r"((?:/[0-9]{2})*)(?![0-9A-Za-z])", s):
+                refs.append((m.group(1) + m.group(2), str(_src), lineno))
+                for tail in re.findall(r"[0-9]{2}", m.group(3)):
+                    refs.append((m.group(1) + tail, str(_src), lineno))
+            # 群組 ID：後面**不能**接英數，否則 `APP-C01` 會被當成群組 `APP-C`。
+            # `外部-拒` 這種非 A-Z 的分類詞不會 match，那是分類詞不是群組。
+            # 左邊界不能用 `\b`：Python 的 `\w` 認得中文，`依賴FE-D完成`
+            # 在 `賴` 與 `F` 之間**沒有**邊界，整個引用就漏掉了。
+            # 前綴長度也不能寫死 `{2,4}` —— 工作項目那條是 `[A-Z]+`，
+            # 兩條不對稱的話 `ADMIN-Z` 這種群組只有一半會被驗到。
+            for m in re.finditer(
+                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])(?![0-9A-Za-z])", s):
+                grefs.append((m.group(1), str(_src), lineno))
+        if in_fence:
+            # 一個沒關的圍籬會讓**檔案後半段的引用全部消音**，而且是綠的。
+            # 「跳過圍籬」本來是為了放過格式範例，不是給人一個萬用消音器。
+            violations.append(f"{_src} 有沒關起來的程式碼圍籬"
+                              f"（``` 或 ~~~ 數量是奇數）—— "
+                              f"後面的引用全部不會被檢查")
 
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
@@ -368,7 +442,10 @@ if wbs_path.exists():
 
     # 群組、里程碑、跨項依賴 —— --json 的消費端需要，順手在同一趟解析裡收
     _text = wbs_path.read_text(encoding="utf-8")
-    for m in re.finditer(r"^## ((?:FE|BE)-[A-Z]) (.+)$", _text, re.M):
+    # **不要把前綴寫死成 FE/BE。** 這支腳本是共用的；別的專案用 APP-、DEP-、
+    # SVC-⋯⋯ 的話整組會被當成不存在，而它的項目照樣算進總數 ——
+    # 網頁上少了一整組、計數卻是對的，兩邊都不會報錯。
+    for m in re.finditer(r"^## ([A-Z]+-[A-Z]) (.+)$", _text, re.M):
         _groups.append({"id": m.group(1), "title": m.group(2).strip(), "desc": ""})
     for g in _groups:
         seg = _text.split("## " + g["id"] + " ", 1)
@@ -533,6 +610,65 @@ for wid in order:
     label = re.sub(r"[*`]", "", info["name"])[:18]
     rows.append((colour, wid, label, weeks, info["pts"], state, detail))
 
+# ── 治理不變量 ─────────────────────────────────────────────────────
+def week_min(wk):
+    """一個項目最早的週次。`W1–W5` 取 1。"""
+    ns = [int(m) for tok in wk for m in re.findall(r"W([0-9]+)", tok)]
+    return min(ns) if ns else None
+
+for wid in order:
+    info = wbs[wid]
+    marks, _ = parse_mark(info.get("mark", ""))
+    # 缺口（沒有工作週次、被別的項目依賴）必須說清楚「最晚何時要答案」
+    # 與「沒答案怎麼辦」。**只寫在導言說「每一項都要有」是宣言，不是機制。**
+    is_gap = not info["weeks"] and wid in blocks
+    if is_gap and "Cancelled" not in marks:
+        if info["deadline"] is None:
+            violations.append(f"{wid}：缺口沒有決策期限（週欄寫 `決策≤Wn`）")
+        if not info["fallback"]:
+            violations.append(f"{wid}：缺口沒有 fallback（在敘述裡寫 `【沒答案就】…`）")
+
+_gids = {g["id"] for g in _groups}
+seen_gref = set()
+for gid, fname, ln in grefs:
+    # 一張群組都認不出來的話不驗 —— 那是別的問題（沒有 WBS 或標題格式壞了），
+    # 在這裡報一堆「群組不存在」只會蓋掉真正的訊號。
+    if not _gids or gid in _gids or (gid, fname) in seen_gref:
+        continue
+    seen_gref.add((gid, fname))
+    violations.append(f"{fname} 第 {ln} 行提到的群組 {gid} 不存在"
+                      f"（重整群組之後斷掉的引用？）")
+
+seen_ref = set()
+for rid, fname, ln in refs:
+    if rid in wbs or (rid, fname) in seen_ref:
+        continue
+    seen_ref.add((rid, fname))
+    violations.append(f"{fname} 第 {ln} 行提到的 {rid} 不存在"
+                      f"（重整群組之後斷掉的引用？）")
+
+for wid in order:
+    info = wbs[wid]
+    seen = set()
+    for start, gaps in info["rows"]:
+        for gap in gaps:
+            if gap not in wbs:
+                if (wid, gap) not in seen:
+                    # 打錯的依賴（`BE-G99`）原本靜默通過，
+                    # 而且第五條也就跟著不驗。
+                    violations.append(f"{wid}：依賴的 {gap} 在這張表裡不存在")
+                    seen.add((wid, gap))
+                continue
+            dl = wbs[gap].get("deadline")
+            if dl is None or start is None:
+                continue
+            # 「這件事排在 W4，而它依賴的裁決最晚也是 W4」不是排程，是碰運氣。
+            # 裁決要**嚴格早於**用得到它的那一週。
+            if start <= dl:
+                violations.append(
+                    f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
+                    f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
+
 if JSON:
     # **狀態只算一次，別的工具吃這一份。**
     # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
@@ -590,54 +726,6 @@ elif rows:
         pad = 20 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in name)
         print(f"{colour}{wid:<9} {name}{' ' * max(pad,1)}{weeks:<8} {pts:>3}  {state:<12} {detail}{X}")
     print()
-
-# ── 治理不變量 ─────────────────────────────────────────────────────
-def week_min(wk):
-    """一個項目最早的週次。`W1–W5` 取 1。"""
-    ns = [int(m) for tok in wk for m in re.findall(r"W([0-9]+)", tok)]
-    return min(ns) if ns else None
-
-for wid in order:
-    info = wbs[wid]
-    marks, _ = parse_mark(info.get("mark", ""))
-    # 缺口（沒有工作週次、被別的項目依賴）必須說清楚「最晚何時要答案」
-    # 與「沒答案怎麼辦」。**只寫在導言說「每一項都要有」是宣言，不是機制。**
-    is_gap = not info["weeks"] and wid in blocks
-    if is_gap and "Cancelled" not in marks:
-        if info["deadline"] is None:
-            violations.append(f"{wid}：缺口沒有決策期限（週欄寫 `決策≤Wn`）")
-        if not info["fallback"]:
-            violations.append(f"{wid}：缺口沒有 fallback（在敘述裡寫 `【沒答案就】…`）")
-
-seen_ref = set()
-for rid, ln in refs:
-    if rid in wbs or rid in seen_ref:
-        continue
-    seen_ref.add(rid)
-    violations.append(f"docs/WBS.md 第 {ln} 行提到的 {rid} 不存在"
-                      f"（重整群組之後斷掉的引用？）")
-
-for wid in order:
-    info = wbs[wid]
-    seen = set()
-    for start, gaps in info["rows"]:
-        for gap in gaps:
-            if gap not in wbs:
-                if (wid, gap) not in seen:
-                    # 打錯的依賴（`BE-G99`）原本靜默通過，
-                    # 而且第五條也就跟著不驗。
-                    violations.append(f"{wid}：依賴的 {gap} 在這張表裡不存在")
-                    seen.add((wid, gap))
-                continue
-            dl = wbs[gap].get("deadline")
-            if dl is None or start is None:
-                continue
-            # 「這件事排在 W4，而它依賴的裁決最晚也是 W4」不是排程，是碰運氣。
-            # 裁決要**嚴格早於**用得到它的那一週。
-            if start <= dl:
-                violations.append(
-                    f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
-                    f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
 
 if violations:
     print()

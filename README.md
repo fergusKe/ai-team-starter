@@ -295,6 +295,15 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 解析本身也 fail-closed：找不到表、表頭壞了、表格被空行截斷、欄數對不上、
 第一筆漏了 ID、ID 重複 —— 全部會紅，**不會安靜地跳過**。
 
+**引用也不准懸空。** `docs/WBS.md` 與 `docs/ROADMAP.md` 裡提到的每一個
+工作項目 ID **與群組 ID** 都要真的存在 —— 重整群組之後「由 XXX 取代」
+那種引用最容易斷，而且沒有任何東西會發現。圍籬程式碼區塊裡的是範例，跳過；
+〈舊 ID 去哪了〉那一節也跳過，它的工作就是提舊 ID。
+
+要多驗幾份文件（例如你的 `AGENTS.md` 會直接點名哪一組負責什麼），
+改 `progress.sh` 開頭的 `REF_SOURCES`。判準是**圍籬外有沒有範例 ID** ——
+圍籬（``` 或 ~~~）裡的範例會被跳過，圍籬外的照樣要驗。
+
 負向測試在 `.github/scripts/test-progress-check.sh`，每一條都是**先實測繞過成功**
 才補起來的。**沒有 `docs/WBS.md` 的專案不受影響**，`--check` 直接通過。
 
@@ -315,7 +324,8 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
 | `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
-| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住 |
+| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住。**週次只放這裡** |
+| `docs/ROADMAP.md` | **選用。** 產品意圖：場景、功能地圖、不做的事。**不要放週次** —— 用 ID 指向 `WBS.md`，`--check` 會驗那些 ID |
 | `prompts/` | 每個階段貼給 AI 的提示 |
 | `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |
 | `.github/scripts/check-pr-branch.sh` | 分支類別閘門本體。**改它之前先跑旁邊的測試** |

@@ -14,7 +14,7 @@
 # 這一頁跟 progress.sh 的差別：
 #
 #   progress.sh   現在做到哪裡（狀態、被什麼擋住、規則違規）。**每天用的**
-#   這一頁         整份計畫長什麼樣（161 項的細節、每週負荷、跨項依賴）。**要review 時用的**
+#   這一頁         整份計畫長什麼樣（每一項的細節、每週負荷、跨項依賴）。**要review 時用的**
 #
 # 模板在 .github/scripts/wbs-page/ 底下，改樣式改那裡。
 
@@ -58,7 +58,9 @@ html = ("<!doctype html>\n<html lang=\"zh-Hant\">\n<head>\n<meta charset=\"utf-8
         + "</body>\n</html>\n")
 pathlib.Path(out_path).write_text(html, encoding="utf-8")
 
-fe = [i for i in data["items"] if i["group"] != "BE-G"]
+# 銜接清單是哪一組用算的，不要寫死組名 —— 見 app.js 的同一段
+_gap = {i["group"] for i in data["items"] if data["affects"].get(i["id"])}
+fe = [i for i in data["items"] if i["group"] not in _gap]
 print("✓ " + out_path)
 print("  " + str(len(data["items"])) + " 項（" + str(len(fe)) + " 項在前端手上、"
       + str(len(data["items"]) - len(fe)) + " 項待銜接）、"
