@@ -1031,6 +1031,46 @@ def changes_for(wid):
     return [c for c in changes if c == pre or c.startswith(pre + "-")]
 
 
+def setup_todo():
+    """**剛複製的模板還缺什麼。** 回傳待辦清單（空的代表都設好了）。
+
+    這些事以前只寫在 README 與 AGENTS.md 裡。**寫在文件裡就是規勸** ——
+    而這個模板自己的第一句話就是「規勸不是機制」。所以改成由腳本說：
+    `CLAUDE.md` 第 2 步就叫人／LLM 跑這支腳本，跑了就會看到。
+    """
+    todo = []
+    if not pathlib.Path("docs/WBS.md").exists():
+        todo.append((
+            "還沒有 docs/WBS.md（工作分解表）",
+            "把要做的事拆成一張表放進去。第一欄是工作項目 ID（`XX-Y01`），"
+            "格式見這支腳本開頭的註解，或 AGENTS.md〈改 docs/WBS.md 之前〉。"
+            "沒有它就沒有「還有哪些沒做」的視角，--check 也沒有東西可以驗。"))
+    elif not BLOCK_TYPES:
+        todo.append((
+            "docs/WBS.md 裡沒有〈阻塞類型〉表",
+            "阻塞欄的類型詞彙是從那張表讀的，腳本裡沒有寫死任何一個詞。"
+            "加一張表頭是 `| 阻塞類型 | 意思 | 該做什麼 |` 的表，"
+            "宣告你這個專案的詞（`待銜接`、`待裁決`⋯⋯隨你）。"
+            "沒有它的話，阻塞欄只能放 ID。"))
+    pkg = pathlib.Path("package.json")
+    if pkg.is_file():
+        try:
+            _s = pkg.read_text(encoding="utf-8")
+        except Exception:
+            _s = ""
+        if "還沒設定" in _s:
+            todo.append((
+                "package.json 的 script 還是刻意會失敗的佔位",
+                "建專案時把 lint／typecheck／test／build 設好，"
+                "或把 ci.yml 裡對應的那幾步刪掉。不動它的話 CI 的 quality 一直是紅的。"))
+    if pathlib.Path("SETUP-GITHUB.md").is_file():
+        todo.append((
+            "SETUP-GITHUB.md 還在",
+            "建 repo 的人做一次（ruleset、code owner），**設完就可以刪掉這個檔案**。"
+            "它還在就代表這一步可能還沒做 —— 沒做的話 GitHub 那道門是開的。"))
+    return todo
+
+
 def change_for(wid):
     """列上顯示哪一個。**多個的時候要看得出來有多個。**
 
@@ -1216,6 +1256,18 @@ for wid in order:
                     f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
                     f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
 
+_todo = setup_todo()
+if _todo and not JSON and not CHECK:
+    print()
+    print(f"{B}這個專案還有 {len(_todo)} 件事沒設定{X}"
+          f"{D}（剛從模板複製的話這是正常的，照著做一次就好）{X}")
+    for _i, (_what, _how) in enumerate(_todo, 1):
+        print(f"{Y}  {_i}. {_what}{X}")
+        for _line in _how.split("。"):
+            if _line.strip():
+                print(f"{D}     {_line.strip()}。{X}")
+    print()
+
 if JSON:
     # **狀態只算一次，別的工具吃這一份。**
     # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
@@ -1269,8 +1321,6 @@ if not wbs:
                 st, colour = "規格已合併", Y
             print(f"{colour}{cid:<34} {st:<10} {bar}{X}")
         print()
-        print(f"{D}（沒有 docs/WBS.md，所以沒有「還有哪些沒做」的視角。{X}")
-        print(f"{D} 有工作分解表的話把它放在 docs/WBS.md，格式見這支腳本的開頭註解。）{X}")
 elif rows:
     print(f"{B}{'ID':<9} {'項目':<20} {'週':<8} {'點':>3}  {'狀態':<12} {'change'}{X}")
     print("─" * 78)

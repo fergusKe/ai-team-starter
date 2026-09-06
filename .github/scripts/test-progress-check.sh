@@ -164,6 +164,43 @@ run_json_has() {
   fi
 }
 
+# run_setup <說明> <have|absent> <字串>：檢查「還沒設定」清單
+#
+# **剛複製模板的人不會記得要做哪幾件事，也不該記得。** 這份清單以前只寫在
+# README 與 AGENTS.md 裡 —— 而這個模板自己的第一句話就是「規勸不是機制」。
+# 所以改成腳本自己說：`CLAUDE.md` 第 2 步就叫人／LLM 跑它，跑了就會看到。
+run_setup() {
+  local desc="$1" mode="$2" needle="$3" out
+  out="$(cd "$W" && bash "$SCRIPT" --all 2>&1)"
+  if [ "$mode" = have ]; then
+    if printf '%s' "$out" | grep -q "$needle"; then
+      echo "✓ $desc"; PASS=$((PASS + 1)); return
+    fi
+    echo "✗ ${desc} —— 輸出裡沒有「${needle}」"
+  else
+    if ! printf '%s' "$out" | grep -q "$needle"; then
+      echo "✓ $desc"; PASS=$((PASS + 1)); return
+    fi
+    echo "✗ ${desc} —— 輸出裡不該有「${needle}」，但它出現了"
+  fi
+  FAIL=$((FAIL + 1))
+}
+
+# run_json_parses <說明>：--json 還是合法 JSON（待辦清單不准污染它）
+run_json_parses() {
+  local desc="$1" out
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null | python3 -c \
+        'import json,sys; json.load(sys.stdin); print("ok")' 2>/dev/null)"
+  if [ "$out" = ok ]; then
+    echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    echo "✗ ${desc} —— --json 不是合法 JSON"; FAIL=$((FAIL + 1))
+  fi
+}
+
+# hide_wbs：讓 docs/WBS.md 暫時不存在（用搬走，不用刪）
+hide_wbs() { mv "$W/docs/WBS.md" "$W/docs/WBS.md.hidden" 2>/dev/null; }
+
 # mkchange <change-id>...：在 fixture 裡開幾個 OpenSpec change
 mkchange() {
   local c
@@ -603,6 +640,30 @@ run 1 "假的開啟圍籬藏不住真的一列" "APP-O10"
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" $'    ```\n見 `APP-Q99`。\n    ```\n\n| 骨架 | `APP-C01` |'
 run 1 "縮排四格的反引號不是圍籬，消音不了引用" "APP-Q99 不存在"
+
+# ── 剛複製的模板：腳本自己說出還沒做的事 ────────────────────────
+
+# 設定齊全的專案不該看到這份清單（fixture 有 WBS、有阻塞類型表、
+# 沒有 package.json 與 SETUP-GITHUB.md）。
+baseline
+run_setup "設定齊全時不印待辦清單" absent "件事沒設定"
+
+# 沒有工作分解表 —— 最常見的第一天狀態。
+baseline
+hide_wbs
+run_setup "沒有 docs/WBS.md 要說出來" have "還沒有 docs/WBS.md"
+
+# 有表但沒宣告阻塞類型：阻塞欄只能放 ID，而訊息要能指路。
+baseline
+# 認的是**表頭那一列**，不是 `##` 標題 —— 改標題不會讓它消失。
+edit "| 阻塞類型 | 意思 | 該做什麼 |" "| 類型 | 意思 | 該做什麼 |"
+run_setup "沒有〈阻塞類型〉表要說出來" have "沒有〈阻塞類型〉表"
+
+# **待辦只在給人看的輸出裡。** `--check` 是 CI 的門、`--json` 是資料，
+# 兩邊都不該被這段話污染。
+baseline
+hide_wbs
+run_json_parses "沒有 WBS 時 --json 仍然是合法 JSON"
 
 # tab 縮排。CommonMark 的 tab 走到下一個 4 的 tab stop，而只數空白的話
 # 一個 tab 就能讓表格列變成程式碼區塊，我們卻照樣讀成資料。
