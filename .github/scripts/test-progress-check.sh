@@ -27,8 +27,10 @@ SCRIPT="$ROOT/.github/scripts/progress.sh"
 # **不複製 progress.sh，用絕對路徑直接跑它。** 複製就有「測到舊檔」的可能，
 # 不複製就沒有 —— 這比加一條「cp 失敗就 exit」的守衛牢靠。
 # 工作目錄按 repo 名字分開：固定同一個路徑的話，兩份 repo 不能同時跑測試。
-# 不需要清掉它 —— `baseline()` 每次都重寫全部的 fixture，而且這裡面
-# 已經沒有 progress.sh 了，殘留的東西影響不到任何一條測試。
+# 不需要清掉它。**不是因為殘留沒有影響** —— 在裡面多放一份提到不存在
+# 的 ID 的文件，綠燈那幾條會紅（實測 67 過 10 失敗）。是因為殘留的違規
+# 跟 fixture 的狀態無關（殘留檔不會被 edit 動到），所以它只會讓**綠燈**
+# 測試變紅、不會讓**紅燈**測試變綠 —— 遮不住回歸，而且整套是紅的。
 W="${TMPDIR:-/tmp}/progress-check-test.$(basename "$ROOT")"
 
 PASS=0
@@ -147,6 +149,27 @@ run_json_has() {
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— --check 有違規，但 --json 的 violations 是空的"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# run_blockers_has <說明> <項目 ID> <應該出現在它 blockers 裡的 ID>
+#
+# **阻塞欄的展開只能這樣測。** 拿 --check 的訊息當 needle 會被
+# docs/WBS.md 整份的敘述掃描滿足（表格列也在掃描範圍裡），
+# 阻塞欄那條路徑就算完全不展開也照過 —— 那是恆真的斷言。
+# 實測：`blockers.update(found[:1])` 這個突變體在補上這個 helper 之前是存活的。
+run_blockers_has() {
+  local desc="$1" item="$2" want="$3" out
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+i = [x for x in d["items"] if x["id"] == sys.argv[1]]
+print("yes" if i and sys.argv[2] in i[0]["blockers"] else "no")' "$item" "$want")"
+  if [ "$out" = yes ]; then
+    echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    echo "✗ ${desc} —— ${item} 的 blockers 裡沒有 ${want}"
     FAIL=$((FAIL + 1))
   fi
 }
@@ -273,6 +296,68 @@ run 1 "阻塞欄裡沒有數字的 ID 要紅" "阻塞欄的 DEP-GXX"
 baseline
 edit "DEP-G01 \`外部-缺\`" "dep-g01 \`外部-缺\`"
 run 1 "阻塞欄裡的小寫 ID 要紅" "阻塞欄的 dep-g01"
+
+# **整格都要吃得完。** 撈不到 token 就當作沒有阻塞，是這一欄最後一個
+# fail-open：下面這幾種跟「這一格真的沒有 ID」長得一模一樣 ——
+# 而週欄與點欄早就是整格驗的。
+baseline
+edit "DEP-G01 \`外部-缺\`" "DEP-G \`外部-缺\`"
+run 1 "阻塞欄只寫群組要紅" "是群組，不是工作項目"
+
+baseline
+edit "DEP-G01 \`外部-缺\`" "DEP_G01 \`外部-缺\`"
+run 1 "阻塞欄用底線寫的 ID 要紅" "既不是工作項目 ID"
+
+# 反過來：**合法的寫法不准被這條新規則掃到。** 阻塞類型是中文，
+# 或「英文前綴接中文」（`DEP-拒`）—— 後者有 ASCII 字母，最容易誤報。
+baseline
+edit "DEP-G01 \`外部-缺\`" "待銜接 + \`DEP-拒\`"
+run_absent 0 "阻塞類型的名稱不算違規" "既不是工作項目 ID"
+
+# ── 散文：長得一樣的字要讀成同一個（第五輪）─────────────────────
+
+# `--` 從中間裂開：尾巴只在 `-` 後面接英數時才吃 `-`，而左邊界擋 `-`，
+# 於是後半段整個消失。**這是 `APP-C01/02x` 的鏡像** ——
+# 不變量對右邊界成立、對左邊界不成立。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01--APP-C99\` |"
+run 1 "雙連字號要紅" "APP-C01--APP-C99"
+
+# 全形數字、全形字母、U+2212 減號、零寬字元 —— 畫面上完全看不出差別，
+# 但 token 會在那裡收尾，變成一個「群組引用」靜靜通過（群組存在，不會紅）。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C９９\` |"
+run 1 "全形數字寫的 ID 也要驗" "APP-C99 不存在"
+
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP−C99\` |"
+run 1 "U+2212 減號寫的 ID 也要驗" "APP-C99 不存在"
+
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C9​9\` |"
+run 1 "夾了零寬字元的 ID 也要驗" "APP-C99 不存在"
+
+# 黏在別的字後面的引用。左邊界原本擋 `-`，`W1-APP-C99` 整段消失。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、W1-APP-C99 |"
+run 1 "黏在連字號後面的引用也要驗" "APP-C99 不存在"
+
+# ── 週欄的範圍套跟 ID 範圍同一條規則 ────────────────────────────
+
+# 只驗格式的話 `W9–W1` 是綠的，而 `--week W5` 看不到那一項。
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | W9–W1 | 3"
+run 1 "週欄範圍反著寫要紅" "反著寫或兩端相同"
+
+# 兩端相同是 `>=` 收掉的另一半。**跟 ID 範圍完全一樣的陷阱** ——
+# 一條 `>=` 有兩個意思，只測一個的話 `>` 這個突變體會存活（實測過）。
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | W2–W2 | 3"
+run 1 "週欄範圍兩端相同要紅" "兩端相同"
+
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | W1–W99 | 3"
+run 1 "週欄範圍跨度超過上限要紅" "超過上限"
 
 # 欄數不足的資料列 —— 原本整列無聲消失
 baseline
@@ -565,9 +650,14 @@ run 1 "範圍第一端不足兩位數要紅" "編號至少兩位數"
 
 # WBS 第一欄與引用掃描共用同一份 ID 文法。分開寫的話，
 # `APP-C1` 會在第一欄合法、在引用裡不合法 —— 同一支腳本兩種讀法。
+#
+# **needle 要挑只有第一欄會印的字。** 兩邊的訊息統一成「不是合法的
+# 工作項目 ID」之後，敘述掃描（docs/WBS.md 整份都掃，表格列也是）
+# 會印同一句話 —— 拿那句話當 needle 的話，第一欄整條放寬也照過。
+# 實測：`is_id_row` 改回 `[0-9]+` 這個突變體就是這樣存活的。
 baseline
 edit "| APP-C01 |" "| APP-C1 |"
-run 1 "WBS 第一欄的一位數 ID 也不合法" "不是合法的工作項目 ID"
+run 1 "WBS 第一欄的一位數 ID 也不合法" "會被當成上一列的續行"
 
 # ── 一份文法：token 切出來，parse 不完整就報（對抗審查第四輪）─────
 
@@ -616,11 +706,13 @@ run 1 "點欄不是數字要紅" "點數欄"
 # 去驗它存在。同一個格子，同一支腳本，兩種讀法。
 baseline
 edit "DEP-G01 \`外部-缺\`" "DEP-G01/99 \`外部-缺\`"
-run 1 "阻塞欄的斜線清單要展開" "DEP-G99"
+run 1 "阻塞欄的斜線清單要展開（--check）" "DEP-G99"
+run_blockers_has "阻塞欄的斜線清單真的進了 blockers" "APP-P03" "DEP-G99"
 
 baseline
 edit "DEP-G01 \`外部-缺\`" "DEP-G01–DEP-G03 \`外部-缺\`"
-run 1 "阻塞欄的範圍中間也要驗" "DEP-G02"
+run 1 "阻塞欄的範圍中間也要驗（--check）" "DEP-G02"
+run_blockers_has "阻塞欄的範圍中間真的進了 blockers" "APP-P03" "DEP-G02"
 
 echo
 if [ "$FAIL" -gt 0 ]; then

@@ -175,26 +175,26 @@ RANGE_MAX = 40
 # 所以改成：**先切出一個最大 token，再用一份文法 parse 它，
 # parse 不完整就報。** 每多一種寫法不會再生一個洞。
 #
-# **token 吃的字元集合要涵蓋右邊界擋的字元集合。** 否則回溯會生出一個
-# 比較短、右邊界剛好成立的假匹配 —— 上面那兩個洞都是這樣來的。
-# 這裡 token 尾巴吃 `[A-Za-z0-9]`、右邊界擋 `[A-Za-z0-9]`：貪婪吃完之後
-# 右邊界必然成立，縮短只會讓它失敗，不會讓它變成另一個答案。
+# **token 吃的字元集合要涵蓋邊界擋的字元集合。左右兩邊都算。**
+#
+#   右邊界：token 尾巴吃 `[A-Za-z0-9]`、右邊界擋 `[A-Za-z0-9]`。貪婪吃完
+#           之後右邊界必然成立，縮短只會讓它失敗，不會讓它變成另一個答案。
+#
+#   左邊界：這裡原本擋 `[A-Za-z0-9-]`，但尾巴只在 `-` 後面接英數時才吃 `-`。
+#           於是 `APP-A01--APP-A99` 從 `--` 中間裂開，後半被左邊界擋掉，
+#           **整段靜默** —— 跟 `APP-C01/02x` 是同一個缺陷的鏡像。
+#           所以尾巴改吃連續的 `[/-]+`，左邊界也不再擋 `-`：
+#           `W1-APP-Z99` 這種黏在別的字後面的引用照樣要驗。
 #
 # 頭部的英數尾巴**要求至少有一個數字**。不要求的話 `SETUP-GITHUB`、
 # `X-Ray`、`E-Mail` 全都變成 token，然後 parse 失敗報一堆假違規
 # （實測：README 立刻多一個）。有數字才像工作項目編號。
 _TOKEN = re.compile(
-    r"(?<![A-Za-z0-9-])"
+    r"(?<![A-Za-z0-9])"
     r"[A-Z]+-[A-Z](?:[A-Za-z0-9]*[0-9][A-Za-z0-9]*)?"
-    r"(?:[/-][A-Za-z0-9]+)*"
+    r"(?:[/-]+[A-Za-z0-9]+)*"
     r"(?![A-Za-z0-9])")
 
-# 阻塞欄那種**只准放 ID 的欄位**用寬的 token —— `BE-GXX`、`be-g01`
-# 在那裡一定是打錯，不會是英文散文。**文法是同一份，只有「哪些字拿去
-# parse」不同**，因為欄位是受控的、散文不是。
-_TOKEN_FIELD = re.compile(
-    r"(?<![A-Za-z0-9-])[A-Za-z]+-[A-Za-z0-9]+(?:[/-][A-Za-z0-9]+)*"
-    r"(?![A-Za-z0-9])")
 
 # token 的三種合法形狀。**只有這三種**，其他一律報。
 _SHAPE_GROUP = re.compile(_GRP)                                    # APP-C
@@ -220,20 +220,37 @@ def plain(s: str) -> str:
     s = re.sub(r"[*_`~]", "", s)                   # 強調符號
     s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2012", "-")
     s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\uff0d", "-")
+    # 減號 U+2212 與橫槓 U+2015 也長得跟 `-` 一樣，貼上來很容易夾帶。
+    s = s.replace("\u2212", "-").replace("\u2015", "-")
+    # **看不見的字元要拿掉，不是留著。** 軟連字號與零寬字元夾在 ID 中間
+    # （`FE-C<ZWSP>01`）畫面上完全看不出來，但會讓 token 從中間裂開，
+    # 於是那個引用整個消失 —— 而且沒有任何訊息。
+    s = re.sub(r"[\u00ad\u200b\u200c\u200d\ufeff]", "", s)
+    # 全形英數也要折回半形。**只折英數**（不折 `＋`、`｜` 這些標點）——
+    # `FE-C０１` 畫面上就是 `FE-C01`，不折的話 token 在全形數字前面就收尾，
+    # 變成一個「群組引用」靜靜通過：群組存在，所以連紅都不會紅。
+    s = "".join(chr(ord(c) - 0xFEE0)
+                if ("\uff10" <= c <= "\uff19" or "\uff21" <= c <= "\uff3a"
+                    or "\uff41" <= c <= "\uff5a") else c
+                for c in s)
     return s.strip()
 
 
-def scan_ids(text, where, wide=False):
+def scan_ids(text, where):
     """讀出一段字裡的工作項目與群組引用。**唯一一份 ID 文法在這裡。**
 
     回傳 `(項目 ID, 群組 ID, 違規訊息)` 三個 list。
     `where` 只進訊息（`docs/WBS.md 第 12 行`、`APP-M01：阻塞欄`）。
-    `wide=True` 給受控欄位用，見 `_TOKEN_FIELD`。
 
     **parse 不完整就報，不要「交給下一條檢查」** —— 這裡就是最後一條。
+
+    這裡曾經有第二種寬 token 給阻塞欄用（`BE-GXX`、`be-g01` 在受控欄位裡
+    一定是打錯）。**那是同一個東西的第二種讀法**，而且它擋不住真正的問題：
+    撈不到 token 就當作沒有阻塞。現在阻塞欄改成整格驗殘留，寬 token 就
+    不需要了。
     """
     ids, gids, errs = [], [], []
-    for m in (_TOKEN_FIELD if wide else _TOKEN).finditer(text):
+    for m in _TOKEN.finditer(text):
         tok = m.group(0)
 
         r = _SHAPE_RANGE.fullmatch(tok)
@@ -460,6 +477,20 @@ if wbs_path.exists():
             violations.append(
                 f"{cur}（docs/WBS.md 第 {lineno} 行）的點數欄 `{pts}` "
                 f"不是數字（只能是數字或 `—`）")
+        # **週欄的範圍要套跟 ID 範圍同一條規則。** 只驗格式的話
+        # `W9–W1` 是綠的，而 `--week W5` 看不到那一項（9≤5≤1 不成立）。
+        # 反著寫、兩端相同、跨度離譜 —— 都是同一種打錯。
+        _mw = re.fullmatch(r"W([0-9]+)–W([0-9]+)", week)
+        if _mw:
+            _a, _b = int(_mw.group(1)), int(_mw.group(2))
+            if _a >= _b:
+                violations.append(
+                    f"{cur}（docs/WBS.md 第 {lineno} 行）的週次欄 `{week}` "
+                    f"反著寫或兩端相同（{_a} 不小於 {_b}）")
+            elif _b - _a > RANGE_MAX:
+                violations.append(
+                    f"{cur}（docs/WBS.md 第 {lineno} 行）的週次欄 `{week}` "
+                    f"跨度 {_b - _a} 超過上限 {RANGE_MAX}（打錯了？）")
         if re.fullmatch(r"W[0-9]+(–W[0-9]+)?", week):
             wbs[cur]["weeks"].add(week)
         # 缺口沒有「工作週次」，它有的是**決策期限**：最晚哪一週要有答案。
@@ -484,17 +515,36 @@ if wbs_path.exists():
         # 每一列的阻塞都要收 —— 一個項目底下常常只有某幾列被擋住
         # （Inbox 的清單做得了、「已讀」沒有端點），只記第一個會讓反向索引漏掉。
         if blocked:
-            # **阻塞欄走同一份文法。** 這裡曾經自己寫一份
-            # `[A-Z]+-[A-Z][0-9]+`：不展開斜線、不展開範圍，於是
-            # `BE-G01/02` 只收到 G01、`BE-G01`–`BE-G03` 中間的 G02 消失 ——
-            # 而同一個格子的敘述掃描會把它們展開去驗存在。
-            # 同一個格子在同一支腳本裡兩種讀法，正是這支腳本在抓的東西。
-            # 欄位是受控的，所以用寬的 token：`BE-GO1`（字母 O）、
-            # `BE-GXX` 在這裡一定是打錯，原本會直接從 blockers 消失 ——
-            # 既不報格式錯，後面「工作不得排在裁決之前」那條也就跟著不驗。
-            found, _bgids, _berrs = scan_ids(plain(blocked),
-                                             f"{cur}：阻塞欄", wide=True)
+            # **阻塞欄走同一份文法，而且整格都要吃得完。**
+            #
+            # 它曾經自己寫一份 `[A-Z]+-[A-Z][0-9]+`：不展開斜線、不展開
+            # 範圍，於是 `BE-G01/02` 只收到 G01、`BE-G01`–`BE-G03` 中間的
+            # G02 消失 —— 而同一個格子的敘述掃描會展開它們去驗存在。
+            #
+            # 但「走同一份文法」還不夠。**撈不到 token 就當作沒有阻塞**，
+            # 是這一欄唯一剩下的 fail-open：`BE-G`（只寫群組）、`BE_G01`、
+            # 全形數字寫的編號，全部跟「這一格真的沒有 ID」長得一模一樣，
+            # 而週欄與點欄早就是整格驗的。所以這裡也整格驗：
+            # 把切得到的 token 與阻塞類型的名稱拿掉之後，
+            # **不准再剩下任何 ASCII 英數**。
+            _bsrc = plain(blocked)
+            found, _bgids, _berrs = scan_ids(_bsrc, f"{cur}：阻塞欄")
             violations.extend(_berrs)
+            # 群組不是阻塞。`BE-G` 擋不住任何一件具體的事，而它原本
+            # 被 parse 成功之後直接丟掉 —— parse 成功卻不用，就是漏。
+            for _g in _bgids:
+                violations.append(
+                    f"{cur}：阻塞欄的 {_g} 是群組，不是工作項目 —— "
+                    f"阻塞要指到具體哪一項（`{_g}01`）")
+            # 阻塞類型的名稱是中文，或「英文前綴接中文」（`BE-拒`）。
+            _rest = _TOKEN.sub(" ", _bsrc)
+            _rest = re.sub(r"[A-Za-z]+-[^\x00-\x7F\s]+", " ", _rest)
+            _bad = [w for w in _rest.split() if re.search(r"[A-Za-z0-9]", w)]
+            if _bad:
+                violations.append(
+                    f"{cur}：阻塞欄的 {'、'.join(_bad)} 既不是工作項目 ID、"
+                    f"也不是阻塞類型（ID 是 `XX-Y01`；阻塞類型是中文，"
+                    f"或像 `BE-拒` 這種英文前綴接中文）")
             wbs[cur]["blockers"].update(found)
             # **逐列記下「這一列排在哪一週、被什麼擋著」。**
             # 阻塞是寫在列上的，用整個項目最早的週次去比會誤報 ——
