@@ -26,10 +26,16 @@ Repository 內其他文件與本檔衝突時，以本檔為準。
 ## Session 啟動
 
 ```bash
-git branch --show-current      # 你在哪個 change 上
-openspec list                  # 有哪些 change
+git branch --show-current                  # 你在哪個 change 上
+openspec list                              # 有哪些 change
 openspec status --change <name>
+bash .github/scripts/progress.sh           # 做到哪裡；剛複製的話還會列出待辦
 ```
+
+**最後一個在新專案裡特別重要。** 剛從模板複製的 repo，它會印出還沒設定
+的東西（沒有 `docs/WBS.md`、沒有〈阻塞類型〉表、`package.json` 的 script
+還是佔位⋯⋯）。**先把那份清單清掉再開始寫東西** —— 那些設定沒做，
+後面的閘門有一半是空轉的。
 
 讀 `AGENTS.md` → `CONTEXT.md` → 那個 change 的 artifact。
 除非使用者指定其他語言，對人類使用繁體中文。
