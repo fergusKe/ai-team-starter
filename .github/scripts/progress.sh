@@ -142,10 +142,12 @@ _FENCE = re.compile(r"^(?:`{3,}|~{3,})")
 # 用 `"舊 ID" in s` 的話，任何含這四個字的 `## ` 標題都能消音整節。
 LEGACY_HEADING = "## 舊 ID 去哪了"
 
-# **工作項目 ID 的文法只有一份。** WBS 第一欄、引用掃描、不合法判定
-# 曾經各寫一次自己的位數，於是 `FE-C1` 在第一欄合法、在引用裡不合法 ——
-# 同一個東西在同一支腳本裡兩種讀法，就是這支腳本一直在抓的那種漂移。
-ID_RE = r"[A-Z]+-[A-Z][0-9]{2,}"
+# **ID 的文法只有一份，而且是組出來的。** 群組是 `大寫前綴-大寫字母`，
+# 工作項目是群組再接**至少兩位**數字。WBS 第一欄、引用掃描、阻塞欄
+# 全部走這一份 —— 曾經各寫一次自己的位數，於是 `APP-C1` 在第一欄合法、
+# 在引用裡不合法：同一個東西在同一支腳本裡兩種讀法。
+_GRP = r"[A-Z]+-[A-Z]"
+ID_RE = _GRP + r"[0-9]{2,}"
 
 # **在 REF_SOURCES 那幾份文件裡，`大寫-大寫＋數字` 是保留字。**
 # 掃描分不出「這是工作項目 ID」還是「剛好長一樣的別的東西」——
@@ -159,11 +161,49 @@ ID_RE = r"[A-Z]+-[A-Z][0-9]{2,}"
 # 靜靜展開 99 個不存在的 ID 只會把真訊號蓋掉。
 RANGE_MAX = 40
 
-# 範圍寫法。`plain()` 已經把 `–—` 正規化成 `-`，所以這裡只認 ASCII 連字號。
-# 兩種寫法：`FE-B02`–`FE-B05` 與 `FE-B02`–`05`。
-_RANGE = re.compile(
-    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])([0-9]+)\s*-\s*"
-    r"([A-Z]+-[A-Z])?([0-9]+)(?![A-Za-z0-9])")
+# ── 一個 token，一份文法 ─────────────────────────────────────────
+#
+# 這裡曾經是三條 regex 接力：一條抓範圍、一條抓斜線清單、一條 catch-all
+# 報不合法。每一條有自己的邊界，「這一條放掉的交給下一條」——
+# 而下一條的邊界條件正好接不住：
+#
+#   `APP-C01/02x`        斜線那條的尾隨 lookahead 在 `x` 上失敗，回溯把
+#                       `/02` 整段丟掉；catch-all 從頭吃到 `/` 就停。
+#   `APP-A01`–`APP-A99x`  範圍那條同一個洞，而第二端前面那個 `-` 又被
+#                       另外兩條的左邊界擋掉 —— 整段完全靜默。
+#
+# 所以改成：**先切出一個最大 token，再用一份文法 parse 它，
+# parse 不完整就報。** 每多一種寫法不會再生一個洞。
+#
+# **token 吃的字元集合要涵蓋右邊界擋的字元集合。** 否則回溯會生出一個
+# 比較短、右邊界剛好成立的假匹配 —— 上面那兩個洞都是這樣來的。
+# 這裡 token 尾巴吃 `[A-Za-z0-9]`、右邊界擋 `[A-Za-z0-9]`：貪婪吃完之後
+# 右邊界必然成立，縮短只會讓它失敗，不會讓它變成另一個答案。
+#
+# 頭部的英數尾巴**要求至少有一個數字**。不要求的話 `SETUP-GITHUB`、
+# `X-Ray`、`E-Mail` 全都變成 token，然後 parse 失敗報一堆假違規
+# （實測：README 立刻多一個）。有數字才像工作項目編號。
+_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9-])"
+    r"[A-Z]+-[A-Z](?:[A-Za-z0-9]*[0-9][A-Za-z0-9]*)?"
+    r"(?:[/-][A-Za-z0-9]+)*"
+    r"(?![A-Za-z0-9])")
+
+# 阻塞欄那種**只准放 ID 的欄位**用寬的 token —— `BE-GXX`、`be-g01`
+# 在那裡一定是打錯，不會是英文散文。**文法是同一份，只有「哪些字拿去
+# parse」不同**，因為欄位是受控的、散文不是。
+_TOKEN_FIELD = re.compile(
+    r"(?<![A-Za-z0-9-])[A-Za-z]+-[A-Za-z0-9]+(?:[/-][A-Za-z0-9]+)*"
+    r"(?![A-Za-z0-9])")
+
+# token 的三種合法形狀。**只有這三種**，其他一律報。
+_SHAPE_GROUP = re.compile(_GRP)                                    # APP-C
+_SHAPE_ITEM = re.compile("(" + _GRP + r")([0-9]{2,})"
+                         r"((?:/[A-Z]?[0-9]{2,})*)")                # APP-C01/02
+# 範圍的位數刻意放寬成 `[0-9]+`，這樣 `APP-C01`–`5` 才報得出
+# 「第二端不合法」，而不是掉進最後那句籠統的訊息。
+_SHAPE_RANGE = re.compile("(" + _GRP + r")([0-9]+)-"
+                          "(?:(" + _GRP + r"))?([0-9]+)")           # APP-C01–APP-C05
 
 
 def plain(s: str) -> str:
@@ -181,6 +221,71 @@ def plain(s: str) -> str:
     s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2012", "-")
     s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\uff0d", "-")
     return s.strip()
+
+
+def scan_ids(text, where, wide=False):
+    """讀出一段字裡的工作項目與群組引用。**唯一一份 ID 文法在這裡。**
+
+    回傳 `(項目 ID, 群組 ID, 違規訊息)` 三個 list。
+    `where` 只進訊息（`docs/WBS.md 第 12 行`、`APP-M01：阻塞欄`）。
+    `wide=True` 給受控欄位用，見 `_TOKEN_FIELD`。
+
+    **parse 不完整就報，不要「交給下一條檢查」** —— 這裡就是最後一條。
+    """
+    ids, gids, errs = [], [], []
+    for m in (_TOKEN_FIELD if wide else _TOKEN).finditer(text):
+        tok = m.group(0)
+
+        r = _SHAPE_RANGE.fullmatch(tok)
+        if r:
+            a_g, a_n, b_g, b_n = r.group(1), r.group(2), r.group(3), r.group(4)
+            if b_g and b_g != a_g:
+                errs.append(f"{where}的範圍 {tok} 兩端不是同一組"
+                            f"（{a_g} 與 {b_g}）—— 範圍只能寫在同一組裡")
+                continue
+            if len(a_n) < 2 or len(b_n) < 2:
+                errs.append(f"{where}的範圍 {tok} 裡的 "
+                            f"{a_n if len(a_n) < 2 else b_n} "
+                            f"不合法（編號至少兩位數）")
+                continue
+            lo, hi = int(a_n), int(b_n)
+            # **`>=` 不是 `>`。** 兩端相同也是打錯：它宣稱是一個範圍，
+            # 實際上只有一個 ID，放過去只會展開成單一個端點。
+            if lo >= hi:
+                errs.append(f"{where}的範圍 {tok} 反著寫或兩端相同"
+                            f"（{lo} 不小於 {hi}）")
+                continue
+            if hi - lo > RANGE_MAX:
+                errs.append(f"{where}的範圍 {tok} 跨度 {hi - lo} "
+                            f"超過上限 {RANGE_MAX}（打錯了？）")
+                continue
+            # **展開成每一個。**「02 到 05」這句話宣稱中間每一個都存在，
+            # 只驗端點的話中間刪掉不會紅。
+            w = max(len(a_n), len(b_n))
+            ids.extend(f"{a_g}{k:0{w}d}" for k in range(lo, hi + 1))
+            continue
+
+        i = _SHAPE_ITEM.fullmatch(tok)
+        if i:
+            ids.append(i.group(1) + i.group(2))
+            # 斜線後面可以重複群組字母（`APP-B02/B03`）—— 那是文件裡真實的
+            # 寫法，拒絕它只會讓人去關掉檢查。但字母**要對得上**。
+            for ltr, num in re.findall(r"/([A-Z]?)([0-9]{2,})", i.group(3)):
+                if ltr and ltr != i.group(1)[-1]:
+                    errs.append(f"{where}的 {tok} 裡，`/{ltr}{num}` 的"
+                                f"組別字母跟前面的 {i.group(1)} 對不上")
+                    continue
+                ids.append(i.group(1) + num)
+            continue
+
+        if _SHAPE_GROUP.fullmatch(tok):
+            gids.append(tok)
+            continue
+
+        errs.append(f"{where}的 {tok} 不是合法的工作項目 ID"
+                    f"（`XX-Y` 加至少兩位數字；斜線清單 `XX-Y01/02`；"
+                    f"範圍 `XX-Y01`–`XX-Y05`）")
+    return ids, gids, errs
 
 MARKS_EXCLUSIVE = {"TBD", "Pending", "Cancelled", "Regular"}
 MARKS_FLAG = {"Alarm"}
@@ -339,6 +444,22 @@ if wbs_path.exists():
             violations.append(f"docs/WBS.md 第 {lineno} 行沒有工作項目 ID，"
                               f"而它前面還沒有任何項目可以續行：{line[:50]}")
             continue
+        # **週欄與點欄也要有文法。** 它們原本只有「認得就收，認不得就算了」——
+        # `W1-W3`（ASCII 連字號，跟正確的 `W1–W3` 差一個鍵）會讓那一項的
+        # 排程靜靜消失、翻成「沒有排程」，而 --check 是綠的；
+        # 連帶「工作不得排在裁決之前」那條也因為 start 是 None 而跳過。
+        # 點欄的 `5點` 一樣：那一列的點數直接不算，總數少掉沒有人會發現。
+        if week and not (re.fullmatch(r"W[0-9]+(–W[0-9]+)?", week)
+                         or re.fullmatch(r"決策≤W[0-9]+", week)
+                         or week in ("—", "常態")):
+            violations.append(
+                f"{cur}（docs/WBS.md 第 {lineno} 行）的週次欄 `{week}` 不是"
+                f"合法的寫法（`W3`、`W13–W16`（是 – 不是 -）、"
+                f"`決策≤W5`、`常態`、`—`）")
+        if pts and not (pts.isdigit() or pts == "—"):
+            violations.append(
+                f"{cur}（docs/WBS.md 第 {lineno} 行）的點數欄 `{pts}` "
+                f"不是數字（只能是數字或 `—`）")
         if re.fullmatch(r"W[0-9]+(–W[0-9]+)?", week):
             wbs[cur]["weeks"].add(week)
         # 缺口沒有「工作週次」，它有的是**決策期限**：最晚哪一週要有答案。
@@ -363,7 +484,17 @@ if wbs_path.exists():
         # 每一列的阻塞都要收 —— 一個項目底下常常只有某幾列被擋住
         # （Inbox 的清單做得了、「已讀」沒有端點），只記第一個會讓反向索引漏掉。
         if blocked:
-            found = re.findall(r"[A-Z]+-[A-Z][0-9]+", plain(blocked))
+            # **阻塞欄走同一份文法。** 這裡曾經自己寫一份
+            # `[A-Z]+-[A-Z][0-9]+`：不展開斜線、不展開範圍，於是
+            # `BE-G01/02` 只收到 G01、`BE-G01`–`BE-G03` 中間的 G02 消失 ——
+            # 而同一個格子的敘述掃描會把它們展開去驗存在。
+            # 同一個格子在同一支腳本裡兩種讀法，正是這支腳本在抓的東西。
+            # 欄位是受控的，所以用寬的 token：`BE-GO1`（字母 O）、
+            # `BE-GXX` 在這裡一定是打錯，原本會直接從 blockers 消失 ——
+            # 既不報格式錯，後面「工作不得排在裁決之前」那條也就跟著不驗。
+            found, _bgids, _berrs = scan_ids(plain(blocked),
+                                             f"{cur}：阻塞欄", wide=True)
+            violations.extend(_berrs)
             wbs[cur]["blockers"].update(found)
             # **逐列記下「這一列排在哪一週、被什麼擋著」。**
             # 阻塞是寫在列上的，用整個項目最早的週次去比會誤報 ——
@@ -371,14 +502,6 @@ if wbs_path.exists():
             if found:
                 wk_here = [int(m) for m in re.findall(r"W([0-9]+)", week)]
                 wbs[cur]["rows"].append((min(wk_here) if wk_here else None, found))
-            # `BE-GO1`（字母 O）、`BE-GXX` 這種**看起來像依賴、卻不是合法 ID**
-            # 的東西，原本會直接從 blockers 消失 —— 既不報格式錯，
-            # 後面「工作不得排在裁決之前」那條也就跟著不驗。
-            # 阻塞類型的名稱是中文，配不到下面這個 pattern。
-            for tok in re.findall(r"[A-Za-z]+-[A-Za-z0-9]+", plain(blocked)):
-                if not re.fullmatch(r"[A-Z]+-[A-Z][0-9]+", tok):
-                    violations.append(
-                        f"{cur}：阻塞欄的 `{tok}` 不是合法的工作項目 ID")
 
         # 標記的格式在**每一列**都驗。續行上的處置只管那一列，但格式一樣要對 ——
         # 一個沒有理由的 `Cancelled`，六個月後沒有人敢刪它。
@@ -442,95 +565,13 @@ if wbs_path.exists():
             # 連字號）跟 `<!-- FE-D -->`（註解裡的舊名）一個漏報一個誤報 ——
             # 同一個字串在兩個地方有兩種讀法，就是這支腳本一直在抓的那種漂移。
             s = plain(raw)
-            # **範圍寫法 `{EX}-B02`–`{EX}-B05` 要展開成每一個。**
-            # 只驗兩個端點的話，中間的 03、04 刪掉不會紅 ——
-            # 而這是產品意圖那一份引用工作分解表的**主要形式**。
-            # 「02 到 05」這句話本身就宣稱中間每一個都存在。
-            for m in _RANGE.finditer(s):
-                a_g, a_n, b_g, b_n = m.group(1), m.group(2), m.group(3), m.group(4)
-                if b_g and b_g != a_g:
-                    violations.append(
-                        f"{_src} 第 {lineno} 行的範圍 {m.group(0).strip()} "
-                        f"兩端不是同一組（{a_g} 與 {b_g}）—— 範圍只能寫在同一組裡")
-                    continue
-                lo, hi = int(a_n), int(b_n)
-                # **不要 `continue`「交給下面的單點檢查」。** 下面那條的
-                # 左邊界是 `(?<![A-Za-z0-9-])`，而範圍中間就是一個 `-`，
-                # 第二個端點會被它擋掉 —— 放掉的東西沒有人接。
-                if len(b_n) < 2:
-                    violations.append(
-                        f"{_src} 第 {lineno} 行的範圍 {m.group(0).strip()} "
-                        f"第二端 {b_n} 不合法（編號至少兩位數）")
-                    continue
-                # **`>=` 不是 `>`。** 兩端相同（`XX-Y01`–`XX-Y01`）也是打錯 ——
-                # 它宣稱是一個範圍，實際上只有一個 ID。放過去的話只會展開成
-                # 單一個端點，跟寫的人想寫的東西不同，而且不會紅。
-                if lo >= hi:
-                    violations.append(
-                        f"{_src} 第 {lineno} 行的範圍 {m.group(0).strip()} "
-                        f"反著寫或兩端相同（{lo} 不小於 {hi}）")
-                    continue
-                if hi - lo > RANGE_MAX:
-                    violations.append(
-                        f"{_src} 第 {lineno} 行的範圍 {m.group(0).strip()} "
-                        f"跨度 {hi - lo} 超過上限 {RANGE_MAX}（打錯了？）")
-                    continue
-                w = max(len(a_n), len(b_n))
-                for k in range(lo, hi + 1):
-                    refs.append((f"{a_g}{k:0{w}d}", str(_src), lineno))
-            # `{EX}-S02/03/04` 這種縮寫也要展開。位數用 `{2,}` ——
-            # 位數跟 `ID_RE` 同一份，兩邊各寫一次的話，一個項目編到
-            # 三位數，它的**所有引用就都不驗了**。
-            # **尾端不要放 lookahead。** `FE-C01/02x` 會讓它在 `x` 上失敗，
-            # 然後回溯把 `*` 縮到零個、改在 `/` 前面成功 —— `/02` 整段消失，
-            # `FE-C02` 不存在也不會紅。不合法的判定交給下面那條 catch-all，
-            # 這一條只負責「有哪些 ID 被提到」，寧可多抓。
-            for m in re.finditer(
-                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])([0-9]{2,})"
-                    r"((?:/[A-Z]?[0-9]{2,})*)", s):
-                refs.append((m.group(1) + m.group(2), str(_src), lineno))
-                # 斜線後面可以重複群組字母（`FE-B02/B03`）—— 那是文件裡
-                # 真實的寫法，拒絕它只會讓人去關掉檢查。但字母**要對得上**：
-                # `FE-B02/C03` 是打錯，不是縮寫。
-                for ltr, num in re.findall(r"/([A-Z]?)([0-9]{2,})", m.group(3)):
-                    if ltr and ltr != m.group(1)[-1]:
-                        violations.append(
-                            f"{_src} 第 {lineno} 行的 {m.group(0)} 裡，"
-                            f"`/{ltr}{num}` 的組別字母跟前面的 {m.group(1)} 對不上")
-                        continue
-                    refs.append((m.group(1) + num, str(_src), lineno))
-            # **長得像工作項目 ID、卻不是合法 ID 的，要露出來。**
-            # 同一支腳本對 WBS 第一欄早就在報「不是合法的工作項目 ID」；
-            # 引用裡卻靜靜吞掉，那是同一個東西在同一支腳本裡有兩種讀法。
-            # 尾巴要一起吃進來：`FE-Q01a` 這種**編號後面黏了英數**的，
-            # 上面那條 regex 的 `(?![0-9A-Za-z])` 會讓它整個消失 ——
-            # 一個懸空 ID 加一個字母就靜靜不見了，這正是要防的事。
-            for m in re.finditer(
-                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z][0-9]+[A-Za-z0-9]*"
-                    r"(?:/[0-9A-Za-z]+)*)(?![A-Za-z0-9])", s):
-                # 斜線段落：純數字，或重複一次群組字母再接數字。
-                head, *tail = m.group(1).split("/")
-                bad = None
-                if not re.fullmatch(ID_RE, head):
-                    bad = head
-                else:
-                    bad = next((t for t in tail
-                                if not re.fullmatch(r"[A-Z]?[0-9]{2,}", t)), None)
-                if bad is not None:
-                    violations.append(
-                        f"{_src} 第 {lineno} 行的 {m.group(1)} 裡的 {bad} "
-                        f"不是合法的工作項目編號"
-                        f"（`XX-Y` 加至少兩位數字，"
-                        f"斜線後面是數字、或重複一次組別字母再接數字）")
-            # 群組 ID：後面**不能**接英數，否則 `APP-C01` 會被當成群組 `APP-C`。
-            # `外部-拒` 這種非 A-Z 的分類詞不會 match，那是分類詞不是群組。
-            # 左邊界不能用 `\b`：Python 的 `\w` 認得中文，`依賴FE-D完成`
-            # 在 `賴` 與 `F` 之間**沒有**邊界，整個引用就漏掉了。
-            # 前綴長度也不能寫死 `{2,4}` —— 工作項目那條是 `[A-Z]+`，
-            # 兩條不對稱的話 `ADMIN-Z` 這種群組只有一半會被驗到。
-            for m in re.finditer(
-                    r"(?<![A-Za-z0-9-])([A-Z]+-[A-Z])(?![0-9A-Za-z])", s):
-                grefs.append((m.group(1), str(_src), lineno))
+            # **同一段字只讀一次。** 這裡以前是三條 regex 各讀一遍、
+            # 各有各的邊界，「這一條放掉的交給下一條」—— 而下一條接不住。
+            # 現在只有 token 切分與一份文法，見 `scan_ids`。
+            ids, gids, errs = scan_ids(s, f"{_src} 第 {lineno} 行")
+            refs.extend((i, str(_src), lineno) for i in ids)
+            grefs.extend((g, str(_src), lineno) for g in gids)
+            violations.extend(errs)
         if in_fence:
             # 一個沒關的圍籬會讓**檔案後半段的引用全部消音**，而且是綠的。
             # 「跳過圍籬」本來是為了放過格式範例，不是給人一個萬用消音器。

@@ -17,9 +17,19 @@
 # **改 progress.sh 之前跑一次，改完再跑一次。**
 
 set -uo pipefail
-ROOT="$(git rev-parse --show-toplevel)"
+# **ROOT 不要靠 git 推。** 原本是 `git rev-parse --show-toplevel`：把這套
+# 東西複製出去（新專案還沒 `git init`）就解析失敗 → 下面的 `cp` 失敗 →
+# `$W` 裡留著**上一次執行留下的 progress.sh**，於是測到的是舊檔、而且全綠。
+# 一支專門在抓 fail-open 的腳本自己 fail-open。（實測踩到過。）
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/.github/scripts/progress.sh"
-W="${TMPDIR:-/tmp}/progress-check-test"
+[ -f "$SCRIPT" ] || { echo "✗ 找不到 $SCRIPT"; exit 1; }
+# **不複製 progress.sh，用絕對路徑直接跑它。** 複製就有「測到舊檔」的可能，
+# 不複製就沒有 —— 這比加一條「cp 失敗就 exit」的守衛牢靠。
+# 工作目錄按 repo 名字分開：固定同一個路徑的話，兩份 repo 不能同時跑測試。
+# 不需要清掉它 —— `baseline()` 每次都重寫全部的 fixture，而且這裡面
+# 已經沒有 progress.sh 了，殘留的東西影響不到任何一條測試。
+W="${TMPDIR:-/tmp}/progress-check-test.$(basename "$ROOT")"
 
 PASS=0
 FAIL=0
@@ -27,8 +37,7 @@ FAIL=0
 # 一份最小但合法的工作分解表。每個案例都從它出發，只壞一個地方 ——
 # 這樣紅燈的原因就只可能是那一個地方。
 baseline() {
-  mkdir -p "$W/docs" "$W/.github/scripts"
-  cp "$SCRIPT" "$W/.github/scripts/progress.sh"
+  mkdir -p "$W/docs"
   cat > "$W/docs/WBS.md" <<'WBS'
 # 測試用的工作分解
 
@@ -90,7 +99,7 @@ RM
 run_absent() {
   local want="$1" desc="$2" needle="$3"
   local out rc
-  out="$(cd "$W" && bash .github/scripts/progress.sh --check 2>&1)"; rc=$?
+  out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
     FAIL=$((FAIL + 1)); return
@@ -108,7 +117,7 @@ run_absent() {
 run() {
   local want="$1" desc="$2" needle="$3"
   local out rc
-  out="$(cd "$W" && bash .github/scripts/progress.sh --check 2>&1)"; rc=$?
+  out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
     FAIL=$((FAIL + 1)); return
@@ -132,7 +141,7 @@ run() {
 # 排在 JSON 輸出之後，所以 --json 對任何違規都印 `"violations": []`。
 run_json_has() {
   local desc="$1" out n
-  out="$(cd "$W" && bash .github/scripts/progress.sh --json 2>/dev/null)"
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null)"
   n="$(printf '%s' "$out" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("violations",[])))' 2>/dev/null)"
   if [ "${n:-0}" -gt 0 ]; then
     echo "✓ $desc"; PASS=$((PASS + 1))
@@ -222,7 +231,7 @@ run 1 "ID 被加粗（會被當成續行）：紅" "不是合法的工作項目 
 # 要真的去看輸出裡有沒有它。
 baseline
 edit "| APP-C01 | 應用骨架 |" " | APP-C01 | 應用骨架 |"
-if (cd "$W" && bash .github/scripts/progress.sh --all 2>&1) | grep -q "APP-C01"; then
+if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
   echo "✓ 表格列前面有空白：那一列還看得見"
   PASS=$((PASS + 1))
 else
@@ -250,6 +259,21 @@ baseline
 edit "DEP-G01 \`外部-缺\`" "DEP-GO1 \`外部-缺\`"
 run 1 "阻塞欄的依賴 ID 打錯（字母 O）：紅" "不是合法的工作項目 ID"
 
+# **上面那條現在是被敘述掃描接住的**（docs/WBS.md 整份都會掃，表格列也是），
+# 不是被阻塞欄那條接住的。所以阻塞欄自己的路徑要另外測 —— 下面兩個
+# 是敘述掃描**看不到**的形狀：散文用的窄 token 要求頭部有數字、
+# 而且只認大寫，這兩個都不符合。
+#
+# 突變體證明過：把阻塞欄改成窄 token、或讓它的錯誤不報，
+# 只有這兩條會紅。
+baseline
+edit "DEP-G01 \`外部-缺\`" "DEP-GXX \`外部-缺\`"
+run 1 "阻塞欄裡沒有數字的 ID 要紅" "阻塞欄的 DEP-GXX"
+
+baseline
+edit "DEP-G01 \`外部-缺\`" "dep-g01 \`外部-缺\`"
+run 1 "阻塞欄裡的小寫 ID 要紅" "阻塞欄的 dep-g01"
+
 # 欄數不足的資料列 —— 原本整列無聲消失
 baseline
 edit "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | |" "| APP-C01 | 應用骨架 | 專案骨架 |"
@@ -259,7 +283,7 @@ run 1 "工作項目列欄數不足：紅" "欄"
 # 這一類實測過：把表頭的 ID 加粗，122 項掉到 19 項，而 --check 照樣是 0。
 baseline
 edit "| ID | 項目 |" "| **ID** | 項目 |"
-if (cd "$W" && bash .github/scripts/progress.sh --all 2>&1) | grep -q "APP-C01"; then
+if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
   echo "✓ 表頭的 ID 被加粗：照樣認得出來"
   PASS=$((PASS + 1))
 else
@@ -466,7 +490,7 @@ run 1 "三位數的引用也要驗" "APP-C011 不存在"
 # 早就在報「不是合法的工作項目 ID」，引用裡卻靜靜吞掉，那是兩種讀法。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C1\` |"
-run 1 "一位數的編號不合法要報" "APP-C1 不是合法的工作項目編號"
+run 1 "一位數的編號不合法要報" "APP-C1 不是合法的工作項目 ID"
 
 # **編號後面黏了英數的也要報。** `APP-Q01a` 原本兩邊都沒有報 ——
 # 引用那條 regex 的 `(?![0-9A-Za-z])` 讓它整個消失，
@@ -474,7 +498,7 @@ run 1 "一位數的編號不合法要報" "APP-C1 不是合法的工作項目編
 # 一個懸空 ID 後面加一個字母就靜靜不見了，那正是這一節要防的事。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-Q01a\` |"
-run 1 "編號後面接英數也不合法" "APP-Q01a 不是合法的工作項目編號"
+run 1 "編號後面接英數也不合法" "APP-Q01a 不是合法的工作項目 ID"
 
 # 標題只決定接下來要不要掃，**它自己照樣要被掃**。
 baseline
@@ -490,12 +514,13 @@ run 1 "只有正牌的〈舊 ID 去哪了〉能豁免" "APP-D 不存在"
 # **「交給下一條檢查」的接力要驗。** 下面每一條都曾經被某一條 regex
 # 放掉、而下一條的邊界條件正好接不住 —— 放掉的東西沒有人接。
 
-# 斜線清單尾巴黏一個字母：項目 regex 的尾隨 lookahead 會在 `x` 上失敗，
-# 回溯把 `*` 縮到零個、改在 `/` 前面成功 —— `/02` 整段消失，
-# `APP-C02` 不存在也不會紅。catch-all 從頭吃到 `/` 就停，也接不住。
+# 斜線清單尾巴黏一個字母。以前是項目 regex 的尾隨 lookahead 在 `x` 上
+# 失敗、回溯把 `/02` 整段丟掉，只能靠「`APP-C02` 不存在」間接抓到。
+# 現在 token 一次切出 `APP-C01/02x`，parse 不完整就直接報 —— 就算
+# `APP-C02` 真的存在，這個寫法本身也是壞的。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01/02x\` |"
-run 1 "斜線清單尾巴黏字母，中間的 ID 照樣要驗" "APP-C02"
+run 1 "斜線清單尾巴黏字母要紅" "APP-C01/02x"
 
 # 斜線後面可以重複組別字母（`APP-B02/B03`），但**字母要對得上** ——
 # `APP-C01/P02` 是打錯，不是縮寫。
@@ -520,7 +545,7 @@ run 1 "範圍兩端相同要紅" "兩端相同"
 # 不吃的話從頭只吃到 `APP-C01`，那是合法的，`/2` 就靜靜消失了。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01/2\` |"
-run 1 "斜線後面一位數要紅" "APP-C01/2 裡的 2"
+run 1 "斜線後面一位數要紅" "APP-C01/2 不是合法的工作項目 ID"
 
 # 跨度離譜 —— 同上，原本也是 continue 之後沒有人接。
 baseline
@@ -530,13 +555,72 @@ run 1 "範圍跨度超過上限要紅" "超過上限"
 # 第二端不足兩位數，同上。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01\`–\`5\` |"
-run 1 "範圍第二端不合法要紅" "第二端"
+run 1 "範圍端點不足兩位數要紅" "編號至少兩位數"
+
+# **第一端也要驗。** 只驗第二端的話 `APP-C1`–`APP-C03` 靜靜通過 ——
+# 而它會展開成 APP-C01…APP-C03，跟寫的人想寫的東西未必一樣。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C1\`–\`APP-C03\` |"
+run 1 "範圍第一端不足兩位數要紅" "編號至少兩位數"
 
 # WBS 第一欄與引用掃描共用同一份 ID 文法。分開寫的話，
 # `APP-C1` 會在第一欄合法、在引用裡不合法 —— 同一支腳本兩種讀法。
 baseline
 edit "| APP-C01 |" "| APP-C1 |"
 run 1 "WBS 第一欄的一位數 ID 也不合法" "不是合法的工作項目 ID"
+
+# ── 一份文法：token 切出來，parse 不完整就報（對抗審查第四輪）─────
+
+# **範圍第二端黏一個字母，整段靜默。** 範圍 regex 的尾隨 lookahead 在 `x`
+# 上失敗 → 範圍不成立；而 `APP-C03x` 前面那個 `-` 又被項目 regex 與
+# catch-all 的左邊界 `(?<![A-Za-z0-9-])` 一起擋掉 —— 三條 regex 接力，
+# 放掉的東西沒有人接。這是 `APP-C01/02x` 的同一個缺陷長在範圍上。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01\`–\`APP-C03x\` |"
+run 1 "範圍第二端黏字母要紅" "APP-C01-APP-C03x"
+
+# 更糟的版本：第二端既不存在、又不合法。原本一樣是綠的。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C01\`–\`APP-C99x\` |"
+run 1 "範圍第二端既不存在又不合法要紅" "APP-C01-APP-C99x"
+
+# **不是每個大寫連字詞都是 ID。** token 的頭部要求至少有一個數字 ——
+# 不要求的話 `SETUP-GITHUB.md`、`X-Ray`、`E-Mail` 全都會被 parse、
+# 全都會報假違規（實測：README 立刻多一個）。
+baseline
+edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`SETUP-GITHUB.md\` 與 X-Ray |"
+run_absent 0 "沒有數字的大寫連字詞不是 ID" "SETUP-GITHUB"
+
+# ── 欄位也要有文法（週欄、點欄）──────────────────────────────
+
+# `W1-W3`（ASCII 連字號）跟正確的 `W1–W3` 差一個鍵，而它會讓那一項的
+# 排程**靜靜消失**：週次變成「沒有排程」，`--check` 是綠的，
+# 連帶「工作不得排在裁決之前」那條也因為 start 是 None 而跳過。
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | W1-W3 | 3"
+run 1 "週欄用 ASCII 連字號要紅" "週次欄"
+
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | w1 | 3"
+run 1 "週欄小寫要紅" "週次欄"
+
+# 點欄一樣：`3點` 會讓那一列的點數直接不算，總數少掉沒有人會發現。
+baseline
+edit "專案骨架 | W1 | 3" "專案骨架 | W1 | 3點"
+run 1 "點欄不是數字要紅" "點數欄"
+
+# ── 阻塞欄走同一份文法（不是自己一份）──────────────────────────
+
+# 阻塞欄以前自己寫一份 `[A-Z]+-[A-Z][0-9]+`：不展開斜線、不展開範圍。
+# 於是 `DEP-G01/99` 只收到 G01 —— 而同一個格子的敘述掃描會展開 `/99`
+# 去驗它存在。同一個格子，同一支腳本，兩種讀法。
+baseline
+edit "DEP-G01 \`外部-缺\`" "DEP-G01/99 \`外部-缺\`"
+run 1 "阻塞欄的斜線清單要展開" "DEP-G99"
+
+baseline
+edit "DEP-G01 \`外部-缺\`" "DEP-G01–DEP-G03 \`外部-缺\`"
+run 1 "阻塞欄的範圍中間也要驗" "DEP-G02"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
