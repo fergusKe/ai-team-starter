@@ -137,13 +137,20 @@ G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\0
 # 規範不會擋住任何人。這裡把它們變成看得到的違規。
 # 圍籬：``` 或 ~~~。**開啟可以接語言名，閉合不行**（CommonMark 4.5）——
 # 只看開頭的話，`` ```python `` 會被當成關，於是圍籬從中間裂開。
-_FENCE = re.compile(r"^(`{3,}|~{3,})")
+_FENCE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 _FENCE_CLOSE = re.compile(r"^(`{3,}|~{3,})\s*$")
 
-# CommonMark 的 HTML block type 1：這幾個標籤到閉合為止都是 raw，
-# 瀏覽器不顯示 `<style>`／`<script>` 的內容 —— 讀者看不到的東西不是資料。
+# CommonMark 的 HTML block，**七種裡的前五種**。共同點是「瀏覽器不顯示，
+# 或顯示的不是表格」—— 讀者看不到的東西不是資料。
+#   type 1  <pre> <script> <style> <textarea>   到閉合標籤
+#   type 2  <!-- -->                             （在 visible_lines 裡另外處理）
+#   type 3  <? ... ?>        type 4  <!X ...>    type 5  <![CDATA[ ... ]]>
+# 3/4/5 在瀏覽器裡是 bogus comment，完全不顯示。
 _HTML_RAW = re.compile(r"^<(pre|script|style|textarea)\b", re.I)
 _HTML_RAW_END = re.compile(r"</(pre|script|style|textarea)>", re.I)
+_HTML_ODD = [(re.compile(r"^<\?"), "?>"),
+             (re.compile(r"^<!\[CDATA\["), "]]>"),
+             (re.compile(r"^<![A-Za-z]"), ">")]
 
 
 def visible_lines(text, src):
@@ -180,8 +187,18 @@ def visible_lines(text, src):
     fence = None       # (字元, 長度)
     comment = False
     raw_html = False
+    odd_end = None
     for lineno, line in enumerate(text.splitlines(), 1):
+        # **tab 要先展開再量縮排。** CommonMark 的 tab 走到下一個 4 的
+        # tab stop，而 `len(line) - len(line.lstrip(" "))` 只數空白 ——
+        # 一個 tab 就能讓表格列變成程式碼區塊，而我們照樣把它讀成資料。
+        line = line.expandtabs(4)
         s = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if odd_end is not None:
+            if odd_end in s:
+                odd_end = None
+            continue
         if comment:
             if "-->" in s:
                 comment = False
@@ -190,7 +207,13 @@ def visible_lines(text, src):
             if _HTML_RAW_END.search(s):
                 raw_html = False
             continue
-        m = _FENCE.match(s)
+        # **開啟圍籬也要照規範，不是只有閉合。** 縮排四格以上不是圍籬
+        # 而是程式碼區塊；反引號圍籬的 info string 不能含反引號（spec 4.5）。
+        # 認太寬的後果跟認太窄一樣嚴重 —— 實測 `` ```x`y `` 開頭的假圍籬
+        # 可以把**真的一列**藏起來，而 --check 是 0。
+        m = _FENCE.match(s) if indent < 4 else None
+        if m and m.group(1)[0] == "`" and "`" in m.group(2):
+            m = None
         if fence is not None:
             # **閉合圍籬不能帶語言名。** 帶了就不是閉合 —— 只看開頭的話，
             # 圍籬裡示範一行 ` ```python ` 就能讓它從中間裂開，
@@ -209,16 +232,28 @@ def visible_lines(text, src):
             if not _HTML_RAW_END.search(s):
                 raw_html = True
             continue
+        for _pat, _end in _HTML_ODD:
+            if _pat.match(s):
+                if _end not in s[2:]:
+                    odd_end = _end
+                break
+        else:
+            _pat = None
+        if _pat is not None:
+            continue
         # **縮排四格以上的表格列要報，不能靜靜跳過。**
         # Markdown 把它當成程式碼區塊 —— 而這裡曾經 `line.strip()` 之後
         # 直接當表格列讀，於是縮排寫的示範表格會被註冊成真項目（實測）。
         # 兩個方向都不能靜默：跳過的話真表格被藏掉，讀進來的話範例變資料。
-        if s.startswith("|") and len(line) - len(line.lstrip(" ")) >= 4:
+        if s.startswith("|") and indent >= 4:
             errs.append(f"{src} 第 {lineno} 行的表格列縮排了四格以上 —— "
                         f"Markdown 會把它當成程式碼區塊。是範例就放進圍籬，"
                         f"是資料就把縮排拿掉")
             continue
         out.append((lineno, line))
+    if odd_end is not None:
+        errs.append(f"{src} 有沒關起來的 `<?…?>`／`<!…>`／`<![CDATA[…]]>` "
+                    f"—— 後面的內容全部不會被檢查")
     if raw_html:
         errs.append(f"{src} 有沒關起來的 `<pre>`／`<script>`／`<style>`／"
                     f"`<textarea>` —— 後面的內容全部不會被檢查")
@@ -425,12 +460,24 @@ def scan_ids(text, where):
     # 所以改成**認形狀不認字元**：兩個以上大寫字母、一個不是連字號也不是
     # 空白的東西、再一個大寫字母加至少兩位數字 —— 那看起來就是一個 ID，
     # 只是中間那個字元不對。實測六份真實文件 0 誤報。
-    for m in re.finditer(r"(?<![A-Za-z0-9])[A-Z]{2,}"
+    # 前綴長度用 `+` 不是 `{2,}` —— `_GRP` 是 `[A-Z]+`，兩邊寫不一樣的話
+    # 三個字母的前綴（`API⎯W03`）整個不報。**同一支腳本兩種前綴長度。**
+    for m in re.finditer(r"(?<![A-Za-z0-9])[A-Z]+"
                          r"([^A-Za-z0-9_\s\-/|、，,。：:（）()\[\]{}%])"
                          r"[A-Z][0-9]{2,}(?![A-Za-z0-9])", text):
         errs.append(f"{where}的 {m.group(0)} 看起來像工作項目 ID，"
                     f"但中間那個 `{m.group(1)}` 不是連字號 —— "
                     f"畫面上看不出差別，機器看得出來")
+    # **同形的不只連字號，字母也會。** `FE-С99` 的 `С` 是西里爾字母
+    # U+0421，`FΕ-C99` 的 `Ε` 是希臘字母 U+0395 —— 畫面上跟 ASCII 一模一樣，
+    # 而 `_TOKEN` 只認 `[A-Z]`，於是整個引用不存在。跟連字號那條是同一件事，
+    # 換個位置而已，所以判準也一樣：**形狀對、但有字元不是 ASCII 就報。**
+    for m in re.finditer(r"(?<![^\W\d_])[^\W\d_]{2,}-[^\W\d_][0-9]{2,}"
+                         r"(?![^\W\d_0-9])", text):
+        if not m.group(0).isascii():
+            errs.append(f"{where}的 {m.group(0)} 看起來像工作項目 ID，"
+                        f"但裡面有不是 ASCII 的字母（西里爾／希臘字母跟 "
+                        f"ASCII 長得一模一樣）—— 畫面上看不出差別")
     # **範圍只有一種寫法，寫錯符號要說出來。** `〜`／`〰`／`゠` 刻意不折成
     # `-`（折了就變成「同一支腳本兩種範圍文法」，見 `normalize()`），
     # 但不折的話它們會被讀成兩個獨立的引用、**中間那些完全不驗**。
