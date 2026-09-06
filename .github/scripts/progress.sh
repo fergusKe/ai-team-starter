@@ -122,7 +122,7 @@ done
 git fetch -q origin 2>/dev/null || true
 
 SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" python3 - <<'PY'
-import os, re, subprocess, pathlib, collections
+import os, re, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
 ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
@@ -175,16 +175,31 @@ RANGE_MAX = 40
 # 所以改成：**先切出一個最大 token，再用一份文法 parse 它，
 # parse 不完整就報。** 每多一種寫法不會再生一個洞。
 #
-# **token 吃的字元集合要涵蓋邊界擋的字元集合。左右兩邊都算。**
+# **左右兩個邊界是兩種東西，不要用同一句話概括。** 曾經寫成
+# 「token 吃的字元集合要涵蓋邊界擋的字元集合，左右都算」——
+# 那句話對右邊界成立、對左邊界不成立，而且照著它改實作會壞掉。
 #
-#   右邊界：token 尾巴吃 `[A-Za-z0-9]`、右邊界擋 `[A-Za-z0-9]`。貪婪吃完
-#           之後右邊界必然成立，縮短只會讓它失敗，不會讓它變成另一個答案。
+#   右邊界：**這是回溯風險，必須涵蓋。** token 尾巴吃 `[A-Za-z0-9]`、
+#           右邊界擋 `[A-Za-z0-9]`。貪婪吃完之後右邊界必然成立；縮短
+#           只會讓它失敗，不會讓它變成另一個比較短的答案。
+#           不涵蓋就會出事，實測過兩次：
+#             `APP-C01/02x`  尾巴 `[0-9]{2,}` 吃不到 `x`，回溯把 `/02`
+#                          整段丟掉，右邊界在 `/` 前面剛好成立
+#             `APP-A01--APP-A99`  尾巴只在 `-` 後接英數時才吃 `-`，
+#                          從 `--` 中間裂開（已修：尾巴改吃 `[/-]+`）
 #
-#   左邊界：這裡原本擋 `[A-Za-z0-9-]`，但尾巴只在 `-` 後面接英數時才吃 `-`。
-#           於是 `APP-A01--APP-A99` 從 `--` 中間裂開，後半被左邊界擋掉，
-#           **整段靜默** —— 跟 `APP-C01/02x` 是同一個缺陷的鏡像。
-#           所以尾巴改吃連續的 `[/-]+`，左邊界也不再擋 `-`：
-#           `W1-APP-Z99` 這種黏在別的字後面的引用照樣要驗。
+#   左邊界：**這不是回溯風險，是「哪些出現位置要掃」的取捨。**
+#           `finditer` 由左往右掃，lookbehind 只決定一個位置可不可以
+#           起頭；擋掉頭部吃不到的字元不會生出假匹配，只會讓那個位置
+#           不被掃。所以這裡**刻意**擋 `[A-Za-z0-9]`，代價是
+#           `W1APP-A99`、`xAPP-A99` 這種黏在英數後面的引用不驗。
+#
+#           放寬過，實測會壞：改成只擋 `[A-Z]`，`CONTEXT.md` 裡的
+#           regex 字面 `[0-9a-zA-Z\-]+` 立刻被讀成「群組 A-Z 不存在」；
+#           改成頭部先吃 `[A-Za-z0-9]*` 也一樣（會切出 `zA-Z`）。
+#           散文裡本來就有 `a-zA-Z` 這種東西，而黏在英數後面的 ID
+#           不是真的引用形式 —— 這個取捨往「不掃」的方向站。
+#           （`W1-APP-A99`，也就是黏在**連字號**後面的，是驗的。）
 #
 # 頭部的英數尾巴**要求至少有一個數字**。不要求的話 `SETUP-GITHUB`、
 # `X-Ray`、`E-Mail` 全都變成 token，然後 parse 失敗報一堆假違規
@@ -206,6 +221,50 @@ _SHAPE_RANGE = re.compile("(" + _GRP + r")([0-9]+)-"
                           "(?:(" + _GRP + r"))?([0-9]+)")           # APP-C01–APP-C05
 
 
+def normalize(s: str) -> str:
+    """把「畫面上長得一樣」的字元折成同一個。**不剝任何結構。**
+
+    `plain()` 與 `plain_field()` 共用這一段 —— 分開寫的話，
+    受控欄位跟散文會對同一個字元有兩種讀法。
+    """
+    # **同形字元不要用清單，用 Unicode 類別。** 這裡原本是一串
+    # `.replace()`，然後每被審查一次就補幾個（U+2010-2014、FF0D、
+    # 2212、2015⋯⋯）—— 而清單永遠列不完：實測 U+2500 `─`、U+30FC `ー`、
+    # U+FE63 `﹣`、U+2043 `⁃` 全部還在外面，每一個都讓 ID 從中間裂開、
+    # 整段靜默。**「靠清單」本身就是那一類問題**，不是清單不夠長。
+    #
+    # 拿掉不佔位的字元（Cf 格式字元含零寬與 LRM／軟連字號，Mn 非空隙
+    # 標記含 VS16）。這裡的輸出只拿去比對 ID，不拿去顯示，
+    # 所以拿掉它們不會改變任何人看到的東西。
+    s = "".join(c for c in s
+                if unicodedata.category(c) not in ("Cf", "Mn"))
+    # 連字號類（Pd）全部折成 `-`，再加上幾個不在 Pd 裡、但畫面上
+    # 一模一樣的：U+2212 減號（Sm）、U+2500 製表線（So）、
+    # U+30FC／U+FF70 日文長音（Lm）、U+2043 項目符號連字號（Po）。
+    s = "".join("-" if (unicodedata.category(c) == "Pd"
+                        or c in "\u2212\u2500\u30fc\uff70\u2043") else c
+                for c in s)
+    # 全形英數折回半形。**只折英數**（不折 `＋`、`｜` 這些這支腳本有在用的
+    # 標點，也不要用 NFKC —— 它不折 en/em dash，卻會把 `①` 折成 `1`）。
+    return "".join(chr(ord(c) - 0xFEE0)
+                   if ("\uff10" <= c <= "\uff19" or "\uff21" <= c <= "\uff3a"
+                       or "\uff41" <= c <= "\uff5a") else c
+                   for c in s)
+
+
+def plain_field(s: str) -> str:
+    """**受控欄位專用的正規化。只剝強調符號，不剝結構。**
+
+    阻塞欄一度直接用 `plain()`，而 `plain()` 是給散文用的：它會整段刪掉
+    HTML tag、HTML 註解、Markdown 連結外殼。於是 `<待確認>`、`<BE-G01>`、
+    `<!-- BE-G01 -->` 這幾格**正規化完變成空字串**，跟「這一格真的沒寫東西」
+    完全一樣 —— 格子裡明明有字，檢查卻什麼都看不到。
+
+    受控欄位的規則相反：**看不懂的東西要留在原地讓它被報出來。**
+    """
+    return normalize(re.sub(r"[*_`~]", "", s)).strip()
+
+
 def plain(s: str) -> str:
     """剝掉 Markdown 與 HTML 的裝飾，只留下讀者實際看到的字。
 
@@ -215,25 +274,13 @@ def plain(s: str) -> str:
     它們長得跟 `-` 一樣，貼上來的文字很容易夾帶。
     """
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)   # HTML 註解
-    s = re.sub(r"<[^:@\s]*?>", "", s)              # HTML tag
+    # **只剝真的 HTML tag，標籤名要小寫。** 原本是 `<[^:@\s]*?>`，
+    # 於是 `<FE-C01>`（用角括號當佔位符，中文文件很常見）整段被吃掉 ——
+    # 一個引用靜靜消失，而這正是這支腳本要抓的事。
+    s = re.sub(r"</?[a-z][a-z0-9]*(?:\s[^>]*)?/?>", "", s)
     s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)  # Markdown 連結，留文字
     s = re.sub(r"[*_`~]", "", s)                   # 強調符號
-    s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2012", "-")
-    s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\uff0d", "-")
-    # 減號 U+2212 與橫槓 U+2015 也長得跟 `-` 一樣，貼上來很容易夾帶。
-    s = s.replace("\u2212", "-").replace("\u2015", "-")
-    # **看不見的字元要拿掉，不是留著。** 軟連字號與零寬字元夾在 ID 中間
-    # （`FE-C<ZWSP>01`）畫面上完全看不出來，但會讓 token 從中間裂開，
-    # 於是那個引用整個消失 —— 而且沒有任何訊息。
-    s = re.sub(r"[\u00ad\u200b\u200c\u200d\ufeff]", "", s)
-    # 全形英數也要折回半形。**只折英數**（不折 `＋`、`｜` 這些標點）——
-    # `FE-C０１` 畫面上就是 `FE-C01`，不折的話 token 在全形數字前面就收尾，
-    # 變成一個「群組引用」靜靜通過：群組存在，所以連紅都不會紅。
-    s = "".join(chr(ord(c) - 0xFEE0)
-                if ("\uff10" <= c <= "\uff19" or "\uff21" <= c <= "\uff3a"
-                    or "\uff41" <= c <= "\uff5a") else c
-                for c in s)
-    return s.strip()
+    return normalize(s).strip()
 
 
 def scan_ids(text, where):
@@ -252,6 +299,18 @@ def scan_ids(text, where):
     ids, gids, errs = [], [], []
     for m in _TOKEN.finditer(text):
         tok = m.group(0)
+
+        # **孤立的斜線要報。** token 的尾巴是 `(?:[/-]+[A-Za-z0-9]+)*`：
+        # `/` 後面沒有接英數時整段吃不下，於是 `XX-Y01/` 切出一個合法的
+        # `XX-Y01`，右邊界看到 `/` 不是英數就成立 —— **截斷的斜線清單
+        # 靜靜變成單一個 ID**。這是「token 吃得到、邊界擋不住」的第三種
+        # 效應，跟左右邊界那兩條都不同。
+        #
+        # 只認 `/`，不認 `-`：`plain()` 會把中文破折號 `——` 折成 `--`，
+        # 而 `` `XX-Y01`——說明 `` 是正常的中文寫法，報它是誤報。
+        if text[m.end():m.end() + 1] == "/":
+            errs.append(f"{where}的 {tok}/ 後面沒有東西 —— "
+                        f"斜線清單要寫成 `XX-Y01/02`")
 
         r = _SHAPE_RANGE.fullmatch(tok)
         if r:
@@ -357,6 +416,50 @@ def check_mark(wid: str, mark: str):
         out.append(f"{wid}：標記沒有理由（格式是 `標記｜理由`）")
     return out
 
+# ── 阻塞類型的詞彙：從文件自己那張表讀出來 ─────────────────────────
+#
+# **不要把 `待銜接`／`待裁決` 這種詞寫死進腳本。** 它們是每個專案自己的
+# 詞彙，而它們**本來就宣告在文件裡**：`docs/WBS.md` 有一張
+# `| 阻塞類型 | 意思 | 該做什麼 |` 的表。從那張表讀第一欄就好 ——
+# 跟群組是從 `## XX-Y 名稱` 標題讀出來的是同一個道理。
+#
+# 這裡曾經改用「殘留法」猜：把切得到的 ID 與「英文前綴接中文」的詞拿掉，
+# 剩下的字如果還有 ASCII 就報。那不是「不寫死詞彙」，是**寫死了另一件事**
+# —— 詞彙必須長成「純中文」或「英文-中文」。實測兩邊都漏：
+# `今天天氣真好` 全綠（純中文，永遠不含 ASCII），`x-待銜接` 也全綠
+# （形狀對了就過，形狀沒有語意）；反過來 `WIP`、`外部 API` 誤報。
+def read_block_types(lines):
+    """讀出〈阻塞類型〉表第一欄的詞彙。找不到那張表就回傳空集合。"""
+    out, in_table, fence = set(), False, False
+    for raw in lines:
+        s = raw.strip()
+        if _FENCE.match(s):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        if not s.startswith("|"):
+            in_table = False
+            continue
+        cells = [plain_field(c) for c in s.strip("|").split("|")]
+        if not cells:
+            continue
+        if cells[0] == "阻塞類型":
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if set(s) <= set("-:| "):        # 表頭分隔線
+            continue
+        if cells[0]:
+            out.add(cells[0])
+    return out
+
+
+BLOCK_TYPES = read_block_types(
+    pathlib.Path("docs/WBS.md").read_text(encoding="utf-8").splitlines()
+    if pathlib.Path("docs/WBS.md").exists() else [])
+
 # ── WBS：ID → (名稱, 週, 點數合計) ─────────────────────────────────
 wbs, order = {}, []
 wbs_path = pathlib.Path("docs/WBS.md")
@@ -378,11 +481,23 @@ if wbs_path.exists():
         s = _lines[i].strip()
         return s.startswith("|") and set(s) <= set("-:| ")
 
+    # **圍籬在這裡也要認。** 引用掃描早就跳過圍籬（那裡面是格式範例），
+    # 但這個迴圈原本沒有 —— 於是一段 ```` ```markdown ```` 包起來的示範表格
+    # 會被當成真的工作項目讀進來：ID 註冊、點數計入、狀態算出來。
+    # **同一份檔案、同一支腳本，圍籬有兩種讀法**，正是這支腳本在抓的病。
+    _wbs_fence = False
     for lineno, line in enumerate(_lines, 1):
         # **不能用 line.startswith("|")** —— Markdown 允許表格列前面有空白，
         # 而那樣的一列會整個從檢查裡消失（連同它的 ID、週次、標記），
         # 不會有任何錯誤訊息。先正規化再判斷。（實測繞過過。）
         line = line.strip()
+        if _FENCE.match(line):
+            _wbs_fence = not _wbs_fence
+            in_table = False
+            cur = None
+            continue
+        if _wbs_fence:
+            continue
         if not line.startswith("|"):
             # 表格結束。**一定要重設** —— 否則下一張表的列會被當成這張表的。
             in_table = False
@@ -515,36 +630,41 @@ if wbs_path.exists():
         # 每一列的阻塞都要收 —— 一個項目底下常常只有某幾列被擋住
         # （Inbox 的清單做得了、「已讀」沒有端點），只記第一個會讓反向索引漏掉。
         if blocked:
-            # **阻塞欄走同一份文法，而且整格都要吃得完。**
+            # **阻塞欄整格都要吃得完，一段都不准放過。**
             #
-            # 它曾經自己寫一份 `[A-Z]+-[A-Z][0-9]+`：不展開斜線、不展開
-            # 範圍，於是 `BE-G01/02` 只收到 G01、`BE-G01`–`BE-G03` 中間的
-            # G02 消失 —— 而同一個格子的敘述掃描會展開它們去驗存在。
+            # 它曾經自己寫一份 `[A-Z]+-[A-Z][0-9]+` 去 `finditer`：
+            # 不展開斜線、不展開範圍，而且**撈不到就當作這一格沒有阻塞**。
+            # 於是 `BE-G`（只寫群組）、`BE_G01`、全形數字寫的編號、
+            # `<待確認>`，全部跟「這一格真的沒有 ID」長得一模一樣。
             #
-            # 但「走同一份文法」還不夠。**撈不到 token 就當作沒有阻塞**，
-            # 是這一欄唯一剩下的 fail-open：`BE-G`（只寫群組）、`BE_G01`、
-            # 全形數字寫的編號，全部跟「這一格真的沒有 ID」長得一模一樣，
-            # 而週欄與點欄早就是整格驗的。所以這裡也整格驗：
-            # 把切得到的 token 與阻塞類型的名稱拿掉之後，
-            # **不准再剩下任何 ASCII 英數**。
-            _bsrc = plain(blocked)
-            found, _bgids, _berrs = scan_ids(_bsrc, f"{cur}：阻塞欄")
-            violations.extend(_berrs)
-            # 群組不是阻塞。`BE-G` 擋不住任何一件具體的事，而它原本
-            # 被 parse 成功之後直接丟掉 —— parse 成功卻不用，就是漏。
-            for _g in _bgids:
-                violations.append(
-                    f"{cur}：阻塞欄的 {_g} 是群組，不是工作項目 —— "
-                    f"阻塞要指到具體哪一項（`{_g}01`）")
-            # 阻塞類型的名稱是中文，或「英文前綴接中文」（`BE-拒`）。
-            _rest = _TOKEN.sub(" ", _bsrc)
-            _rest = re.sub(r"[A-Za-z]+-[^\x00-\x7F\s]+", " ", _rest)
-            _bad = [w for w in _rest.split() if re.search(r"[A-Za-z0-9]", w)]
-            if _bad:
-                violations.append(
-                    f"{cur}：阻塞欄的 {'、'.join(_bad)} 既不是工作項目 ID、"
-                    f"也不是阻塞類型（ID 是 `XX-Y01`；阻塞類型是中文，"
-                    f"或像 `BE-拒` 這種英文前綴接中文）")
+            # 現在：**整格切成段，每一段要嘛是合法 ID、要嘛是宣告過的
+            # 阻塞類型，兩者都不是就報。** 週欄與點欄早就是這樣驗的。
+            # 用 `plain_field()` 而不是 `plain()` —— 後者會把
+            # `<待確認>`、`<!-- BE-G01 -->` 整段刪掉，正規化完是空字串。
+            _bsrc = plain_field(blocked)
+            found = []
+            for _part in re.split(r"[\s+＋、,，]+", _bsrc):
+                if not _part or _part in BLOCK_TYPES:
+                    continue
+                if not _TOKEN.fullmatch(_part):
+                    # **這一段完全不合任何文法。** 以前這裡是靜默的。
+                    violations.append(
+                        f"{cur}：阻塞欄的 {_part} 既不是工作項目 ID、"
+                        f"也不是〈阻塞類型〉表裡宣告過的類型"
+                        + ("（那張表在 docs/WBS.md，表頭是 "
+                           "`| 阻塞類型 | 意思 | 該做什麼 |`，"
+                           "現在讀不到任何類型）" if not BLOCK_TYPES else
+                           f"（目前宣告過的：{'、'.join(sorted(BLOCK_TYPES))}）"))
+                    continue
+                _ids, _gids, _errs = scan_ids(_part, f"{cur}：阻塞欄")
+                violations.extend(_errs)
+                found.extend(_ids)
+                # 群組不是阻塞。`BE-G` 擋不住任何一件具體的事，而它原本
+                # 被 parse 成功之後直接丟掉 —— parse 成功卻不用，就是漏。
+                for _g in _gids:
+                    violations.append(
+                        f"{cur}：阻塞欄的 {_g} 是群組，不是工作項目 —— "
+                        f"阻塞要指到具體哪一項（`{_g}01`）")
             wbs[cur]["blockers"].update(found)
             # **逐列記下「這一列排在哪一週、被什麼擋著」。**
             # 阻塞是寫在列上的，用整個項目最早的週次去比會誤報 ——
