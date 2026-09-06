@@ -135,8 +135,15 @@ G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\0
 # ── 規則違規 ───────────────────────────────────────────────────────
 # **這一段是重點。** 前面那些規則如果只寫在文件裡，它們就只是規範；
 # 規範不會擋住任何人。這裡把它們變成看得到的違規。
-# 圍籬：``` 或 ~~~，後面可以接語言名。**要記住開了幾個。**
+# 圍籬：``` 或 ~~~。**開啟可以接語言名，閉合不行**（CommonMark 4.5）——
+# 只看開頭的話，`` ```python `` 會被當成關，於是圍籬從中間裂開。
 _FENCE = re.compile(r"^(`{3,}|~{3,})")
+_FENCE_CLOSE = re.compile(r"^(`{3,}|~{3,})\s*$")
+
+# CommonMark 的 HTML block type 1：這幾個標籤到閉合為止都是 raw，
+# 瀏覽器不顯示 `<style>`／`<script>` 的內容 —— 讀者看不到的東西不是資料。
+_HTML_RAW = re.compile(r"^<(pre|script|style|textarea)\b", re.I)
+_HTML_RAW_END = re.compile(r"</(pre|script|style|textarea)>", re.I)
 
 
 def visible_lines(text, src):
@@ -172,15 +179,24 @@ def visible_lines(text, src):
     out, errs = [], []
     fence = None       # (字元, 長度)
     comment = False
+    raw_html = False
     for lineno, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if comment:
             if "-->" in s:
                 comment = False
             continue
+        if raw_html:
+            if _HTML_RAW_END.search(s):
+                raw_html = False
+            continue
         m = _FENCE.match(s)
         if fence is not None:
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+            # **閉合圍籬不能帶語言名。** 帶了就不是閉合 —— 只看開頭的話，
+            # 圍籬裡示範一行 ` ```python ` 就能讓它從中間裂開，
+            # 後面那半段的東西被當成資料讀進來（實測 rc=0）。
+            if (_FENCE_CLOSE.match(s) and m
+                    and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]):
                 fence = None
             continue
         if m:
@@ -189,7 +205,23 @@ def visible_lines(text, src):
         if s.startswith("<!--") and "-->" not in s[4:]:
             comment = True
             continue
+        if _HTML_RAW.match(s):
+            if not _HTML_RAW_END.search(s):
+                raw_html = True
+            continue
+        # **縮排四格以上的表格列要報，不能靜靜跳過。**
+        # Markdown 把它當成程式碼區塊 —— 而這裡曾經 `line.strip()` 之後
+        # 直接當表格列讀，於是縮排寫的示範表格會被註冊成真項目（實測）。
+        # 兩個方向都不能靜默：跳過的話真表格被藏掉，讀進來的話範例變資料。
+        if s.startswith("|") and len(line) - len(line.lstrip(" ")) >= 4:
+            errs.append(f"{src} 第 {lineno} 行的表格列縮排了四格以上 —— "
+                        f"Markdown 會把它當成程式碼區塊。是範例就放進圍籬，"
+                        f"是資料就把縮排拿掉")
+            continue
         out.append((lineno, line))
+    if raw_html:
+        errs.append(f"{src} 有沒關起來的 `<pre>`／`<script>`／`<style>`／"
+                    f"`<textarea>` —— 後面的內容全部不會被檢查")
     if fence is not None:
         errs.append(f"{src} 有沒關起來的程式碼圍籬"
                     f"（`{fence[0] * fence[1]}` 開了沒關，或關的那行比它短）"
@@ -386,11 +418,24 @@ def scan_ids(text, where):
     不需要了。
     """
     ids, gids, errs = [], [], []
+    # **不要再補同形字元的清單。** `normalize()` 折掉的是「已知長得像 `-`」
+    # 的那些，而清單永遠列不完 —— 第六輪補了六個，第八輪又找到五個
+    # （U+23AF、U+31D0、U+2796、U+1173、U+2504），每一個都讓引用整段靜默。
+    #
+    # 所以改成**認形狀不認字元**：兩個以上大寫字母、一個不是連字號也不是
+    # 空白的東西、再一個大寫字母加至少兩位數字 —— 那看起來就是一個 ID，
+    # 只是中間那個字元不對。實測六份真實文件 0 誤報。
+    for m in re.finditer(r"(?<![A-Za-z0-9])[A-Z]{2,}"
+                         r"([^A-Za-z0-9_\s\-/|、，,。：:（）()\[\]{}%])"
+                         r"[A-Z][0-9]{2,}(?![A-Za-z0-9])", text):
+        errs.append(f"{where}的 {m.group(0)} 看起來像工作項目 ID，"
+                    f"但中間那個 `{m.group(1)}` 不是連字號 —— "
+                    f"畫面上看不出差別，機器看得出來")
     # **範圍只有一種寫法，寫錯符號要說出來。** `〜`／`〰`／`゠` 刻意不折成
     # `-`（折了就變成「同一支腳本兩種範圍文法」，見 `normalize()`），
     # 但不折的話它們會被讀成兩個獨立的引用、**中間那些完全不驗**。
     # 週欄早就在說「是 – 不是 -」，這裡要一致：看起來像範圍就要當範圍看待。
-    for m in re.finditer(r"[A-Z]+-[A-Z][0-9]{2,}\s*([〜〰゠])\s*"
+    for m in re.finditer(r"[A-Z]+-[A-Z][0-9]{2,}\s*([〜～〰゠])\s*"
                          r"(?:[A-Z]+-[A-Z])?[0-9]{2,}", text):
         errs.append(f"{where}的 {m.group(0)} 用 `{m.group(1)}` 當範圍 —— "
                     f"範圍要用 `–`（en dash），不然中間那些不會被驗")
@@ -537,7 +582,7 @@ def read_block_types(vis):
         if not s.startswith("|"):
             in_table = False
             continue
-        cells = [plain_field(c) for c in s.strip("|").split("|")]
+        cells = [plain_field(c) for c in split_row(s)]
         if not cells:
             continue
         # **表頭的定義是「下一行是分隔線」**，不是「第一欄剛好寫著阻塞類型」。
@@ -555,9 +600,12 @@ def read_block_types(vis):
         # **類型詞不准跟 ID 文法撞名。** 查表排在文法前面，所以表裡放什麼、
         # 阻塞欄就放行什麼：宣告一個 `BE-G01`，那個相依性就從
         # `blockers` 靜靜消失；宣告一個 `BE-G`，「群組不是阻塞」也被繞過。
-        if _TOKEN.fullmatch(w):
-            errs.append(f"docs/WBS.md 第 {n} 行：阻塞類型 `{w}` 跟工作項目 ID "
-                        f"的文法撞名 —— 它會讓阻塞欄裡的同名 ID 整個消失")
+        # **用 `search` 不是 `fullmatch`。** 只擋「整個詞就是一個 ID」的話，
+        # 宣告一個 `XX-G01。`（後面多一個句號）就繞過去了 ——
+        # 阻塞欄寫同樣的字，那條相依性照樣靜靜消失。
+        if _TOKEN.search(w):
+            errs.append(f"docs/WBS.md 第 {n} 行：阻塞類型 `{w}` 裡面有工作項目 ID "
+                        f"的形狀 —— 它會讓阻塞欄裡的同名 ID 整個消失")
             continue
         # **類型詞不准含分隔符。** 阻塞欄是用 `[\s+＋、,，]+` 切段的，
         # 含分隔符的詞永遠對不上自己 —— 而錯誤訊息還會一邊說「沒宣告過」、
@@ -604,6 +652,14 @@ if wbs_path.exists():
         # 不會有任何錯誤訊息。先正規化再判斷。（實測繞過過。）
         line = line.strip()
         if not line.startswith("|"):
+            # **GFM 允許表格列省略開頭的 `|`。** 我們不支援那種寫法（支援的話
+            # 「表格到哪裡結束」會變得很難講），但**不能靜靜丟掉** ——
+            # 少打一個開頭的 `|`，那一列的週次、點數、阻塞、標記全部消失，
+            # 而畫面上它還是一列表格（實測：點數少 50、Cancelled 不見）。
+            if in_table and "|" in line:
+                violations.append(
+                    f"docs/WBS.md 第 {lineno} 行看起來是表格列，但開頭少了 `|`"
+                    f"（Markdown 會把它當成表格的一部分，這支腳本不會）：{line[:40]}")
             # 表格結束。**一定要重設** —— 否則下一張表的列會被當成這張表的。
             in_table = False
             cur = None
@@ -929,11 +985,19 @@ def changes_for(wid):
 
 
 def change_for(wid):
+    """列上顯示哪一個。**多個的時候要看得出來有多個。**
+
+    只回 `hits[0]` 的話，第二個 change 既不在列上、也不在孤兒清單、
+    也不在 `--json` 裡 —— 它從整個輸出消失。以前是錯訊號（被當成孤兒），
+    改成 `changes_for` 之後變成**沒有訊號**，那更糟。
+    """
     hits = changes_for(wid)
     if not hits:
         hits = [c for c in branches if c == wid.lower()
                 or c.startswith(wid.lower() + "-")]
-    return hits[0] if hits else None
+    if not hits:
+        return None
+    return hits[0] if len(hits) == 1 else f"{hits[0]} +{len(hits) - 1}"
 
 # ── 輸出 ───────────────────────────────────────────────────────────
 rows, tally = [], collections.Counter()
@@ -1122,6 +1186,11 @@ if JSON:
             "pts": info["pts"], "blockers": sorted(info["blockers"]),
             "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
             "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
+            # **change 的關聯以前只存在於終端機表格。** `--json` 是網頁與
+            # Excel 的唯一資料來源，那邊看不到就等於這件事沒有被算過 ——
+            # 而「同一個 ID 開了兩個 change」這種事更是完全看不出來。
+            # 這裡放**全部**，不是第一個。
+            "changes": changes_for(wid),
         })
         for g in info["blockers"]:
             _aff[g].append(wid)

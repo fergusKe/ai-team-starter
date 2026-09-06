@@ -202,7 +202,7 @@ CI 每次都跑它。它讀 `docs/WBS.md`，有違規就讓 build 紅。守的�
 判準因此不是「測試全綠」，是 **「把防禦拿掉，測試要變紅」**：
 
 ```bash
-bash .github/scripts/test-progress-check.sh   # 117 條負向測試
+bash .github/scripts/test-progress-check.sh   # 每條規則各造一次違規，驗它真的會紅
 ```
 
 每一條都對一條規則各造一次違規、斷言它真的會紅。
