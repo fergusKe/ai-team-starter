@@ -135,8 +135,69 @@ G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\0
 # ── 規則違規 ───────────────────────────────────────────────────────
 # **這一段是重點。** 前面那些規則如果只寫在文件裡，它們就只是規範；
 # 規範不會擋住任何人。這裡把它們變成看得到的違規。
-# 圍籬：``` 或 ~~~，後面可以接語言名。
-_FENCE = re.compile(r"^(?:`{3,}|~{3,})")
+# 圍籬：``` 或 ~~~，後面可以接語言名。**要記住開了幾個。**
+_FENCE = re.compile(r"^(`{3,}|~{3,})")
+
+
+def visible_lines(text, src):
+    """吐出「讀者看得到的行」。**Markdown 結構只有這一份讀法。**
+
+    回傳 `([(行號, 原始行)], 違規訊息)`。圍籬與 HTML 註解裡的行不吐出來。
+
+    這裡曾經有三份：`read_block_types`、WBS 表格解析、引用掃描各自寫一次
+    `if _FENCE.match(s): fence = not fence`。三份都錯在同一個地方 ——
+    **翻轉不是 Markdown 的規則**。CommonMark 說：閉合圍籬要跟開啟的
+    同字元、而且長度不能比它短。只數次數的話，這三種寫法都能無聲塞進
+    一個假的工作項目（實測，`--check` 全是 0）：
+
+        ````markdown        外圍四個，裡面示範一段三個的圍籬
+        ```                 ← 被當成「關」，裡面的表格曝光給解析器
+        | ID | … | XX-X99 | …
+        ```                 ← 被當成「開」
+        ````
+
+        ```markdown         示範一段 ~~~ 圍籬
+        ~~~                 ← 不同字元，照樣被當成關
+        | ID | … | XX-X98 | …
+        ~~~
+        ```
+
+        <!--                跨行註解。`plain()` 的 `<!--.*?-->` 是逐行的，
+        | ID | … | XX-X97 | …      而 WBS 解析根本沒看註解
+        -->
+
+    沒關起來的圍籬與註解都要報 —— **跳過機制要自己會叫**，
+    否則在檔案最上面打三個反引號就能讓整份文件消音。
+    """
+    out, errs = [], []
+    fence = None       # (字元, 長度)
+    comment = False
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if comment:
+            if "-->" in s:
+                comment = False
+            continue
+        m = _FENCE.match(s)
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                fence = None
+            continue
+        if m:
+            fence = (m.group(1)[0], len(m.group(1)))
+            continue
+        if s.startswith("<!--") and "-->" not in s[4:]:
+            comment = True
+            continue
+        out.append((lineno, line))
+    if fence is not None:
+        errs.append(f"{src} 有沒關起來的程式碼圍籬"
+                    f"（`{fence[0] * fence[1]}` 開了沒關，或關的那行比它短）"
+                    f" —— 後面的內容全部不會被檢查")
+    if comment:
+        errs.append(f"{src} 有沒關起來的 HTML 註解（`<!--` 少了 `-->`）"
+                    f" —— 後面的內容全部不會被檢查")
+    return out, errs
 
 # 〈舊 ID 去哪了〉是唯一可以提不存在的 ID 的一節。**認固定標題，不是關鍵字** ——
 # 用 `"舊 ID" in s` 的話，任何含這四個字的 `## ` 標題都能消音整節。
@@ -221,6 +282,22 @@ _SHAPE_RANGE = re.compile("(" + _GRP + r")([0-9]+)-"
                           "(?:(" + _GRP + r"))?([0-9]+)")           # APP-C01–APP-C05
 
 
+def split_row(line):
+    """把一列 Markdown 表格切成欄。**`\\|` 是跳脫，不是欄位分隔。**
+
+    原本是 `line.strip("|").split("|")`，完全不理跳脫字元 —— 於是欄數檢查
+    會對一列**已經照規矩寫了 `\\|`** 的敘述報「敘述裡的 `|` 要寫成 `\\|`」。
+    **一條叫人做一件做了也沒用的事的訊息，比沒有訊息更糟。**
+    """
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.replace("\\|", "|").strip()
+            for c in re.split(r"(?<!\\)\|", s)]
+
+
 def normalize(s: str) -> str:
     """把「畫面上長得一樣」的字元折成同一個。**不剝任何結構。**
 
@@ -233,16 +310,28 @@ def normalize(s: str) -> str:
     # U+FE63 `﹣`、U+2043 `⁃` 全部還在外面，每一個都讓 ID 從中間裂開、
     # 整段靜默。**「靠清單」本身就是那一類問題**，不是清單不夠長。
     #
-    # 拿掉不佔位的字元（Cf 格式字元含零寬與 LRM／軟連字號，Mn 非空隙
-    # 標記含 VS16）。這裡的輸出只拿去比對 ID，不拿去顯示，
-    # 所以拿掉它們不會改變任何人看到的東西。
+    # 拿掉不佔位的字元：`Cf`（格式字元，含零寬、LRM、軟連字號）
+    # 與變體選擇符（VS1-16 及其補充區）。
+    #
+    # **只剝變體選擇符，不要整類剝 `Mn`。** 整類剝過，理由是 VS16 屬於
+    # `Mn` —— 但 `Mn` 裡還有越南文的聲調、泰文的母音符號這些**會改變
+    # 字義**的東西，剝掉之後兩個不同的詞會撞成同一個（`ป่า` 與 `ปา`
+    # 都變成 `ปา`）。用「畫面上看不出差別」當理由的正規化，
+    # 一旦跨過那條線就變成把不同的東西讀成一樣 —— 那是另一種漂。
     s = "".join(c for c in s
-                if unicodedata.category(c) not in ("Cf", "Mn"))
-    # 連字號類（Pd）全部折成 `-`，再加上幾個不在 Pd 裡、但畫面上
-    # 一模一樣的：U+2212 減號（Sm）、U+2500 製表線（So）、
-    # U+30FC／U+FF70 日文長音（Lm）、U+2043 項目符號連字號（Po）。
-    s = "".join("-" if (unicodedata.category(c) == "Pd"
-                        or c in "\u2212\u2500\u30fc\uff70\u2043") else c
+                if unicodedata.category(c) != "Cf"
+                and not ("\ufe00" <= c <= "\ufe0f")
+                and not ("\U000e0100" <= c <= "\U000e01ef"))
+    # 連字號類折成 `-`。**`Pd` 不能整類收** —— 裡面有 U+301C 波浪號
+    # 與 U+30A0 片假名雙連字號，它們畫面上不像 `-`，而且 `〜` 在中文裡
+    # 是「到」的意思。整類收的話 `XX-A01〜XX-A03` 會被當成範圍靜靜展開，
+    # 而同一支腳本的週欄卻只認 `–`（訊息還特別寫「是 – 不是 -」）——
+    # **同一支腳本兩種範圍文法**，正是這裡一直在抓的東西。
+    # 範圍認哪些符號由 `_SHAPE_RANGE` 決定，不該靠正規化順便放行。
+    s = "".join("-" if ((unicodedata.category(c) == "Pd"
+                         and c not in "\u301c\u30a0\u3030")
+                        or c in "\u2212\u2500\u2501\u02d7"
+                                "\u30fc\uff70\u2043") else c
                 for c in s)
     # 全形英數折回半形。**只折英數**（不折 `＋`、`｜` 這些這支腳本有在用的
     # 標點，也不要用 NFKC —— 它不折 en/em dash，卻會把 `①` 折成 `1`）。
@@ -297,6 +386,14 @@ def scan_ids(text, where):
     不需要了。
     """
     ids, gids, errs = [], [], []
+    # **範圍只有一種寫法，寫錯符號要說出來。** `〜`／`〰`／`゠` 刻意不折成
+    # `-`（折了就變成「同一支腳本兩種範圍文法」，見 `normalize()`），
+    # 但不折的話它們會被讀成兩個獨立的引用、**中間那些完全不驗**。
+    # 週欄早就在說「是 – 不是 -」，這裡要一致：看起來像範圍就要當範圍看待。
+    for m in re.finditer(r"[A-Z]+-[A-Z][0-9]{2,}\s*([〜〰゠])\s*"
+                         r"(?:[A-Z]+-[A-Z])?[0-9]{2,}", text):
+        errs.append(f"{where}的 {m.group(0)} 用 `{m.group(1)}` 當範圍 —— "
+                    f"範圍要用 `–`（en dash），不然中間那些不會被驗")
     for m in _TOKEN.finditer(text):
         tok = m.group(0)
 
@@ -428,37 +525,57 @@ def check_mark(wid: str, mark: str):
 # —— 詞彙必須長成「純中文」或「英文-中文」。實測兩邊都漏：
 # `今天天氣真好` 全綠（純中文，永遠不含 ASCII），`x-待銜接` 也全綠
 # （形狀對了就過，形狀沒有語意）；反過來 `WIP`、`外部 API` 誤報。
-def read_block_types(lines):
-    """讀出〈阻塞類型〉表第一欄的詞彙。找不到那張表就回傳空集合。"""
-    out, in_table, fence = set(), False, False
-    for raw in lines:
-        s = raw.strip()
-        if _FENCE.match(s):
-            fence = not fence
-            continue
-        if fence:
-            continue
+def read_block_types(vis):
+    """讀出〈阻塞類型〉表第一欄的詞彙。回傳 (詞彙集合, 違規訊息)。
+
+    `vis` 是 `visible_lines()` 的輸出 —— 圍籬與註解裡的示範表不算宣告。
+    """
+    out, errs, in_table = set(), [], False
+    rows = {n: l.strip() for n, l in vis}
+    for n, l in vis:
+        s = l.strip()
         if not s.startswith("|"):
             in_table = False
             continue
         cells = [plain_field(c) for c in s.strip("|").split("|")]
         if not cells:
             continue
+        # **表頭的定義是「下一行是分隔線」**，不是「第一欄剛好寫著阻塞類型」。
+        # 只看第一欄的話，任何一張表裡出現一列 `| 阻塞類型 | 一般資料 |`，
+        # 底下每一列就都變成「宣告過的類型」—— 一句話開一扇後門。
         if cells[0] == "阻塞類型":
-            in_table = True
+            nxt = rows.get(n + 1, "")
+            in_table = nxt.startswith("|") and set(nxt) <= set("-:| ")
             continue
-        if not in_table:
+        if not in_table or set(s) <= set("-:| "):
             continue
-        if set(s) <= set("-:| "):        # 表頭分隔線
+        w = cells[0]
+        if not w:
             continue
-        if cells[0]:
-            out.add(cells[0])
-    return out
+        # **類型詞不准跟 ID 文法撞名。** 查表排在文法前面，所以表裡放什麼、
+        # 阻塞欄就放行什麼：宣告一個 `BE-G01`，那個相依性就從
+        # `blockers` 靜靜消失；宣告一個 `BE-G`，「群組不是阻塞」也被繞過。
+        if _TOKEN.fullmatch(w):
+            errs.append(f"docs/WBS.md 第 {n} 行：阻塞類型 `{w}` 跟工作項目 ID "
+                        f"的文法撞名 —— 它會讓阻塞欄裡的同名 ID 整個消失")
+            continue
+        # **類型詞不准含分隔符。** 阻塞欄是用 `[\s+＋、,，]+` 切段的，
+        # 含分隔符的詞永遠對不上自己 —— 而錯誤訊息還會一邊說「沒宣告過」、
+        # 一邊把它列在「目前宣告過的」裡面。
+        if re.search(r"[\s+＋、,，]", w):
+            errs.append(f"docs/WBS.md 第 {n} 行：阻塞類型 `{w}` 含有空白或"
+                        f"分隔符 —— 阻塞欄是按這些字切段的，這個詞永遠對不上")
+            continue
+        out.add(w)
+    return out, errs
 
 
-BLOCK_TYPES = read_block_types(
-    pathlib.Path("docs/WBS.md").read_text(encoding="utf-8").splitlines()
-    if pathlib.Path("docs/WBS.md").exists() else [])
+_wbs_vis, _wbs_struct_errs = visible_lines(
+    pathlib.Path("docs/WBS.md").read_text(encoding="utf-8"), "docs/WBS.md"
+) if pathlib.Path("docs/WBS.md").exists() else ([], [])
+BLOCK_TYPES, _bt_errs = read_block_types(_wbs_vis)
+violations.extend(_wbs_struct_errs)
+violations.extend(_bt_errs)
 
 # ── WBS：ID → (名稱, 週, 點數合計) ─────────────────────────────────
 wbs, order = {}, []
@@ -472,38 +589,26 @@ if wbs_path.exists():
     in_table = False
     found_table = False
     ncols = 0          # 表頭有幾欄。**列的欄數要跟它一模一樣。**
-    _lines = wbs_path.read_text(encoding="utf-8").splitlines()
+    # **結構只讀一份。** 圍籬與註解裡的示範表格不是資料 —— 判斷交給
+    # `visible_lines()`，這個迴圈只管表格語意。
+    _vis = dict(_wbs_vis)
 
     def is_sep(i):
-        """第 i 行（0-based）是不是 Markdown 的表頭分隔線。"""
-        if i >= len(_lines):
-            return False
-        s = _lines[i].strip()
+        """第 i 行（1-based 行號）是不是 Markdown 的表頭分隔線。"""
+        s = _vis.get(i, "").strip()
         return s.startswith("|") and set(s) <= set("-:| ")
 
-    # **圍籬在這裡也要認。** 引用掃描早就跳過圍籬（那裡面是格式範例），
-    # 但這個迴圈原本沒有 —— 於是一段 ```` ```markdown ```` 包起來的示範表格
-    # 會被當成真的工作項目讀進來：ID 註冊、點數計入、狀態算出來。
-    # **同一份檔案、同一支腳本，圍籬有兩種讀法**，正是這支腳本在抓的病。
-    _wbs_fence = False
-    for lineno, line in enumerate(_lines, 1):
+    for lineno, line in _wbs_vis:
         # **不能用 line.startswith("|")** —— Markdown 允許表格列前面有空白，
         # 而那樣的一列會整個從檢查裡消失（連同它的 ID、週次、標記），
         # 不會有任何錯誤訊息。先正規化再判斷。（實測繞過過。）
         line = line.strip()
-        if _FENCE.match(line):
-            _wbs_fence = not _wbs_fence
-            in_table = False
-            cur = None
-            continue
-        if _wbs_fence:
-            continue
         if not line.startswith("|"):
             # 表格結束。**一定要重設** —— 否則下一張表的列會被當成這張表的。
             in_table = False
             cur = None
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = split_row(line)
         head = plain(cells[0])
         # 表頭：`| ID | 項目 | 工作 | 週 | 點 | …`
         # **用正規化後的字比對。** 只認字面上的 `ID` 的話，把表頭寫成
@@ -512,7 +617,7 @@ if wbs_path.exists():
         # **表頭的定義是「下一行是分隔線」**，不是「第一欄剛好寫著 ID」。
         # 說明用的表格裡也會出現 `| **ID** | 工作項目編號… |` 這種資料列，
         # 只看第一欄會把它誤判成表頭。
-        if head.casefold() == "id" and is_sep(lineno):
+        if head.casefold() == "id" and is_sep(lineno + 1):
             if len(cells) < 5:
                 violations.append(f"docs/WBS.md 第 {lineno} 行是工作分解表的表頭，"
                                   f"但只有 {len(cells)} 欄（要 5 欄以上）")
@@ -707,21 +812,19 @@ if wbs_path.exists():
         if not _src.exists():
             continue
         in_legacy = False
-        in_fence = False
-        for lineno, line in enumerate(
-                _src.read_text(encoding="utf-8").splitlines(), 1):
+        # **結構只讀一份。** 圍籬與註解裡是範例不是引用 —— 交給
+        # `visible_lines()`；`docs/WBS.md` 那份在上面已經算過，
+        # 這裡重算一次會讓同一個結構錯誤報兩次。
+        if str(_src) == "docs/WBS.md":
+            _vlines, _verrs = _wbs_vis, []
+        else:
+            _vlines, _verrs = visible_lines(
+                _src.read_text(encoding="utf-8"), str(_src))
+        violations.extend(_verrs)
+        for lineno, line in _vlines:
             # **結構看原始行，ID 看正規化後的字串。** plain() 會剝掉
-            # 反引號與 `~`，圍籬那一行過完它就變成空字串了 ——
-            # 拿正規化後的字串去認圍籬，等於整個跳過機制失效。
+            # 反引號與 `~`，圍籬那一行過完它就變成空字串了。
             raw = line.strip()
-            # 圍籬裡是範例，不是引用。**先判斷再跳過** —— 圍籬本身這一行
-            # 也不該被掃（``` 後面可能接語言名）。`~~~` 也是合法圍籬，
-            # 不認得它就等於把裡面的範例當成真引用。
-            if _FENCE.match(raw):
-                in_fence = not in_fence
-                continue
-            if in_fence:
-                continue
             if raw.startswith("## "):
                 # **標題只決定接下來要不要掃，它自己照樣要被掃。**
                 # 原本這裡 `continue`，於是 `## APP-D 資料層` 這種
@@ -742,12 +845,6 @@ if wbs_path.exists():
             refs.extend((i, str(_src), lineno) for i in ids)
             grefs.extend((g, str(_src), lineno) for g in gids)
             violations.extend(errs)
-        if in_fence:
-            # 一個沒關的圍籬會讓**檔案後半段的引用全部消音**，而且是綠的。
-            # 「跳過圍籬」本來是為了放過格式範例，不是給人一個萬用消音器。
-            violations.append(f"{_src} 有沒關起來的程式碼圍籬"
-                              f"（``` 或 ~~~ 數量是奇數）—— "
-                              f"後面的引用全部不會被檢查")
 
     if not found_table:
         # 檔案在、卻一張工作分解表都認不出來。**這是最安靜的失敗** ——
@@ -819,11 +916,23 @@ try:
 except Exception:
     pass
 
-def change_for(wid):
+def changes_for(wid):
+    """一個工作項目底下**所有**對得上的 change。
+
+    原本只回傳 `hits[0]`，而 `matched` 是用它算的 —— 於是同一個 ID 開
+    兩個 change（`fe-c01-api`／`fe-c01-ui`）時，第二個永遠不在 `matched`
+    裡，會被當成「命名不合規的孤兒」印出來。**一個 ID 只准一個 change**
+    這條規則沒有人講過，是 `[0]` 順手訂下的。
+    """
     pre = wid.lower()
-    hits = [c for c in changes if c == pre or c.startswith(pre + "-")]
+    return [c for c in changes if c == pre or c.startswith(pre + "-")]
+
+
+def change_for(wid):
+    hits = changes_for(wid)
     if not hits:
-        hits = [c for c in branches if c == pre or c.startswith(pre + "-")]
+        hits = [c for c in branches if c == wid.lower()
+                or c.startswith(wid.lower() + "-")]
     return hits[0] if hits else None
 
 # ── 輸出 ───────────────────────────────────────────────────────────
@@ -1093,7 +1202,7 @@ if total:
 # 對不上 WBS 的 change：命名沒照規矩。
 # **沒有 WBS 的時候不做這件事** —— 沒有東西可以對，
 # 把每個 change 都說成「命名錯誤」是錯的訊號。
-matched = {change_for(w) for w in order} - {None}
+matched = {c for w in order for c in changes_for(w)}
 orphan = sorted(set(changes) - matched) if wbs else []
 if orphan:
     print()

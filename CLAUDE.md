@@ -12,6 +12,19 @@ Claude Code 進入此 Repository 後：
    **那份是算出來的，沒有人維護它**，所以它不會漂。資料來自
    `openspec/changes/` 的 `tasks.md` 打勾與遠端分支；
    如果專案有 `docs/WBS.md`，它還會告訴你**還有哪些沒開始**。
+
+   **有 `docs/WBS.md` 的話，那張表有文法，`--check` 是一個解析器不是抽查。**
+   動它之前先讀 `AGENTS.md`〈改 `docs/WBS.md` 之前：這張表有文法，而且會被驗〉
+   —— 四個欄位各自只能寫哪些東西、ID 引用只有哪幾種寫法、範例為什麼要放進
+   圍籬。打錯一個字元不會被當成「沒填」，會紅（那是刻意的）。
+
+   ```bash
+   bash .github/scripts/progress.sh --check       # 有違規就非零結束（CI 也在跑）
+   bash .github/scripts/test-progress-check.sh    # 這些規則自己的負向測試
+   ```
+
+   改 `progress.sh` 之前跑一次、改完再跑一次。驗收條件不是「測試全綠」，
+   是**「把防禦拿掉，測試要變紅」**。
 3. 讀 `CONTEXT.md` 與那個 change 的 artifacts。
 4. 確認規格在 PR 上談定了沒有 —— **沒有就不要寫產品程式碼**。
 5. 除非使用者指定其他語言，對人類使用繁體中文。
