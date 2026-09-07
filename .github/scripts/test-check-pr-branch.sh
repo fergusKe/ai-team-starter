@@ -23,6 +23,16 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gate-test.XXXXXXXX")"
 BASELINE="$ROOT/_baseline"
 PASS=0; FAIL=0; N=0
 
+# 失敗登記**只有這一個入口**。
+#
+# 2026-09-07 實測：原本 $FAIL 分散在十幾處各自加一，而自測只走得到其中兩處 ——
+# 逐個弄啞（+1 改 +0），十三處存活，整套照樣報全過。
+# 「自測通過」在那種形狀下只覆蓋了自測剛好走過的那幾條路徑。
+#
+# 收成一個入口之後，弄啞它 → 每一條斷言的紅燈同時消失 → 自測必然抓到。
+# 這不是遞迴自證，是把要信任的表面從十幾個縮到一個，再對那一個做陽性對照。
+bump_fail() { FAIL=$((FAIL + 1)); }
+
 [ -f "$GATE" ] || { echo "找不到 $GATE" >&2; exit 2; }
 
 mkdir -p "$BASELINE"
@@ -75,7 +85,7 @@ run() { # run <期望exit> <base> <分支> <說明> <造檔案的指令...>
   if [ "$got" = "$want" ]; then
     printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
   else
-    printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"; FAIL=$((FAIL+1))
+    printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"; bump_fail
     sed 's/^/      /' "$ROOT/c$N.out" | head -5
   fi
 }
@@ -106,7 +116,7 @@ run_msg() { # run_msg <期望exit> <base> <分支> <說明> <訊息片段> <造�
     else
       printf '  \033[31m✗\033[0m %-46s exit 對但訊息不含「%s」\n' "$desc" "$needle"
     fi
-    FAIL=$((FAIL+1)); sed 's/^/      /' "$ROOT/c$N.out" | head -6
+    bump_fail; sed 's/^/      /' "$ROOT/c$N.out" | head -6
   fi
 }
 
@@ -126,7 +136,7 @@ run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p d
 #
 # 這裡故意給一個**一定會失敗**的期望（合法的 chore 小改，卻期望 exit=1），
 # 斷言 run 判它紅。在子 shell 裡跑，計數不會被污染。
-# 先驗**計數**還活著。只看訊息的話，`FAIL=$((FAIL+1))` 被改成 `+0` 時
+# 先驗**計數**還活著。只看訊息的話，`bump_fail` 被改成 `+0` 時
 # 訊息照樣印 —— 2026-09-07 審查實測，那個突變在只看訊息的版本下 72/72 存活。
 # （同一個錯我在 test-progress-check.sh 修過一次，這支漏了。）
 _fail_before=$FAIL
@@ -151,7 +161,7 @@ case "$run_selftest_output" in
     printf '  \033[32m✓\033[0m %-46s\n' "run 自測：exit 不符時判紅"; PASS=$((PASS+1)) ;;
   *)
     printf '  \033[31m✗\033[0m %-46s\n' "run 自測：exit 不符時判紅"
-    printf '      實際輸出：%s\n' "$run_selftest_output"; FAIL=$((FAIL+1)) ;;
+    printf '      實際輸出：%s\n' "$run_selftest_output"; bump_fail ;;
 esac
 
 # run_msg 自己的陽性對照。
@@ -173,7 +183,7 @@ case "$selftest_output" in
     printf '  \033[32m✓\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"; PASS=$((PASS+1)) ;;
   *)
     printf '  \033[31m✗\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"
-    printf '      實際輸出：%s\n' "$selftest_output"; FAIL=$((FAIL+1)) ;;
+    printf '      實際輸出：%s\n' "$selftest_output"; bump_fail ;;
 esac
 
 # ── openspec status 的 fail-closed 分支 ─────────────────────────────────────
@@ -226,11 +236,22 @@ run_status() { # run_status <期望exit> <STATUS_MODE> <說明> <訊息片段>
     printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
   else
     printf '  \033[31m✗\033[0m %-46s 期望=%s／含「%s」，實際 exit=%s\n' "$desc" "$want" "$needle" "$got"
-    FAIL=$((FAIL+1)); sed 's/^/      /' "$ROOT/c$N.out" | head -5
+    bump_fail; sed 's/^/      /' "$ROOT/c$N.out" | head -5
   fi
 }
 
 echo "── openspec status 讀不到就拒（fail-closed）──"
+# run_status 自己的陽性對照（判準：每個 oracle 都要走過一次失敗路徑）。
+_fail_before=$FAIL
+run_status 1 "" "自測（不計入）" "這串字絕不會出現在任何輸出裡" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  printf '  \033[32m✓\033[0m %-46s\n' "run_status 自測：訊息不符時判紅"; PASS=$((PASS+1))
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %-46s\n' "run_status 自測：訊息不符時沒有判紅"
+fi
+
 run_status 1 empty   "status 沒有輸出 → 拒"        "沒有輸出"
 run_status 1 badjson "status 不是合法 JSON → 拒"   "不是合法 JSON"
 run_status 1 missing "artifacts 裡沒有 specs → 拒" "找不到 \`specs\` 這一項"

@@ -39,6 +39,16 @@ W="${TMPDIR:-/tmp}/progress-check-test.$(basename "$ROOT").$$"
 PASS=0
 FAIL=0
 
+# 失敗登記**只有這一個入口**。
+#
+# 2026-09-07 實測：原本 $FAIL 分散在十幾處各自加一，而自測只走得到其中兩處 ——
+# 逐個弄啞（+1 改 +0），十三處存活，整套照樣報全過。
+# 「自測通過」在那種形狀下只覆蓋了自測剛好走過的那幾條路徑。
+#
+# 收成一個入口之後，弄啞它 → 每一條斷言的紅燈同時消失 → 自測必然抓到。
+# 這不是遞迴自證，是把要信任的表面從十幾個縮到一個，再對那一個做陽性對照。
+bump_fail() { FAIL=$((FAIL + 1)); }
+
 # 一份最小但合法的工作分解表。每個案例都從它出發，只壞一個地方 ——
 # 這樣紅燈的原因就只可能是那一個地方。
 baseline() {
@@ -115,12 +125,12 @@ run_absent() {
   out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   if printf '%s' "$out" | grep -q "$needle"; then
     echo "✗ ${desc} —— 訊息裡不該出現「${needle}」，但它出現了"
     echo "$out" | sed 's/^/      /' | head -20
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   echo "✓ $desc"
   PASS=$((PASS + 1))
@@ -133,12 +143,12 @@ run() {
   out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   if [ -n "$needle" ] && ! printf '%s' "$out" | grep -q "$needle"; then
     echo "✗ ${desc} —— 退出碼對了，但訊息裡沒有「${needle}」"
     echo "$out" | sed 's/^/      /' | head -20
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   echo "✓ $desc"
   PASS=$((PASS + 1))
@@ -152,6 +162,23 @@ run() {
 # --json 的 violations 必須跟 --check 看到的是同一份。**一個永遠空的欄位
 # 比沒有這個欄位更糟** —— 讀的人會以為自己檢查過了。原本治理不變量整段
 # 排在 JSON 輸出之後，所以 --json 對任何違規都印 `"violations": []`。
+# run_all_has <說明> <輸出裡要有的字>
+#
+# 這三條原本是頂層的內聯 if/else，各自寫自己的 bump_fail —— 於是**沒有任何
+# 東西在驗它們的失敗路徑**（2026-09-07 實測：各自把 bump_fail 換成 `:`，
+# 三處全部存活）。收成共用 helper 之後，下面的陽性對照一次蓋住三條。
+#
+# 判準（外部審查訂的）：每個**共用** assertion oracle 都要走過一次失敗路徑。
+# 一次性的內聯斷言不符合那個形狀 —— 能收就收成共用的。
+run_all_has() {
+  local desc="$1" needle="$2"
+  if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "$needle"; then
+    echo "✓ $desc"; PASS=$((PASS + 1)); return
+  fi
+  echo "✗ ${desc} —— --all 的輸出裡沒有「${needle}」"
+  bump_fail
+}
+
 run_json_has() {
   local desc="$1" out n
   out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null)"
@@ -160,7 +187,7 @@ run_json_has() {
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— --check 有違規，但 --json 的 violations 是空的"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -183,7 +210,7 @@ run_setup() {
     fi
     echo "✗ ${desc} —— 輸出裡不該有「${needle}」，但它出現了"
   fi
-  FAIL=$((FAIL + 1))
+  bump_fail
 }
 
 # run_json_parses <說明>：--json 還是合法 JSON（待辦清單不准污染它）
@@ -194,7 +221,7 @@ run_json_parses() {
   if [ "$out" = ok ]; then
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
-    echo "✗ ${desc} —— --json 不是合法 JSON"; FAIL=$((FAIL + 1))
+    echo "✗ ${desc} —— --json 不是合法 JSON"; bump_fail
   fi
 }
 
@@ -227,7 +254,7 @@ print("yes" if i and sys.argv[3] in str(i[0].get(sys.argv[2], "")) else "no")' "
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${item} 的 ${field} 裡沒有「${want}」"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -246,7 +273,7 @@ print("yes" if any(i["id"] == sys.argv[1] for i in d["items"]) else "no")' "$bad
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${bad} 被當成真的工作項目讀進來了"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -267,7 +294,7 @@ print("yes" if i and sys.argv[2] in i[0]["blockers"] else "no")' "$item" "$want"
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${item} 的 blockers 裡沒有 ${want}"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -302,7 +329,7 @@ baseline
 #
 #   if [ "$rc" != "$want" ]  →  if false          存活
 #   if [ -n "$needle" ] && ! grep …  →  if false  存活
-#   FAIL=$((FAIL + 1))  →  FAIL=$((FAIL + 0))     存活
+#   bump_fail  →  FAIL=$((FAIL + 0))     存活
 #
 # 「工具說綠」跟「工具還活著」是兩件事。這裡在乾淨狀態下故意給錯的期望，
 # 斷言 run 判它紅。子 shell 隔離計數。
@@ -312,7 +339,7 @@ selftest() { # selftest <說明> <期望輸出片段> <run 的參數...>
   out="$( PASS=0; FAIL=0; "$@" 2>&1 )"
   case "$out" in
     *"$want_msg"*) echo "✓ $desc"; PASS=$((PASS + 1)) ;;
-    *) echo "✗ ${desc} —— 期望輸出含「${want_msg}」，實際：${out}"; FAIL=$((FAIL + 1)) ;;
+    *) echo "✗ ${desc} —— 期望輸出含「${want_msg}」，實際：${out}"; bump_fail ;;
   esac
 }
 # 先驗**計數**還活著。上面那個 selftest 看的是 run 印出來的訊息，
@@ -328,6 +355,30 @@ else
   FAIL=$((_fail_before + 1))
   echo "✗ run 自測：失敗沒有被計進 \$FAIL —— 這支測試的綠燈是假的"
 fi
+
+# **每一個** assertion helper 都要走過一次失敗路徑。
+#
+# 2026-09-07 實測：收成單一 bump_fail 之後，弄啞那個入口會被抓到；
+# 但把個別 helper 裡的 `bump_fail` 換成 `:`，十三處裡十二處仍然存活。
+# 也就是「集中登記」只讓**入口**有了讀者，**每個 helper 自己**還是沒有。
+# 判準（外部審查訂的）是「每個共用 oracle 至少被故意走一次失敗路徑」，
+# 所以下面每一支都給一個一定失敗的輸入。
+selftest_count() { # selftest_count <說明> <helper 與參數...>
+  local desc="$1"; shift
+  local before=$FAIL
+  "$@" >/dev/null 2>&1
+  if [ "$FAIL" -eq "$((before + 1))" ]; then
+    FAIL=$before; echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    FAIL=$((before + 1)); echo "✗ ${desc} —— 它沒有把失敗計進 \$FAIL"
+  fi
+}
+selftest_count "run_all_has 自測"      run_all_has      "自測（不計入）" "這串字絕不會出現在 --all 的輸出裡"
+selftest_count "run_json_has 自測"     run_json_has     "自測（不計入）" "這個_key_絕不存在"
+selftest_count "run_setup 自測"        run_setup        "自測（不計入）" "have" "這串字絕不會出現在輸出裡"
+selftest_count "run_field_has 自測"    run_field_has    "自測（不計入）" "NO-SUCH-ITEM" "state" "不可能的值"
+selftest_count "run_no_item 自測"      run_no_item      "自測（不計入）" "APP-C01"
+selftest_count "run_blockers_has 自測" run_blockers_has "自測（不計入）" "APP-C01" "NO-SUCH-BLOCKER"
 
 selftest "run 自測：退出碼不符時判紅" "期望退出碼 1，實際 0" \
          run 1 "自測（不計入）" ""
@@ -394,13 +445,7 @@ run 1 "ID 被加粗（會被當成續行）：紅" "不是合法的工作項目 
 # 要真的去看輸出裡有沒有它。
 baseline
 edit "| APP-C01 | 應用骨架 |" " | APP-C01 | 應用骨架 |"
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
-  echo "✓ 表格列前面有空白：那一列還看得見"
-  PASS=$((PASS + 1))
-else
-  echo "✗ 表格列前面有空白：那一列從輸出裡消失了"
-  FAIL=$((FAIL + 1))
-fi
+run_all_has "表格列前面有空白：那一列還看得見" "APP-C01"
 
 baseline
 edit "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | |" \
@@ -651,13 +696,7 @@ run_field_has "同一個 ID 的每一個 change 都要進 --json" "APP-C01" "cha
 # 突變體證明過：只斷言 `--json`，`change_for` 退回只取第一個照樣全過。
 baseline
 mkchange app-c01-api app-c01-ui
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "+1"; then
-  echo "✓ 同一個 ID 開了兩個 change：列上看得出來"
-  PASS=$((PASS + 1))
-else
-  echo "✗ 同一個 ID 開了兩個 change：列上只看到一個"
-  FAIL=$((FAIL + 1))
-fi
+run_all_has "同一個 ID 開了兩個 change：列上看得出來" "+1"
 
 # 讀阻塞類型表要跟工作分解表**用同一份切列**（`split_row`）。
 # 分開寫的話，含 `\|` 的類型詞在兩邊會被切成不一樣的東西 ——
@@ -864,13 +903,7 @@ run 1 "工作項目列欄數不足：紅" "欄"
 # 這一類實測過：把表頭的 ID 加粗，122 項掉到 19 項，而 --check 照樣是 0。
 baseline
 edit "| ID | 項目 |" "| **ID** | 項目 |"
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
-  echo "✓ 表頭的 ID 被加粗：照樣認得出來"
-  PASS=$((PASS + 1))
-else
-  echo "✗ 表頭的 ID 被加粗：整張表消失了"
-  FAIL=$((FAIL + 1))
-fi
+run_all_has "表頭的 ID 被加粗：照樣認得出來" "APP-C01"
 
 baseline
 edit "| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |" "| ID | 項目 | 工作 | 週 |"
