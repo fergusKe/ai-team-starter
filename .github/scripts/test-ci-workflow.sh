@@ -234,7 +234,12 @@ GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
   || bad "有一步「真的會跑的」npm ci 排在 Branch 之前" "npm ci 在第 $(get install_idx) 步、Branch 在第 $(get branch_idx) 步（帶 if: 的不算）"
 
 # T5：四支閘門測試都要在 ci job 裡
-for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh test-scenario-coverage.sh; do
+# **模板不把 `check-scenario-coverage.sh` 列進來。** 剛複製的模板沒有任何
+# 規格，那支閘門會紅在「一份規格檔都沒掃到」—— 而那個判斷是對的，
+# 掃不到不等於全部覆蓋。衍生專案有規格之後自己加進 ci.yml 與這份清單
+# （GuildHub-frontend 已經這樣做了，見它的 docs/DECISIONS.md）。
+for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh \
+         test-scenario-coverage.sh; do
   if [ "$(get "exact_$t")" = "1" ]; then
     ok "ci job 跑 ${t}，run 剛好是那一句、沒有 if:／shell:"
   else
