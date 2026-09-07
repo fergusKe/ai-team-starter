@@ -978,7 +978,14 @@ run 1 "涵蓋證據指到不存在的 commit 要紅" "在本機找不到"
 # 後者是證據真的還沒進來。講錯會叫人去查一個根本不存在的問題。
 baseline
 mkcommit >/dev/null
-SHA2="$(git -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan 2>/dev/null)"
+# `commit-tree` 也要身分（runner 上沒有全域 git config）。
+# **而且不可以把錯誤吞掉** —— 原本寫 `2>/dev/null`，於是它在 CI 上失敗、
+# SHA2 是空字串、`commit:` 後面沒東西，測到的變成「寫法不合文法」而不是
+# 「不在 HEAD 歷史裡」。fixture 自己 fail-open，本機看不到（實測：CI 才紅）。
+SHA2="$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+        GIT_COMMITTER_EMAIL=t@t.invalid \
+        git -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan)"
+[ -n "$SHA2" ] || { echo "✗ 測試腳本自己壞了：commit-tree 沒有產生 SHA"; bump_fail; }
 mkevid "commit:$SHA2"
 run 1 "commit 存在但不在 HEAD 歷史裡要紅" "不在目前 HEAD 的歷史裡"
 

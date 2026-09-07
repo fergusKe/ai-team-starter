@@ -77,6 +77,12 @@ KINDS = {"vitest", "playwright", "command-negative", "manual-browser", "ci-job"}
 # **只掃 openspec/specs/ 不夠。** 一份 change 在 feat 階段，它的 spec 還在
 # openspec/changes/<id>/specs/ 底下 —— 只掃 main 的話，缺口要等到 archive
 # 才會被發現，而那時候實作早就合併了。
+#
+# **「範圍」很重要。** 一份 `## MODIFIED Requirements` 的 delta 本來就會重述
+# main 上同一條 Scenario（MODIFIED 是整塊取代，openspec 甚至強制你把同一個
+# Requirement 底下每一條都抄進來）。所以「同一個 ID 出現兩次」只有在**同一個
+# 範圍裡**才是錯的 —— 跨範圍出現是正常流程。
+# （實測：第一版沒分範圍，一開 change 就報六條假的重複。）
 roots = [pathlib.Path("openspec/specs")]
 cdir = pathlib.Path("openspec/changes")
 if cdir.is_dir():
@@ -89,6 +95,7 @@ files = 0
 for root in roots:
     if not root.is_dir():
         continue
+    seen_here = {}  # 這一個範圍裡看過的 ID
     for f in sorted(root.rglob("*.md")):
         files += 1
         cur = None
@@ -111,11 +118,13 @@ for root in roots:
                     cur = None
                     continue
                 cur = mid.group(1)
-                if cur in scenarios:
+                if cur in seen_here:
                     # **不可以靜靜合併。** `sort -u` 會把重複折疊掉，
                     # 於是「兩條不同的 Scenario 共用一個 ID」看起來像一條。
-                    die(f"Scenario ID {cur} 出現不只一次（{scenarios[cur]}、{f}:{i}）")
-                scenarios[cur] = f"{f}:{i}"
+                    die(f"Scenario ID {cur} 在同一個範圍裡出現不只一次"
+                        f"（{seen_here[cur]}、{f}:{i}）")
+                seen_here[cur] = f"{f}:{i}"
+                scenarios.setdefault(cur, f"{f}:{i}")
                 continue
             mv = VERIFY_RE.match(line)
             if mv:
@@ -139,10 +148,10 @@ for root in roots:
                 if len(parts[2]) < 8:
                     die(f"{cur} 的豁免沒有寫出實質理由（{f}:{i}）")
                     continue
-                if cur in exempt:
+                if cur in exempt and exempt[cur][3] == root:
                     die(f"{cur} 有不只一條 VERIFY-BY（{f}:{i}）")
                     continue
-                exempt[cur] = (kind, parts[1], parts[2])
+                exempt[cur] = (kind, parts[1], parts[2], root)
 
 if files == 0:
     die("一份規格檔都沒掃到 —— **掃不到不等於全部覆蓋**。"
@@ -206,7 +215,7 @@ if FAIL:
 print(f"✓ Scenario 覆蓋：{len(scenarios)} 條規格，"
       f"{len(scenarios) - len(exempt)} 條有通過的測試、{len(exempt)} 條豁免")
 for s in sorted(exempt):
-    k, ev, why = exempt[s]
+    k, ev, why, _root = exempt[s]
     print(f"    {s}  {k}｜{ev}｜{why}")
 PY
 RC=$?

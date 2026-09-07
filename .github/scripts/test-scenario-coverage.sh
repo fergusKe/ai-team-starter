@@ -223,6 +223,32 @@ printf '\n#### Scenario: [DEMO-01-S01] 重複的 ID\n\n- **WHEN** a\n- **THEN** 
 FAKE_JSON="$(json_all_pass)"
 run 1 "Scenario ID 重複要紅（不可以靜靜折疊）" "出現不只一次"
 
+# **MODIFIED delta 重述 main 上同一條 Scenario 不是重複。** openspec 甚至強制
+# 你把同一個 Requirement 底下每一條都抄進 MODIFIED 區塊 —— 所以「同一個 ID
+# 出現兩次」只有在同一個範圍裡才是錯的。（實測：第一版沒分範圍，一開 change
+# 就報六條假的重複，而那六條完全是正常流程。）
+setup
+mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
+{
+  printf '## MODIFIED Requirements\n\n### Requirement: 示範\n\n'
+  printf '#### Scenario: [DEMO-01-S01] 第一條\n\n- **WHEN** a\n- **THEN** b\n\n'
+  printf '#### Scenario: [DEMO-01-S02] 第二條\n\n- **WHEN** a\n- **THEN** b\n'
+} > "$W/repo/openspec/changes/demo-change/specs/demo/spec.md"
+FAKE_JSON="$(json_all_pass)"
+run 0 "MODIFIED delta 重述同一條 Scenario 不算重複" "Scenario 覆蓋"
+
+# 但**同一個範圍裡**重複仍然要紅（陽性對照 —— 少了它，把重複檢查整個拿掉
+# 也不會有測試變紅）。
+setup
+mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
+{
+  printf '## MODIFIED Requirements\n\n### Requirement: 示範\n\n'
+  printf '#### Scenario: [DEMO-01-S01] 第一條\n\n- **WHEN** a\n- **THEN** b\n\n'
+  printf '#### Scenario: [DEMO-01-S01] 又一條同 ID\n\n- **WHEN** a\n- **THEN** b\n'
+} > "$W/repo/openspec/changes/demo-change/specs/demo/spec.md"
+FAKE_JSON="$(json_all_pass)"
+run 1 "同一個範圍裡重複仍然要紅" "同一個範圍裡出現不只一次"
+
 # **掃不到不等於全部覆蓋。** 目錄搬走、正規表示式寫壞，差集都會變成空的。
 setup
 rm -rf "$W/repo/openspec/specs"
