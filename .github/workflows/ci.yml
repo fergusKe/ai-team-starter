@@ -137,6 +137,9 @@ jobs:
       - name: Prompts contract tests
         run: bash .github/scripts/test-prompts.sh
 
+      - name: Scenario coverage gate tests
+        run: bash .github/scripts/test-scenario-coverage.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——

@@ -226,6 +226,42 @@ change id 與 slice 的分界，不需要任何消歧邏輯。
 **阻塞類型的詞彙不是寫死在腳本裡的**，是從 `docs/WBS.md` 自己那張
 `| 阻塞類型 | 意思 | 該做什麼 |` 表讀出來的。要用新的類型，**先去那張表宣告**。
 
+### Scenario 覆蓋：每一條規格都要有一個真的跑過的測試
+
+```bash
+bash .github/scripts/check-scenario-coverage.sh
+```
+
+〈完成的定義〉第 2 條寫「每個 Scenario 都有對應測試」。**在這支腳本出現以前，
+那句話沒有任何機器在執行** —— 衍生專案實測差集有 8 條。
+
+**它不掃測試原始碼。** 實測踩過：一個 Scenario ID 只出現在測試檔的**一行註解**
+裡，`grep` 會把它算成已覆蓋。所以看的是 `vitest --reporter=json` 的執行結果，
+而且只認 `passed` 的**葉節點**標題 ——「出現這個 ID」跟「這條真的被驗了」中間
+差著：有沒有被 skip、有沒有編譯錯誤、有沒有真的通過。ID 寫在 `describe` 上
+也不算：那個 describe 底下每一條都會沾到它，一條 ID 就能替一整群測試背書。
+
+不用單元測試驗的 Scenario，在它自己底下寫一行豁免：
+
+```markdown
+#### Scenario: [FE-W01-S01] 進入世界看到 3D 畫面
+
+- **WHEN** 使用者在支援 WebGL2 的瀏覽器開啟 `/world`
+- **THEN** 頁面渲染出一個 canvas 元素
+- **VERIFY-BY** `manual-browser`｜PR #37 的截圖｜WebGL 像素結果 jsdom 證明不了
+```
+
+種類是**封閉列舉**：`vitest`／`playwright`／`command-negative`／`manual-browser`。
+不認得的種類直接紅 —— 打錯字的豁免等於沒有豁免，而它看起來跟真的一模一樣。
+
+**豁免寫在 Scenario 裡面，不另外開一份清單。** 理由是 `feat/` 分支不得回改
+已批准的 specs（分支閘門擋著），所以豁免只能在 spec PR 階段加 ——
+**實作者沒辦法寫到一半才給自己補一張免死金牌。**
+
+機器還會擋：豁免過期（測試補上了但豁免還留著）、孤兒豁免（指到不存在的
+Scenario）、同一條有兩份豁免、Scenario 沒有穩定 ID、ID 重複、
+以及**一份規格檔都沒掃到**（掃不到不等於全部覆蓋）。
+
 ### 引用 ID 的寫法
 
 **模板預設驗兩份**：`docs/WBS.md` 與 `docs/ROADMAP.md`。權威是

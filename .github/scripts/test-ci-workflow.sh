@@ -139,7 +139,8 @@ if not inst: die("ci job 裡找不到 `run: npm ci`")
 put("install_before_branch", "1" if min(inst) < bi else "0")
 put("install_idx", str(min(inst))); put("branch_idx", str(bi))
 
-for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
+for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh",
+           "test-scenario-coverage.sh"):
     put("has_" + t, "1" if any(t in r for r in runs) else "0")
 
 put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
@@ -158,7 +159,8 @@ put("branch_env_head_exact", "1" if e.get("HEAD_REF", "").strip() == "${{ github
 # **精確 allow-list**，不是「列舉會忽略失敗的寫法」。
 # deny-list 列不完：`|| true`、`|| :`、`|| echo x`、`|| exit 0`、`; true`…
 # 只要 run 不是剛好那一句，就當作被動過。
-for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
+for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh",
+           "test-scenario-coverage.sh"):
     want = "bash .github/scripts/%s" % t_
     idxs = [i for i, r in enumerate(runs) if t_ in r]
     put("exact_" + t_, "1" if any(
@@ -232,7 +234,7 @@ GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
   || bad "有一步「真的會跑的」npm ci 排在 Branch 之前" "npm ci 在第 $(get install_idx) 步、Branch 在第 $(get branch_idx) 步（帶 if: 的不算）"
 
 # T5：四支閘門測試都要在 ci job 裡
-for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh; do
+for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh test-scenario-coverage.sh; do
   if [ "$(get "exact_$t")" = "1" ]; then
     ok "ci job 跑 ${t}，run 剛好是那一句、沒有 if:／shell:"
   else
