@@ -49,6 +49,13 @@ SPEC
   # `npx` 替身：只攔 vitest，把預先寫好的 JSON 放到 --outputFile 指的位置。
   cat > "$W/repo/bin/npx" <<'STUB'
 #!/usr/bin/env bash
+# `openspec list --specs --json`：閘門用它問「有沒有現況 spec」。
+# 替身回一份非空的清單 —— fixture 想測的是覆蓋比對，不是 OpenSpec 的 discovery。
+# （不攔的話每個案例都會去叫真的 npx，26 個案例慢到逾時。）
+if [ "${1:-}" = "openspec" ]; then
+  if [ -n "${FAKE_SPECS_EMPTY:-}" ]; then printf '{"specs":[]}'; else printf '{"specs":[{"id":"demo"}]}'; fi
+  exit 0
+fi
 if [ "${1:-}" != "vitest" ]; then exec /usr/bin/env npx "$@"; fi
 out=""
 while [ $# -gt 0 ]; do
@@ -76,7 +83,8 @@ run() {
   # 失敗要留現場），而這支測試裡有 16 個案例**故意失敗** —— 跑一次就在系統的
   # $TMPDIR 留 16 個目錄。指到 $W 之後，它們跟著 $W 一起被清掉。
   out="$(cd "$W/repo" && PATH="$W/repo/bin:$PATH" TMPDIR="$W/tmp" \
-         FAKE_JSON="${FAKE_JSON:-}" FAKE_RC="${FAKE_RC:-0}" bash "$GATE" 2>&1)"; rc=$?
+         FAKE_JSON="${FAKE_JSON:-}" FAKE_RC="${FAKE_RC:-0}" \
+         FAKE_SPECS_EMPTY="${FAKE_SPECS_EMPTY:-}" bash "$GATE" 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
     echo "$out" | sed 's/^/      /' | head -12
@@ -266,6 +274,14 @@ printf '\n#### Scenario: [DEMO-01-S01] 又一條同 ID\n\n- **WHEN** a\n- **THEN
   >> "$W/repo/openspec/specs/demo/spec.md"
 FAKE_JSON="$(json_all_pass)"
 run 1 "Scenario ID 重複要紅" "出現不只一次"
+
+# **零份現況 spec 是合法狀態，安全回 0。** 剛複製的模板還沒有任何規格 ——
+# 不接進 CI 的話，第一次 archive 會卡在一個沒有任何合法 PR 能修好的死結
+# （archive/ 不准碰 .github/）。所以從第一天就接上，零份的時候不做事。
+setup
+FAKE_JSON="$(json_all_pass)"; FAKE_SPECS_EMPTY=1
+run 0 "零份現況 spec 時安全回 0" "還沒有任何現況 spec"
+FAKE_SPECS_EMPTY=
 
 # **掃不到不等於全部覆蓋。** 目錄搬走、正規表示式寫壞，差集都會變成空的。
 setup

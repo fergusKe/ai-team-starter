@@ -25,6 +25,33 @@ cd "$(git rev-parse --show-toplevel)"
 FAIL=0
 die() { echo "✗ $*" >&2; FAIL=1; }
 
+# **零份現況 spec 是一個合法狀態，不是錯誤。**
+#
+# 剛從模板複製的專案還沒有任何 `openspec/specs/`。原本的處置是「不要把這支
+# 接進 CI，等有規格再接」—— 那製造了一個**沒有任何合法 PR 能修好的死結**：
+#
+#     第一次 archive 產生現況 spec → 合約測試開始要求 ci.yml 有這一步
+#     而 archive/<id> 分支不准碰 .github/ → 那個 PR 永遠是紅的
+#
+# （外部審查指出、實測確認。）所以改成：**從模板起就永遠接在 CI 上**，
+# 而零份 spec 的時候安全地回 0。
+#
+# **問 OpenSpec，不要自己 glob。** 用 `openspec/specs/` 存不存在去判斷會漂 ——
+# 放一份帶 ```` ```markdown ```` 範例的 README 進去，glob 看得到 Scenario、
+# 而 OpenSpec 說沒有任何 item（審查者實測的 false positive）。
+SPECS_JSON="$(npx openspec list --specs --json 2>/dev/null)" || SPECS_JSON=""
+if [ -n "$SPECS_JSON" ] && printf '%s' "$SPECS_JSON" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)          # 解析不出來就不要當成「零份」
+sys.exit(0 if isinstance(d.get("specs"), list) and not d["specs"] else 1)
+'; then
+  echo "✓ 還沒有任何現況 spec（openspec list --specs 回空），沒有東西可以檢查"
+  exit 0
+fi
+
 W="$(mktemp -d "${TMPDIR:-/tmp}/scenario-cov.XXXXXXXX")"
 REPORT="$W/vitest.json"
 

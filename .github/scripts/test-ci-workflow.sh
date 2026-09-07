@@ -198,6 +198,14 @@ for _n, _want in (("Lint", "npm run lint"), ("Typecheck", "npm run typecheck"),
                                  and all_ifs[_i[0]] is None and all_shells[_i[0]] is None) else "0")
     put("quality_actual_" + _n, (all_runs[_i[0]].strip() if _i else "（沒有這一步）"))
 
+# 覆蓋閘門那一步也要掃整份 —— 模板把它放在 `quality:` job，衍生放在 `ci:`。
+_cov = "check-scenario-coverage.sh"
+_ci = [k for k, r in enumerate(all_runs) if _cov in r]
+put("cov_anywhere", "1" if any(
+    all_runs[k].strip() == "bash .github/scripts/" + _cov
+    and all_ifs[k] is None and all_shells[k] is None for k in _ci) else "0")
+put("cov_actual", (all_runs[_ci[0]].strip() if _ci else "（沒有這一步）"))
+
 # **整份 workflow 都不准出現 continue-on-error。** 原本只掃 ci job 的 step 層
 # 與 job 層 —— 別的 job（例如模板的 `quality:`）設了它，一樣是「失敗不算失敗」。
 put("coe_anywhere", "1" if re.search(r"^\s*(?:continue-on-error|\"continue-on-error\"|'continue-on-error'):",
@@ -298,27 +306,21 @@ done
   && ok "整份 ci.yml 都沒有 continue-on-error（不是只有 ci job）" \
   || bad "整份 ci.yml 都沒有 continue-on-error" "別的 job 設了它，一樣是失敗不算失敗"
 
-# T5c：**有規格的專案一定要接覆蓋閘門。**
+# T5c：**覆蓋閘門一定要接在 CI 上，從第一天就接。**
 #
-# 這一條取代了原本「模板與衍生各自維護一份必跑清單」的宣告式分岔 ——
-# 那個分岔要靠人記得，而外部審查實測：在模板複本加一份正式 main spec、
-# 完全沒有測試，這支測試仍然全過。改成同一條規則，兩邊都適用：
-#   沒有規格 → 不要求（剛複製的模板）
-#   有規格   → ci.yml 一定要有那一步，而且不得被中和
-HAS_SPECS=0
-if [ -d "$ROOT/openspec/specs" ] \
-   && grep -rqE '^####[[:space:]]+Scenario:' "$ROOT/openspec/specs" 2>/dev/null; then
-  HAS_SPECS=1
-fi
-if [ "$HAS_SPECS" = 1 ]; then
-  if [ "$(get exact_check-scenario-coverage.sh)" = "1" ]; then
-    ok "有規格，而且 ci.yml 接了 check-scenario-coverage.sh"
-  else
-    bad "有規格，而且 ci.yml 接了 check-scenario-coverage.sh" \
-        "openspec/specs/ 裡有 Scenario，但 ci.yml 沒有那一步（實際：$(get actual_check-scenario-coverage.sh)）"
-  fi
+# 原本是「有規格才要求」，靠 grep 掃 openspec/specs 判斷。那有兩個問題：
+#   1. **第一次 archive 會死結** —— archive 產生現況 spec 之後這條開始要求，
+#      而 `archive/<id>` 不准碰 `.github/`，那個 PR 永遠是紅的。
+#   2. grep 的 discovery 跟 OpenSpec 漂掉了 —— 放一份帶 markdown 範例的
+#      README 進 openspec/specs/，grep 看得到 Scenario 而 OpenSpec 說沒有 item。
+# 兩個都是外部審查實測出來的。
+#
+# 改成永遠要求。零份 spec 的時候閘門自己安全回 0（它問 OpenSpec，不自己 glob）。
+if [ "$(get cov_anywhere)" = "1" ]; then
+  ok "ci.yml 接了 check-scenario-coverage.sh，run 剛好是那一句"
 else
-  ok "還沒有任何規格，覆蓋閘門先不要求（剛複製的模板）"
+  bad "ci.yml 接了 check-scenario-coverage.sh，run 剛好是那一句" \
+      "實際：$(get cov_actual)"
 fi
 
 # T6：ci job 不得有 continue-on-error（失敗要真的失敗）
