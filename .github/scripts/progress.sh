@@ -119,9 +119,27 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-git fetch -q origin 2>/dev/null || true
+# **fetch 失敗不可以靜靜吞掉。** 遠端分支是狀態的三個來源之一 ——
+# 「規格審查中」與「實作中」完全靠它。fetch 失敗時腳本會拿上一次的 refs
+# 繼續算，於是畫面上是一個**看起來很正常、其實是幾天前**的狀態，而且沒有
+# 任何跡象。原本這裡寫 `|| true`，那正是這支腳本自己在抓的
+# 「解析不出來就靜靜跳過」。
+#
+# 但**不中止** —— 沒有網路是常態（飛機上、離線的 CI job），而 WBS 的文法
+# 檢查跟遠端一點關係也沒有。所以：照跑，但把「遠端不新鮮」講出來，並且在
+# `--json` 裡標記，讓吃這份資料的工具自己決定要不要信。
+REMOTE_FRESH=1
+REMOTE_WHY=""
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  REMOTE_FRESH=0; REMOTE_WHY="這裡不是 git repo"
+elif ! git remote get-url origin >/dev/null 2>&1; then
+  REMOTE_FRESH=0; REMOTE_WHY="沒有設定 origin"
+elif ! git fetch -q origin 2>/dev/null; then
+  REMOTE_FRESH=0; REMOTE_WHY="git fetch origin 失敗（離線？沒有權限？）"
+fi
 
-SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" python3 - <<'PY'
+SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" \
+REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
 import os, re, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
@@ -129,6 +147,9 @@ ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 JSON = os.environ.get("JSON") == "1"
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
+# 遠端 refs 是不是這一次抓下來的。**不新鮮的時候要說**，見上面 shell 那段。
+REMOTE_FRESH = os.environ.get("REMOTE_FRESH") == "1"
+REMOTE_WHY = os.environ.get("REMOTE_WHY") or ""
 
 G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 
@@ -1283,6 +1304,15 @@ for wid in order:
                     f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
                     f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
 
+# **遠端不新鮮就講出來，而且要講清楚哪些狀態不能信。**
+# 只印「fetch 失敗」不夠 —— 讀的人不會知道那影響了什麼。
+if not REMOTE_FRESH and not JSON:
+    print()
+    print(f"{Y}⚠ 遠端狀態可能是舊的：{REMOTE_WHY}{X}")
+    print(f"{D}  「規格審查中」與「實作中」是從遠端分支推的，這一次沒抓到新的，"
+          f"用的是上一次的 refs。{X}")
+    print(f"{D}  「已封存」「規格已合併」「未開始」不受影響 —— 那些只看這份 tree。{X}")
+
 _todo = setup_todo()
 if _todo and not JSON and not CHECK:
     print()
@@ -1300,8 +1330,11 @@ if JSON:
     # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
     # 那正是這份文件到處在防的「同一件事寫在兩個地方」。
     import json as _json
+    # `remote_fresh` 是給下游用的。`wbs-page.sh` 與往後的 WBS 區塊都要看它 ——
+    # **把從遠端推出來的狀態當成事實寫進版控，是把一個當下的東西凍成一份紀錄。**
     out = {"items": [], "groups": _groups, "affects": {},
-           "milestones": _milestones, "deps": _deps}
+           "milestones": _milestones, "deps": _deps,
+           "remote_fresh": REMOTE_FRESH, "remote_why": REMOTE_WHY}
     _aff = collections.defaultdict(list)
     for wid in order:
         info = wbs[wid]

@@ -204,6 +204,25 @@ run_all_absent() {
   echo "✓ $desc"; PASS=$((PASS + 1))
 }
 
+# run_json_top <說明> <頂層鍵> <期望值（字串比對）>：--json 的頂層欄位
+#
+# `run_field_has` 只看 `items[]`。有些事實不屬於任何一個項目 ——
+# 例如「這一次遠端 refs 有沒有抓到」，那是**整份資料的可信度**，
+# 下游（網頁、Excel、往後的 WBS 區塊）要靠它決定要不要信分支推出來的狀態。
+run_json_top() {
+  local desc="$1" key="$2" want="$3" out
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("yes" if str(d.get(sys.argv[1])) == sys.argv[2] else "no:" + str(d.get(sys.argv[1])))' "$key" "$want")"
+  if [ "$out" = yes ]; then
+    echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    echo "✗ ${desc} —— --json 的 ${key} 期望「${want}」，實際 ${out#no:}"
+    bump_fail
+  fi
+}
+
 run_json_has() {
   local desc="$1" out n
   out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null)"
@@ -261,6 +280,25 @@ mkchange() {
     printf '# %s\n' "$c" > "$W/openspec/changes/$c/proposal.md"
     printf -- '- [x] 一\n- [ ] 二\n' > "$W/openspec/changes/$c/tasks.md"
   done
+}
+
+# mkorigin <ok|broken>：給 fixture 一個 origin
+#
+# `ok` 造一份本機 bare repo 當 origin（fetch 會成功，**不打網路**）；
+# `broken` 指向一個不存在的路徑（fetch 必然失敗）。
+# 沒有這個的話「遠端不新鮮」的警告只有一種情況測得到，
+# 而「永遠都警告」跟「該警告時才警告」在那種測法下長得一樣。
+mkorigin() {
+  git -C "$W" init -q 2>/dev/null
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+  GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m x 2>/dev/null
+  if [ "$1" = ok ]; then
+    git init -q --bare "$W/.origin.git"
+    git -C "$W" remote add origin "$W/.origin.git" 2>/dev/null
+    git -C "$W" push -q origin HEAD 2>/dev/null
+  else
+    git -C "$W" remote add origin "$W/.no-such-origin.git" 2>/dev/null
+  fi
 }
 
 # mkremote <遠端分支名>...：在 fixture 裡造一個遠端分支
@@ -427,6 +465,7 @@ selftest_count() { # selftest_count <說明> <helper 與參數...>
 }
 selftest_count "run_all_has 自測"      run_all_has      "自測（不計入）" "這串字絕不會出現在 --all 的輸出裡"
 selftest_count "run_all_absent 自測"   run_all_absent   "自測（不計入）" "WBS 共"
+selftest_count "run_json_top 自測"     run_json_top     "自測（不計入）" "remote_fresh" "不可能的值"
 selftest_count "run_json_has 自測"     run_json_has     "自測（不計入）" "這個_key_絕不存在"
 selftest_count "run_setup 自測"        run_setup        "自測（不計入）" "have" "這串字絕不會出現在輸出裡"
 selftest_count "run_field_has 自測"    run_field_has    "自測（不計入）" "NO-SUCH-ITEM" "state" "不可能的值"
@@ -790,6 +829,35 @@ baseline
 mkchange app-c01-api app-c01-ui
 mkremote feat/app-c01-ui--slice
 run_field_has "第二個 change 有實作分支：項目就是實作中" "APP-C01" "state" "實作中"
+
+# ── 遠端 refs 不新鮮的時候要說 ────────────────────────────────────
+#
+# 原本這裡是 `git fetch -q origin 2>/dev/null || true`。fetch 失敗時腳本
+# 拿**上一次**的 refs 繼續算，畫面上是一個看起來很正常、其實是幾天前的
+# 狀態，沒有任何跡象 —— 那正是這支腳本自己在抓的「解析不出來就靜靜跳過」。
+#
+# 三條缺一不可：抓不到要說、抓得到不准說、`--json` 要標記。
+# 少了「抓得到不准說」，把警告改成無條件印照樣全綠。
+baseline
+mkorigin broken
+run_all_has "fetch 失敗要講出來" "遠端狀態可能是舊的"
+run_all_has "而且要講清楚哪些狀態不能信" "是從遠端分支推的"
+
+baseline
+mkorigin broken
+run_json_top "fetch 失敗時 --json 標記 remote_fresh=False" "remote_fresh" "False"
+
+# **陽性對照。** origin 正常時不可以印那個警告，`remote_fresh` 要是 True。
+baseline
+mkorigin ok
+run_all_absent "origin 正常時不印遠端警告" "遠端狀態可能是舊的"
+run_json_top "origin 正常時 remote_fresh=True" "remote_fresh" "True"
+
+# 第三種理由：有 repo 但沒有 origin（`baseline` 最後會 `git init`，所以單獨
+# 跑就是這個狀態）。**理由不能一律說「fetch 失敗」** —— 沒有 origin 跟抓不到
+# 是兩件事：前者要去設 remote，後者要去看網路或權限。訊息指錯方向等於沒有訊息。
+baseline
+run_all_has "有 repo 但沒有 origin 也算不新鮮（理由不同）" "沒有設定 origin"
 
 # 讀阻塞類型表要跟工作分解表**用同一份切列**（`split_row`）。
 # 分開寫的話，含 `\|` 的類型詞在兩邊會被切成不一樣的東西 ——
