@@ -140,6 +140,66 @@ case "$selftest_output" in
     printf '      實際輸出：%s\n' "$selftest_output"; FAIL=$((FAIL+1)) ;;
 esac
 
+# ── openspec status 的 fail-closed 分支 ─────────────────────────────────────
+#
+# 規格身分那一關去問 `openspec status --change <id> --json`。它的失敗路徑
+# （沒有輸出／不是 JSON／找不到 specs 那一項／status 是沒見過的值）
+# **正常 fixture 永遠走不到** —— 而走不到的分支沒有測試就是空話。
+# 2026-09-07 實測：把那四條各拿掉一條，整套仍然全綠（4 個突變全存活）。
+#
+# 所以用一支假的 npx 餵那四種回應。它只攔 `openspec status`，其餘原樣轉給真的
+# npx —— 攔太多的話這幾條測到的就不是被測的那一關。
+STUB="$ROOT/stub-bin"
+mkdir -p "$STUB"
+REAL_NPX="$(command -v npx)"
+cat > "$STUB/npx" <<STUBEOF
+#!/usr/bin/env bash
+if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "openspec" ] && [ "\$2" = "status" ]; then
+  case "\$STATUS_MODE" in
+    empty)   exit 0 ;;
+    badjson) printf 'not-json\\n'; exit 0 ;;
+    missing) printf '%s\\n' '{"artifacts":[]}'; exit 0 ;;
+    unknown) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"future"}]}'; exit 0 ;;
+  esac
+fi
+exec "$REAL_NPX" "\$@"
+STUBEOF
+chmod +x "$STUB/npx"
+
+run_status() { # run_status <期望exit> <STATUS_MODE> <說明> <訊息片段>
+  local want="$1" mode="$2" desc="$3" needle="$4"
+  N=$((N+1))
+  local W="$ROOT/c$N"
+  git clone -q "$BASELINE" "$W" 2>/dev/null
+  echo node_modules >> "$W/.git/info/exclude"
+  ln -s "$REPO/node_modules" "$W/node_modules" 2>/dev/null
+  # 造一份**完全正常**的新規格：這樣被擋下來的唯一理由就是 status 那一關。
+  ( cd "$W" && git config user.email t@t && git config user.name t \
+    && git checkout -qb spec/fresh-change \
+    && mkdir -p openspec/changes/fresh-change/specs/demo \
+    && printf 'schema: spec-driven\n' > openspec/changes/fresh-change/.openspec.yaml \
+    && printf '## Why\nx\n\n## What Changes\n- a\n\n## Non-goals\n- 無\n' > openspec/changes/fresh-change/proposal.md \
+    && printf '## ADDED Requirements\n\n### Requirement: R\n系統 SHALL 做事，並在不合法時回錯誤。\n\n#### Scenario: [FR-01-S01] a\n- **WHEN** a\n- **THEN** b\n' > openspec/changes/fresh-change/specs/demo/spec.md
+    git add -A >/dev/null 2>&1; git commit -qm x >/dev/null 2>&1 )
+  ( cd "$W" && PATH="$STUB:$PATH" STATUS_MODE="$mode" bash "$GATE" main spec/fresh-change ) >"$ROOT/c$N.out" 2>&1
+  local got=$?
+  if [ "$got" = "$want" ] && grep -q -- "$needle" "$ROOT/c$N.out"; then
+    printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
+  else
+    printf '  \033[31m✗\033[0m %-46s 期望=%s／含「%s」，實際 exit=%s\n' "$want" "$desc" "$needle" "$got"
+    FAIL=$((FAIL+1)); sed 's/^/      /' "$ROOT/c$N.out" | head -5
+  fi
+}
+
+echo "── openspec status 讀不到就拒（fail-closed）──"
+run_status 1 empty   "status 沒有輸出 → 拒"        "沒有輸出"
+run_status 1 badjson "status 不是合法 JSON → 拒"   "不是合法 JSON"
+run_status 1 missing "artifacts 裡沒有 specs → 拒" "找不到 \`specs\` 這一項"
+run_status 1 unknown "status 是沒見過的值 → 拒"    "只接受 \`done\`"
+# 陽性對照：同一個 fixture、不攔 status 的話要綠。
+# 沒有它的話，上面四條可能只是「假 npx 把什麼都弄壞了」。
+run_status 0 ""      "不攔 status 時同一份規格要過"  "spec 階段"
+
 echo "── 規格豁免封堵（新 change，main 上沒有它的 Scenario ID）──"
 # 用 fresh-change 而不是 demo-change：demo-change 的 Scenario ID 已經在 main 上，
 # 這幾個 fixture 會被「刪掉 main 上的 Scenario」那條防禦先擋掉，
