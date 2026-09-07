@@ -42,6 +42,12 @@ jobs:
           node-version: '24'
           cache: npm
 
+      # `npm ci` 要排在 Branch 之前。看起來多裝一次，但 Branch 那一關內部會跑
+      # `npx openspec validate`（check-pr-branch.sh 的 spec/ 與 archive/ 分支），
+      # 沒有 node_modules 的話那次 npx 會去抓網路上的版本 —— **繞過 lockfile**，
+      # 而這份檔案下面整段都在講不要繞過 lockfile。正確性優先於快速失敗。
+      - run: npm ci
+
       # 分支類別閘門。
       #
       # 用**分支前綴**決定這個 PR 能改什麼，而不是用路徑白名單決定
@@ -50,11 +56,18 @@ jobs:
       #
       # 封閉列舉 + 每類一個不看檔案性質的上界，漏掉的方向是 fail-CLOSED。
       # 分類與上界寫在 AGENTS.md〈分支命名〉，實作在腳本裡。
+      #
+      # 🔒 分支名**一定要走 env 中介變數**，不可以把 `${{ github.head_ref }}`
+      # 直接插進 `run:`。Actions 是**文字替換**，而 git 收 `chore/$(...)` 這種
+      # 分支名（`git check-ref-format` rc=0）—— 直接插值的話那段會在
+      # 閘門拿到參數之前就被 shell 執行。這是 GitHub 官方點名的 script injection。
+      # `.github/scripts/test-ci-workflow.sh` 在驗這件事，改這一步之前先跑它。
       - name: Branch
         if: github.event_name == 'pull_request'
-        run: bash .github/scripts/check-pr-branch.sh "${{ github.base_ref }}" "${{ github.head_ref }}"
-
-      - run: npm ci
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: bash .github/scripts/check-pr-branch.sh "$BASE_REF" "$HEAD_REF"
 
       # lockfile 的來源檢查。
       #
@@ -106,6 +119,17 @@ jobs:
       # 不會有東西變紅，只會有本來該紅的東西變綠。
       - name: WBS gate tests
         run: bash .github/scripts/test-progress-check.sh
+
+      # 分支閘門自己的測試。**它之前不在 CI 裡** —— 有測試、沒有讀者，
+      # 而執法層本體壞掉的方式跟工作分解表一樣是安靜的。
+      # 排在 npm ci 之後：這支測試內部會跑 `npx openspec archive`。
+      - name: Branch gate tests
+        run: bash .github/scripts/test-check-pr-branch.sh
+
+      # workflow 自己的合約測試：分支名有沒有原樣傳進閘門。
+      # 這一關驗的不是腳本，是**這份 YAML** —— 把 env 中介變數改回直接插值就會紅。
+      - name: Workflow contract tests
+        run: bash .github/scripts/test-ci-workflow.sh
 
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #

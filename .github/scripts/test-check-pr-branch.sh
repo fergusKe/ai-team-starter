@@ -15,7 +15,11 @@ set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
 GATE="$REPO/.github/scripts/check-pr-branch.sh"
-ROOT="$(mktemp -d -t gate-test)"
+# `mktemp -d -t PREFIX` 在 macOS 是「拿 PREFIX 當前綴」，在 GNU coreutils 卻是
+# 「TEMPLATE 相對於 TMPDIR」而且要求含 XXXXXX —— 少了就報錯、$() 收到空字串，
+# 於是所有路徑變成 /c53 這種。這支測試接進 CI 的第一次跑就是這樣紅的：
+# 在 macOS 永遠綠、在 ubuntu runner 永遠壞，而它之前不在 CI 裡所以沒人知道。
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gate-test.XXXXXXXX")"
 BASELINE="$ROOT/_baseline"
 PASS=0; FAIL=0; N=0
 
@@ -102,7 +106,7 @@ run 0 main chore/tidy-readme   "小改"                     sh -c 'echo "一行"
 run 1 main chore/sneak-spec    "碰 openspec/"             sh -c 'echo "x: 1" >> openspec/config.yaml'
 run 1 main chore/sneak-ci      "碰 .github/"              sh -c 'echo "#" >> .github/workflows/ci.yml'
 run 1 main chore/symlink       "加 symlink"               sh -c 'ln -s /etc/passwd link.txt'
-run 1 main chore/binary        "加 binary（含 NUL）"       sh -c 'printf "PNG\x00\x01\x02\x03binary" > blob.bin'
+run 1 main chore/binary        "加 binary（含 NUL）"       sh -c '{ printf PNG; head -c 4 /dev/zero; printf binary; } > blob.bin'
 run 1 main chore/huge          "超過 bytes 上限"           sh -c 'head -c 30000 /dev/zero | tr "\0" "a" > big.txt'
 run 1 main chore/minified      "一行 minified"             sh -c 'head -c 30000 /dev/zero | tr "\0" "x" | tr -d "\n" > min.js'
 run 0 main chore/lockfile-bump "大 lockfile 不計入大小"     sh -c 'head -c 40000 /dev/zero | tr "\0" "b" > package-lock.json'
