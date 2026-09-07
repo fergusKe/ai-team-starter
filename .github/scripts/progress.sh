@@ -1083,7 +1083,10 @@ def changes_for(wid):
     這條規則沒有人講過，是 `[0]` 順手訂下的。
     """
     pre = wid.lower()
-    return [c for c in changes if c == pre or c.startswith(pre + "-")]
+    # **排序 —— 字典的插入順序（先 active 後 archived）不該影響任何判斷。**
+    # 不排的話，「第一個」剛好永遠是 active 的那個，於是「聚合」跟「只看第一個」
+    # 在這份資料上同解，兩者的差別觀察不到（外部審查的存活突變之一）。
+    return sorted(c for c in changes if c == pre or c.startswith(pre + "-"))
 
 
 def setup_todo():
@@ -1236,10 +1239,14 @@ def change_ids_for(wid):
     _e_ids, _e_shas = _evid.get(wid, ([], []))
     if _e_ids or _e_shas:
         return _e_ids
+    # `changes_for()` 已經排好序了 —— **排序只有一個來源**。這裡再排一次的話，
+    # 兩個排序會互相遮蔽：任一邊被拿掉，另一邊都會把它補回來，於是兩邊都
+    # 「拿掉也不會紅」（實測過，兩個突變各自存活）。
     hits = changes_for(wid)
     if not hits:
-        hits = [c for c in branches if c == wid.lower()
-                or c.startswith(wid.lower() + "-")]
+        # 分支推出來的那一份也要排 —— 它不經過 changes_for。
+        hits = sorted(c for c in branches if c == wid.lower()
+                      or c.startswith(wid.lower() + "-"))
     return hits
 
 
@@ -1506,7 +1513,10 @@ if JSON:
             # Excel 的唯一資料來源，那邊看不到就等於這件事沒有被算過 ——
             # 而「同一個 ID 開了兩個 change」這種事更是完全看不出來。
             # 這裡放**全部**，不是第一個。
-            "changes": changes_for(wid),
+            # **要跟狀態算出來的那一份是同一份。** 這裡原本是 `changes_for()`：
+            # 有涵蓋證據的項目，狀態是用證據算的，而 `--json` 卻吐命名推導的
+            # 結果 —— 兩個不同的清單，看的人分不出哪一個影響了狀態。
+            "changes": change_ids_for(wid),
         })
         for g in info["blockers"]:
             _aff[g].append(wid)
@@ -1619,11 +1629,14 @@ def _render_block(stripped):
         st = _durable_of.get(wid, "")
         if st in ("", "未開始"):
             continue
+        # **兩種證據並列時兩個都要留。** 原本 `if _s:` 一成立就只印 commit，
+        # change 從「依據」欄整個消失 —— 而 AGENTS.md 明寫可以並列，`--json`
+        # 也兩個都留著。**顯示層掉資料跟資料層掉資料一樣糟**，因為區塊就是
+        # 大部分人唯一會看的地方。（外部審查實測。）
         _i, _s = _evid.get(wid, ([], []))
-        if _s:
-            why = "、".join("`" + x[:12] + "`" for x in _s)
-        else:
-            why = "、".join("`" + x + "`" for x in change_ids_for(wid)) or "—"
+        _why = ["`" + x + "`" for x in (_i or change_ids_for(wid))]
+        _why += ["`" + x[:12] + "`" for x in _s]
+        why = "、".join(_why) or "—"
         lines.append(f"| {wid} | {st} | {why} |")
         n += 1
     tal = collections.Counter(_durable_of[w] for w in order)

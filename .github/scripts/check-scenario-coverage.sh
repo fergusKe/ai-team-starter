@@ -52,10 +52,18 @@ def die(msg):
     FAIL.append(msg)
 
 
-# `check-pr-branch.sh` 認的就是這個形狀。**兩邊要是同一份文法** ——
-# 分開寫的話，一邊認得、另一邊認不得的 Scenario 會從覆蓋檢查裡整個消失。
-HEAD_RE = re.compile(r"^####\s+Scenario:\s*\[([A-Z0-9-]+)\]")
+# **跟 `check-pr-branch.sh` 用同一份文法。** 那邊要求 `[群組-S99] 標題`：
+#
+#     ID_RE = re.compile(r"^\[([A-Z0-9]+(?:-[A-Z0-9]+)*-S[0-9]{2})\]\s+\S")
+#
+# 這裡原本寫成寬鬆的 `[A-Z0-9-]+`，於是 `#### Scenario: [BAD] …` 配上一條
+# 標題含 `[BAD]` 的通過測試，rc=0 全綠 —— 一個分支閘門會擋下來的 ID，
+# 在覆蓋檢查這邊卻算數。**兩份文法就是兩種答案。**（外部審查實測反例。）
+SID = r"[A-Z0-9]+(?:-[A-Z0-9]+)*-S[0-9]{2}"
+HEAD_RE = re.compile(r"^####\s+Scenario:\s*\[(" + SID + r")\]\s+\S")
 ANY_HEAD_RE = re.compile(r"^####\s+Scenario:\s*(.*)$")
+# 任何一種標題都會結束前一條 Scenario 的範圍。
+ANY_MD_HEAD_RE = re.compile(r"^#{1,6}\s")
 # 豁免：`- **VERIFY-BY** <種類>｜<證據>｜<理由>`
 VERIFY_RE = re.compile(r"^\s*-\s*\*\*VERIFY-BY\*\*\s*(.+)$")
 # **封閉列舉。** 不認得的種類直接紅 —— 打錯字的豁免等於沒有豁免，
@@ -83,13 +91,21 @@ for root in roots:
         files += 1
         cur = None
         for i, line in enumerate(io.open(f, encoding="utf-8").read().splitlines(), 1):
+            # **任何標題都結束前一條 Scenario 的範圍。** 原本只在遇到下一條
+            # `#### Scenario:` 時才換 `cur`，於是寫在 `### Requirement:` 底下
+            # 的 VERIFY-BY 會被算成上一條 Scenario 的豁免 —— 那條 Scenario
+            # 明明已經結束了。（外部審查實測反例：rc=0，豁免生效。）
+            if ANY_MD_HEAD_RE.match(line) and not ANY_HEAD_RE.match(line):
+                cur = None
+                continue
             m = ANY_HEAD_RE.match(line)
             if m:
                 mid = HEAD_RE.match(line)
                 if not mid:
-                    # 沒有穩定 ID 的 Scenario。**不可以當成不存在** ——
+                    # ID 不合文法的 Scenario。**不可以當成不存在** ——
                     # 那樣它就永遠不會出現在差集裡，等於免驗。
-                    die(f"{f}:{i} 的 Scenario 沒有 `[ID]`：{line.strip()[:60]}")
+                    die(f"{f}:{i} 的 Scenario ID 不合文法（要 `[群組-S99] 標題`，"
+                        f"跟分支閘門同一份）：{line.strip()[:60]}")
                     cur = None
                     continue
                 cur = mid.group(1)
@@ -147,6 +163,8 @@ if data is not None:
         # 然後宣布「全部覆蓋」** —— 那是這裡最危險的一種綠燈。
         die("vitest 報告裡沒有 testResults 陣列 —— 格式變了？")
         results = []
+    # **每一個檔案的結果都要走。** 只讀 `results[0]` 的話，第二個測試檔以後
+    # 的覆蓋全部消失 —— 而 vitest 一個檔案就是一個 testResults 條目。
     total = 0
     for fres in results:
         for a in fres.get("assertionResults", []) or []:
@@ -163,14 +181,16 @@ if data is not None:
 # ── 比對 ──────────────────────────────────────────────────────────
 missing = sorted(s for s in scenarios if s not in passed_ids and s not in exempt)
 stale = sorted(s for s in exempt if s in passed_ids)
-orphan = sorted(s for s in exempt if s not in scenarios)
+# 原本這裡還有一條「VERIFY-BY 指到不存在的 Scenario」。**它不可達** ——
+# `exempt` 的鍵一定來自已經進 `scenarios` 的 `cur`，差集永遠是空的。
+# 「改名之後留下的孤兒豁免」實際上是由**位置**擋掉的：豁免必須寫在它那條
+# Scenario 的範圍裡，改名等於換了範圍，那條豁免就變成別條的、或者沒有歸屬。
+# 不可達的防禦沒辦法被測試鎖住 —— 要嘛可達，要嘛不要留。
 
 for s in missing:
     die(f"{s}（{scenarios[s]}）沒有任何通過的測試指著它，也沒有 VERIFY-BY 豁免")
 for s in stale:
     die(f"{s} 同時有通過的測試與 VERIFY-BY 豁免 —— 豁免過期了，拿掉它")
-for s in orphan:
-    die(f"VERIFY-BY 指到 {s}，但沒有這條 Scenario（改名或刪掉之後留下的）")
 
 if FAIL:
     print("✗ Scenario 覆蓋檢查沒過：", file=sys.stderr)

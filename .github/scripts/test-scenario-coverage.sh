@@ -223,6 +223,59 @@ run 1 "一份規格檔都沒掃到要紅" "掃不到不等於全部覆蓋"
 
 # change 裡的 spec 也要算 —— 只掃 main 的話，缺口要等到 archive 才會出現，
 # 而那時候實作早就合併了。
+# **ID 文法要跟分支閘門同一份。** 寬鬆成 `[A-Z0-9-]+` 的話，`[BAD]` 配上一條
+# 標題含 `[BAD]` 的通過測試就 rc=0 全綠 —— 一個分支閘門會擋下來的 ID，
+# 在這裡卻算數。（外部審查實測的反例。）
+setup
+printf '\n#### Scenario: [BAD] 不合法的 ID\n\n- **WHEN** a\n- **THEN** b\n' \
+  >> "$W/repo/openspec/specs/demo/spec.md"
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]},
+  {"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["demo"]},
+  {"title":"[BAD] 不合法","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "不合文法的 Scenario ID 要紅（不可以當成不存在）" "不合文法"
+
+# **豁免不可以跨出它的 Scenario。** 遇到 `### Requirement:` 之類的標題就
+# 結束範圍 —— 原本只在下一條 `#### Scenario:` 才換，於是寫在別的段落底下的
+# VERIFY-BY 會被算成上一條的豁免。（外部審查實測的反例。）
+setup
+printf '\n### Requirement: 另一個需求\n\n- **VERIFY-BY** `manual-browser`｜PR #1｜這條要真的畫面才驗得到\n' \
+  >> "$W/repo/openspec/specs/demo/spec.md"
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "豁免寫在別的段落底下不算（孤兒）" "孤兒豁免"
+
+# 同一條有兩份豁免 —— 哪一份算數沒有唯一答案，不可以挑一個。
+setup
+add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜這條要真的畫面才驗得到'
+add_verify '- **VERIFY-BY** `playwright`｜PR #2｜另外一個理由寫在這裡'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "同一條有兩份豁免要紅" "不只一條"
+
+# 理由的長度門檻要真的擋得住 —— 降到 4 個字的話 `尚未確認` 就過關了。
+setup
+add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜尚未確認'
+FAKE_JSON="$(json_all_pass)"
+run 1 "四個字的理由不算實質理由" "沒有寫出實質理由"
+
+# **VERIFY-BY 要在行首的列表項上。** 放寬成「一行裡任何位置出現」的話，
+# 散文或程式碼區塊裡提到這個字串就會變成一張真的免死金牌。
+setup
+printf '\n這一段散文提到 - **VERIFY-BY** `manual-browser`｜PR #1｜只是在講解用法而已\n' \
+  >> "$W/repo/openspec/specs/demo/spec.md"
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "散文裡提到 VERIFY-BY 不算豁免" "DEMO-01-S02"
+
+# **每一個測試檔的結果都要走。** vitest 一個檔案就是一個 testResults 條目，
+# 只讀第一個的話，第二個檔案以後的覆蓋全部消失。
+setup
+FAKE_JSON='{"testResults":[
+  {"assertionResults":[{"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["a"]}]},
+  {"assertionResults":[{"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["b"]}]}]}'
+run 0 "第二個測試檔的覆蓋也要算" "Scenario 覆蓋"
+
 setup
 mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
 printf '#### Scenario: [DEMO-02-S01] change 裡的\n\n- **WHEN** a\n- **THEN** b\n' \

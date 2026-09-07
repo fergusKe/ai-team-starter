@@ -291,6 +291,21 @@ mkmarkers() {
   } >> "$W/docs/WBS.md"
 }
 
+# mkmarkers_top：marker 放在檔案最前面
+#
+# `mkmarkers` 是附加在最後面，於是「區塊之前」佔了整份文件、「區塊之後」
+# 幾乎是空的。要驗「指紋雜湊的是整份、不是前半」就得反過來擺。
+mkmarkers_top() {
+  python3 - "$W/docs/WBS.md" <<'TOP'
+import io, sys
+p = sys.argv[1]
+t = io.open(p, encoding="utf-8").read().split("\n")
+t.insert(1, "<!-- progress:start 這一段由 `progress.sh --render` 產生，不要手改 -->")
+t.insert(2, "<!-- progress:end -->")
+io.open(p, "w", encoding="utf-8").write("\n".join(t))
+TOP
+}
+
 # render：在 fixture 上跑 --render，回傳它的退出碼
 render() { (cd "$W" && bash "$SCRIPT" --render >/dev/null 2>&1); }
 
@@ -846,6 +861,14 @@ baseline
 mkchange app-c01-api app-c01-ui
 run_all_has "同一個 ID 開了兩個 change：列上看得出來" "+1"
 
+# **change 清單要排序，不要靠字典的插入順序。** `changes` 是先塞 active
+# 再塞 archived，所以「第一個」剛好永遠是 active 的那個 —— 聚合與「只看第一個」
+# 在那種資料上同解，差別觀察不到。排序之後順序跟狀態無關。
+baseline
+mkchange app-c01-ui
+mkarchived app-c01-api
+run_field_has "change 清單依 ID 排序（不是字典插入順序）" "APP-C01" "changes" "'app-c01-api', 'app-c01-ui'"
+
 # **看得見不等於算得對。** 上面兩條都綠的時候，狀態仍然是錯的：
 #
 #   APP-C01  兩個 change 都已封存   有分支   app-c01-api +1
@@ -1027,6 +1050,77 @@ run 1 "來源變了但區塊沒重產：--check 要紅" "跟現在的狀態對�
 # 重產之後就綠了 —— 沒有這條的話，「永遠報對不上」也會讓上一條通過。
 render
 run 0 "重產之後 --check 綠" ""
+
+# ── 耐久狀態自己也要被鎖住 ────────────────────────────────────────
+#
+# 上面那些斷言驗的是**終端機那一欄**（`_state_of`），而區塊寫的是
+# `_durable_of` —— 兩個是分開算的。外部審查實測：把耐久狀態的「全部封存」
+# 改成「任一封存」、或把聚合改成只看第一個 change，198 條全綠。
+
+# 一個封存、一個還在做：**區塊裡不可以是「已封存」**。
+baseline
+mkarchived app-c01-api
+mkchange app-c01-ui
+mkmarkers
+render
+run_block absent "混合狀態不准在區塊裡變成已封存" "| APP-C01 | 已封存 |"
+run_block have "混合狀態在區塊裡是規格已合併" "| APP-C01 | 規格已合併 |"
+
+# 兩個都封存：區塊裡才是「已封存」（陽性對照 —— 少了它，
+# 把耐久狀態一律算成「規格已合併」也會讓上面那條過）。
+baseline
+mkarchived app-c01-api app-c01-ui
+mkmarkers
+render
+run_block have "兩個都封存時區塊裡是已封存" "| APP-C01 | 已封存 |"
+
+# **依狀態排序，不依 ID。** 讀的人問的是「哪些做完了」——
+# 按 ID 排的話那幾項會被外部缺口埋在中間。
+#
+# fixture 要能分辨兩種排法：`DEP-G01` 的 ID 排在最後、狀態（已封存）排在最前，
+# `APP-O10`（常態）反過來。按 ID 排 → APP-O10 在前；按狀態排 → DEP-G01 在前。
+baseline
+mkarchived dep-g01-x
+mkmarkers
+render
+if python3 - "$W/docs/WBS.md" <<'ORDER'
+import io, sys
+t = io.open(sys.argv[1], encoding="utf-8").read()
+b = t[t.index("<!-- progress:start"):t.index("<!-- progress:end -->")]
+rows = [l.split("|")[1].strip() for l in b.splitlines()
+        if l.startswith("| ") and "|---" not in l and not l.startswith("| 項目")]
+sys.exit(0 if rows[:2] == ["DEP-G01", "APP-O10"] else 1)
+ORDER
+then echo "✓ 區塊依狀態排序，不依 ID"; PASS=$((PASS + 1))
+else echo "✗ 區塊沒有依狀態排序（已封存的 DEP-G01 要排在常態的 APP-O10 前面）"; bump_fail; fi
+
+# **兩種證據並列時兩個都要留。** `--json` 兩個都有，而區塊原本只印 commit，
+# change 從「依據」欄整個消失 —— 而區塊是大部分人唯一會看的地方。
+baseline
+mkchange evd-a01-x
+SHA3="$(mkcommit)"
+mkevid "change:evd-a01-x commit:$SHA3"
+mkmarkers
+render
+run_block have "並列證據：change 要出現在區塊裡" "evd-a01-x"
+run_block have "並列證據：commit 也要出現在區塊裡" "${SHA3:0:12}"
+
+# **指紋要雜湊整份 WBS，不是只有區塊前面那一段。** 把 marker 放在最前面，
+# 於是整份文件都在「區塊之後」；改最後面那一列，只雜湊前半的話指紋不會動。
+baseline
+mkmarkers_top
+render
+E1="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+# **等長的替換。** 改變長度的話，只雜湊前半的突變也會因為中點位移而變 ——
+# 那樣殺死它的是長度、不是位置，測不到「有沒有看整份」。
+edit "APP-O10 | 文件維護" "APP-O10 | 文件保養"
+render
+E2="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+if [ -n "$E1" ] && [ "$E1" != "$E2" ]; then
+  echo "✓ 區塊後面的內容變了，指紋也要變"; PASS=$((PASS + 1))
+else
+  echo "✗ 區塊後面的內容變了，指紋卻沒變（${E1} → ${E2}）"; bump_fail
+fi
 
 # **從遠端分支推的狀態不准進版控。** 分支開了或刪了、repo 沒有新 commit，
 # 寫進去的東西當下就過期。
