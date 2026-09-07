@@ -78,16 +78,27 @@ KINDS = {"vitest", "playwright", "command-negative", "manual-browser", "ci-job"}
 # openspec/changes/<id>/specs/ 底下 —— 只掃 main 的話，缺口要等到 archive
 # 才會被發現，而那時候實作早就合併了。
 #
-# **「範圍」很重要。** 一份 `## MODIFIED Requirements` 的 delta 本來就會重述
-# main 上同一條 Scenario（MODIFIED 是整塊取代，openspec 甚至強制你把同一個
-# Requirement 底下每一條都抄進來）。所以「同一個 ID 出現兩次」只有在**同一個
-# 範圍裡**才是錯的 —— 跨範圍出現是正常流程。
-# （實測：第一版沒分範圍，一開 change 就報六條假的重複。）
+# **只掃 `openspec/specs/`，不掃還沒 archive 的 change。**
+#
+# 第一版連 active change 的 delta 一起掃，理由是「只掃 main 的話缺口要等到
+# archive 才會被發現」。那個理由本身沒錯，但它**跟這個 repo 的流程互鎖**：
+#
+#     spec/<id> 分支依設計不能加測試（閘門只准動 openspec/changes/<id>/**）
+#     → 第一個 spec PR 就會紅，因為新 Scenario 還沒有測試
+#     → 合進 main 之後 main 一直紅，直到 feat PR 落地
+#
+# 實測（外部審查指出、我重現）：加一份 strict-valid、尚未實作的新 change，
+# rc=1、訊息是「FE-W06-S01 沒有任何通過的測試指著它」。**規格先行的流程被
+# 自己的覆蓋閘門鎖死了。**
+#
+# 所以判準改成：**一條 Scenario 進入 `openspec/specs/` 的那一刻要有人驗它。**
+# 那一刻就是 archive —— 而 archive 正是「這個 change 變成現況描述」的時點，
+# 也是 `AGENTS.md`〈完成的定義〉該生效的時點。
+#
+# 代價講清楚：實作階段漏掉的測試，要到 archive PR 才會紅。**沒有更早的
+# 選項** —— 提早驗就得知道「哪一個 feat slice 是最後一個」，而那件事機器
+# 分不出來（一個 change 可以有很多個 feat PR）。
 roots = [pathlib.Path("openspec/specs")]
-cdir = pathlib.Path("openspec/changes")
-if cdir.is_dir():
-    roots += [p / "specs" for p in cdir.iterdir()
-              if p.is_dir() and p.name != "archive"]
 
 scenarios = {}      # id -> 檔案:行
 exempt = {}         # id -> (種類, 證據, 理由)
@@ -95,7 +106,6 @@ files = 0
 for root in roots:
     if not root.is_dir():
         continue
-    seen_here = {}  # 這一個範圍裡看過的 ID
     for f in sorted(root.rglob("*.md")):
         files += 1
         cur = None
@@ -118,13 +128,11 @@ for root in roots:
                     cur = None
                     continue
                 cur = mid.group(1)
-                if cur in seen_here:
+                if cur in scenarios:
                     # **不可以靜靜合併。** `sort -u` 會把重複折疊掉，
                     # 於是「兩條不同的 Scenario 共用一個 ID」看起來像一條。
-                    die(f"Scenario ID {cur} 在同一個範圍裡出現不只一次"
-                        f"（{seen_here[cur]}、{f}:{i}）")
-                seen_here[cur] = f"{f}:{i}"
-                scenarios.setdefault(cur, f"{f}:{i}")
+                    die(f"Scenario ID {cur} 出現不只一次（{scenarios[cur]}、{f}:{i}）")
+                scenarios[cur] = f"{f}:{i}"
                 continue
             mv = VERIFY_RE.match(line)
             if mv:
@@ -148,10 +156,10 @@ for root in roots:
                 if len(parts[2]) < 8:
                     die(f"{cur} 的豁免沒有寫出實質理由（{f}:{i}）")
                     continue
-                if cur in exempt and exempt[cur][3] == root:
+                if cur in exempt:
                     die(f"{cur} 有不只一條 VERIFY-BY（{f}:{i}）")
                     continue
-                exempt[cur] = (kind, parts[1], parts[2], root)
+                exempt[cur] = (kind, parts[1], parts[2])
 
 if files == 0:
     die("一份規格檔都沒掃到 —— **掃不到不等於全部覆蓋**。"
@@ -198,6 +206,37 @@ stale = sorted(s for s in exempt if s in passed_ids)
 # Scenario 的範圍裡，改名等於換了範圍，那條豁免就變成別條的、或者沒有歸屬。
 # 不可達的防禦沒辦法被測試鎖住 —— 要嘛可達，要嘛不要留。
 
+# ── `ci-job` 的證據要真的存在 ────────────────────────────────────
+#
+# **這一類完全可以機器驗，不該是任意文字。**（外部審查指出：原本 `ci-job`
+# 的證據欄寫什麼都算數，跟「宣告即證據」沒有兩樣。）
+# 約定：證據欄要列出 `ci.yml` 裡的**步驟名稱**，用「／」或「/」分隔；
+# 每一個都必須真的是那份 workflow 的一個 `- name:`。
+if any(k == "ci-job" for k, *_ in exempt.values()):
+    wf = pathlib.Path(".github/workflows/ci.yml")
+    if not wf.is_file():
+        die("有 ci-job 豁免，但找不到 .github/workflows/ci.yml")
+        step_names = set()
+    else:
+        step_names = set(re.findall(r"^\s*-\s*name:\s*(.+?)\s*$",
+                                    wf.read_text(encoding="utf-8"), re.M))
+    for sid, (kind, ev, _why) in exempt.items():
+        if kind != "ci-job":
+            continue
+        # 證據欄裡把步驟名稱抓出來：切掉說明文字，只認列舉的那幾個名字。
+        named = [x.strip() for x in re.split(r"[／/、,，]", ev) if x.strip()]
+        # 「ci.yml 的 Lint／Typecheck／Test／Build 四個步驟」這種寫法：
+        # 第一段帶前綴、最後一段帶後綴，各自再切一次。
+        cleaned = []
+        for x in named:
+            m = re.search(r"([A-Za-z][A-Za-z0-9 _-]*)", x)
+            if m:
+                cleaned.append(m.group(1).strip())
+        hit = [c for c in cleaned if c in step_names]
+        if not hit:
+            die(f"{sid} 的 ci-job 豁免，證據欄 `{ev}` 裡沒有任何一個是 "
+                f"ci.yml 真的有的步驟名稱（現有：{'、'.join(sorted(step_names))}）")
+
 for s in missing:
     die(f"{s}（{scenarios[s]}）沒有任何通過的測試指著它，也沒有 VERIFY-BY 豁免")
 for s in stale:
@@ -215,7 +254,7 @@ if FAIL:
 print(f"✓ Scenario 覆蓋：{len(scenarios)} 條規格，"
       f"{len(scenarios) - len(exempt)} 條有通過的測試、{len(exempt)} 條豁免")
 for s in sorted(exempt):
-    k, ev, why, _root = exempt[s]
+    k, ev, why = exempt[s]
     print(f"    {s}  {k}｜{ev}｜{why}")
 PY
 RC=$?

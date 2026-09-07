@@ -23,7 +23,10 @@ bump_fail() { FAIL=$((FAIL + 1)); }
 # 每個案例都從乾淨的狀態出發，只壞一個地方。
 setup() {
   rm -rf "$W/repo"
-  mkdir -p "$W/repo/openspec/specs/demo" "$W/repo/bin" "$W/tmp"
+  mkdir -p "$W/repo/openspec/specs/demo" "$W/repo/bin" "$W/tmp" "$W/repo/.github/workflows"
+  # `ci-job` 豁免的證據欄要指到這裡面真的有的步驟名稱。
+  printf 'jobs:\n  ci:\n    steps:\n      - name: Lint\n        run: x\n      - name: Build\n        run: y\n' \
+    > "$W/repo/.github/workflows/ci.yml"
   ( cd "$W/repo" && git init -q \
     && git -c user.email=t@t.invalid -c user.name=t commit -q --allow-empty -m x )
   cat > "$W/repo/openspec/specs/demo/spec.md" <<'SPEC'
@@ -175,10 +178,28 @@ run 0 "有 VERIFY-BY 豁免就算過" "豁免"
 # 列舉裡的每一種都要真的被接受（陽性對照 —— 少了它，把某一種從列舉裡刪掉
 # 不會有任何測試變紅）。
 setup
-add_verify '- **VERIFY-BY** `ci-job`｜ci.yml 的四個步驟｜CI 的 job 本身就是這條的執行'
+add_verify '- **VERIFY-BY** `ci-job`｜ci.yml 的 Lint／Build 兩個步驟｜CI 的 job 本身就是這條的執行'
 FAKE_JSON='{"testResults":[{"assertionResults":[
   {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
 run 0 "ci-job 也是認得的豁免種類" "ci-job"
+
+# **`ci-job` 的證據完全可以機器驗，不該是任意文字。**（外部審查指出：
+# 原本寫什麼都算數，跟「宣告即證據」沒有兩樣。）
+setup
+add_verify '- **VERIFY-BY** `ci-job`｜ci.yml 的 Deploy 步驟｜CI 的 job 本身就是這條的執行'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "ci-job 指到不存在的步驟名稱要紅" "沒有任何一個是"
+
+setup
+python3 - "$W/repo/.github/workflows/ci.yml" <<'RM'
+import io, sys, os
+os.remove(sys.argv[1])
+RM
+add_verify '- **VERIFY-BY** `ci-job`｜ci.yml 的 Lint 步驟｜CI 的 job 本身就是這條的執行'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "有 ci-job 豁免卻找不到 ci.yml 要紅" "找不到 .github/workflows/ci.yml"
 
 # 種類是封閉列舉 —— 打錯字的豁免等於沒有豁免，但它看起來跟真的一模一樣。
 setup
@@ -223,31 +244,12 @@ printf '\n#### Scenario: [DEMO-01-S01] 重複的 ID\n\n- **WHEN** a\n- **THEN** 
 FAKE_JSON="$(json_all_pass)"
 run 1 "Scenario ID 重複要紅（不可以靜靜折疊）" "出現不只一次"
 
-# **MODIFIED delta 重述 main 上同一條 Scenario 不是重複。** openspec 甚至強制
-# 你把同一個 Requirement 底下每一條都抄進 MODIFIED 區塊 —— 所以「同一個 ID
-# 出現兩次」只有在同一個範圍裡才是錯的。（實測：第一版沒分範圍，一開 change
-# 就報六條假的重複，而那六條完全是正常流程。）
+# 同一份規格裡重複要紅（`sort -u` 會把兩條不同的 Scenario 折疊成一條）。
 setup
-mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
-{
-  printf '## MODIFIED Requirements\n\n### Requirement: 示範\n\n'
-  printf '#### Scenario: [DEMO-01-S01] 第一條\n\n- **WHEN** a\n- **THEN** b\n\n'
-  printf '#### Scenario: [DEMO-01-S02] 第二條\n\n- **WHEN** a\n- **THEN** b\n'
-} > "$W/repo/openspec/changes/demo-change/specs/demo/spec.md"
+printf '\n#### Scenario: [DEMO-01-S01] 又一條同 ID\n\n- **WHEN** a\n- **THEN** b\n' \
+  >> "$W/repo/openspec/specs/demo/spec.md"
 FAKE_JSON="$(json_all_pass)"
-run 0 "MODIFIED delta 重述同一條 Scenario 不算重複" "Scenario 覆蓋"
-
-# 但**同一個範圍裡**重複仍然要紅（陽性對照 —— 少了它，把重複檢查整個拿掉
-# 也不會有測試變紅）。
-setup
-mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
-{
-  printf '## MODIFIED Requirements\n\n### Requirement: 示範\n\n'
-  printf '#### Scenario: [DEMO-01-S01] 第一條\n\n- **WHEN** a\n- **THEN** b\n\n'
-  printf '#### Scenario: [DEMO-01-S01] 又一條同 ID\n\n- **WHEN** a\n- **THEN** b\n'
-} > "$W/repo/openspec/changes/demo-change/specs/demo/spec.md"
-FAKE_JSON="$(json_all_pass)"
-run 1 "同一個範圍裡重複仍然要紅" "同一個範圍裡出現不只一次"
+run 1 "Scenario ID 重複要紅" "出現不只一次"
 
 # **掃不到不等於全部覆蓋。** 目錄搬走、正規表示式寫壞，差集都會變成空的。
 setup
@@ -255,67 +257,33 @@ rm -rf "$W/repo/openspec/specs"
 FAKE_JSON="$(json_all_pass)"
 run 1 "一份規格檔都沒掃到要紅" "掃不到不等於全部覆蓋"
 
-# change 裡的 spec 也要算 —— 只掃 main 的話，缺口要等到 archive 才會出現，
-# 而那時候實作早就合併了。
-# **ID 文法要跟分支閘門同一份。** 寬鬆成 `[A-Z0-9-]+` 的話，`[BAD]` 配上一條
-# 標題含 `[BAD]` 的通過測試就 rc=0 全綠 —— 一個分支閘門會擋下來的 ID，
-# 在這裡卻算數。（外部審查實測的反例。）
-setup
-printf '\n#### Scenario: [BAD] 不合法的 ID\n\n- **WHEN** a\n- **THEN** b\n' \
-  >> "$W/repo/openspec/specs/demo/spec.md"
-FAKE_JSON='{"testResults":[{"assertionResults":[
-  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]},
-  {"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["demo"]},
-  {"title":"[BAD] 不合法","status":"passed","ancestorTitles":["demo"]}]}]}'
-run 1 "不合文法的 Scenario ID 要紅（不可以當成不存在）" "不合文法"
-
-# **豁免不可以跨出它的 Scenario。** 遇到 `### Requirement:` 之類的標題就
-# 結束範圍 —— 原本只在下一條 `#### Scenario:` 才換，於是寫在別的段落底下的
-# VERIFY-BY 會被算成上一條的豁免。（外部審查實測的反例。）
-setup
-printf '\n### Requirement: 另一個需求\n\n- **VERIFY-BY** `manual-browser`｜PR #1｜這條要真的畫面才驗得到\n' \
-  >> "$W/repo/openspec/specs/demo/spec.md"
-FAKE_JSON='{"testResults":[{"assertionResults":[
-  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
-run 1 "豁免寫在別的段落底下不算（孤兒）" "孤兒豁免"
-
-# 同一條有兩份豁免 —— 哪一份算數沒有唯一答案，不可以挑一個。
-setup
-add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜這條要真的畫面才驗得到'
-add_verify '- **VERIFY-BY** `playwright`｜PR #2｜另外一個理由寫在這裡'
-FAKE_JSON='{"testResults":[{"assertionResults":[
-  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
-run 1 "同一條有兩份豁免要紅" "不只一條"
-
-# 理由的長度門檻要真的擋得住 —— 降到 4 個字的話 `尚未確認` 就過關了。
-setup
-add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜尚未確認'
-FAKE_JSON="$(json_all_pass)"
-run 1 "四個字的理由不算實質理由" "沒有寫出實質理由"
-
-# **VERIFY-BY 要在行首的列表項上。** 放寬成「一行裡任何位置出現」的話，
-# 散文或程式碼區塊裡提到這個字串就會變成一張真的免死金牌。
-setup
-printf '\n這一段散文提到 - **VERIFY-BY** `manual-browser`｜PR #1｜只是在講解用法而已\n' \
-  >> "$W/repo/openspec/specs/demo/spec.md"
-FAKE_JSON='{"testResults":[{"assertionResults":[
-  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
-run 1 "散文裡提到 VERIFY-BY 不算豁免" "DEMO-01-S02"
-
-# **每一個測試檔的結果都要走。** vitest 一個檔案就是一個 testResults 條目，
-# 只讀第一個的話，第二個檔案以後的覆蓋全部消失。
-setup
-FAKE_JSON='{"testResults":[
-  {"assertionResults":[{"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["a"]}]},
-  {"assertionResults":[{"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["b"]}]}]}'
-run 0 "第二個測試檔的覆蓋也要算" "Scenario 覆蓋"
-
+# **還沒 archive 的 change 不算。** `spec/` 分支依設計不能加測試，所以連
+# active change 的 delta 一起掃的話，第一個 spec PR 就會紅 ——
+# 規格先行的流程會被自己的覆蓋閘門鎖死（外部審查指出、實測重現：
+# 加一份 strict-valid、尚未實作的 change，rc=1）。
 setup
 mkdir -p "$W/repo/openspec/changes/demo-change/specs/demo"
-printf '#### Scenario: [DEMO-02-S01] change 裡的\n\n- **WHEN** a\n- **THEN** b\n' \
+printf '## ADDED Requirements\n\n### Requirement: 新的\n\n#### Scenario: [DEMO-02-S01] 還沒實作\n\n- **WHEN** a\n- **THEN** b\n' \
   > "$W/repo/openspec/changes/demo-change/specs/demo/spec.md"
 FAKE_JSON="$(json_all_pass)"
-run 1 "change 裡的 spec 也要納入檢查" "DEMO-02-S01"
+run 0 "還沒 archive 的 change 不擋（否則 spec 先行流程鎖死）" "Scenario 覆蓋"
+
+# **但 archive 之後就要擋。** archive 會把 delta 折進 openspec/specs/，
+# 那一刻起它就是現況描述，必須有人驗它。
+setup
+printf '\n#### Scenario: [DEMO-01-S03] archive 之後的\n\n- **WHEN** a\n- **THEN** b\n' \
+  >> "$W/repo/openspec/specs/demo/spec.md"
+FAKE_JSON="$(json_all_pass)"
+run 1 "進了 openspec/specs 就一定要有人驗它" "DEMO-01-S03"
+
+# 已 archive 的 change 目錄不掃（它的內容已經折進 openspec/specs 了，
+# 再掃一次就是同一條算兩遍）。
+setup
+mkdir -p "$W/repo/openspec/changes/archive/2026-01-01-old/specs/demo"
+printf '#### Scenario: [DEMO-09-S01] 舊的\n\n- **WHEN** a\n- **THEN** b\n' \
+  > "$W/repo/openspec/changes/archive/2026-01-01-old/specs/demo/spec.md"
+FAKE_JSON="$(json_all_pass)"
+run 0 "archive 目錄裡的舊 delta 不掃" "Scenario 覆蓋"
 
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS + FAIL))"

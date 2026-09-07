@@ -982,9 +982,21 @@ mkcommit >/dev/null
 # **而且不可以把錯誤吞掉** —— 原本寫 `2>/dev/null`，於是它在 CI 上失敗、
 # SHA2 是空字串、`commit:` 後面沒東西，測到的變成「寫法不合文法」而不是
 # 「不在 HEAD 歷史裡」。fixture 自己 fail-open，本機看不到（實測：CI 才紅）。
-SHA2="$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+# **把身分來源縮到只剩明寫的那一份。**
+#
+# 這個修正原本只在「runner 剛好沒有身分」的機器上測得到 —— 拿掉下面那幾個
+# 環境變數，在有全域 git config 的機器上照樣 207/207 全過（外部審查實測）。
+#
+#   GIT_CONFIG_GLOBAL=/dev/null   不讀 ~/.gitconfig
+#   GIT_CONFIG_NOSYSTEM=1          不讀 /etc/gitconfig
+#   -c user.useConfigOnly=true     不准從 hostname／使用者名稱推導
+#
+# 三個一起，identity 就**只能**來自那四個環境變數；拿掉它們在任何機器上
+# 都必然紅。
+SHA2="$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
         GIT_COMMITTER_EMAIL=t@t.invalid \
-        git -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan)"
+        git -c user.useConfigOnly=true -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan)"
 [ -n "$SHA2" ] || { echo "✗ 測試腳本自己壞了：commit-tree 沒有產生 SHA"; bump_fail; }
 mkevid "commit:$SHA2"
 run 1 "commit 存在但不在 HEAD 歷史裡要紅" "不在目前 HEAD 的歷史裡"
