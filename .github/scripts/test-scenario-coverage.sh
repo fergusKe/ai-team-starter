@@ -172,6 +172,14 @@ FAKE_JSON='{"testResults":[{"assertionResults":[
   {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
 run 0 "有 VERIFY-BY 豁免就算過" "豁免"
 
+# 列舉裡的每一種都要真的被接受（陽性對照 —— 少了它，把某一種從列舉裡刪掉
+# 不會有任何測試變紅）。
+setup
+add_verify '- **VERIFY-BY** `ci-job`｜ci.yml 的四個步驟｜CI 的 job 本身就是這條的執行'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 0 "ci-job 也是認得的豁免種類" "ci-job"
+
 # 種類是封閉列舉 —— 打錯字的豁免等於沒有豁免，但它看起來跟真的一模一樣。
 setup
 add_verify '- **VERIFY-BY** `眼睛看過了`｜PR #1｜這條要真的畫面才驗得到'

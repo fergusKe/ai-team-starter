@@ -68,7 +68,9 @@ ANY_MD_HEAD_RE = re.compile(r"^#{1,6}\s")
 VERIFY_RE = re.compile(r"^\s*-\s*\*\*VERIFY-BY\*\*\s*(.+)$")
 # **封閉列舉。** 不認得的種類直接紅 —— 打錯字的豁免等於沒有豁免，
 # 而它看起來跟真的豁免一模一樣。
-KINDS = {"vitest", "playwright", "command-negative", "manual-browser"}
+# `ci-job`：CI 的 job 本身就是這條 Scenario 的執行。用在「四個工程品質指令
+# 都以 0 結束」那種 —— 在測試裡遞迴跑 `npm run build` 是沒有意義的。
+KINDS = {"vitest", "playwright", "command-negative", "manual-browser", "ci-job"}
 
 # ── 規格：main 上的，以及還在 change 裡的 ──────────────────────────
 #
