@@ -6,6 +6,7 @@
 #     bash .github/scripts/progress.sh --week W1
 #     bash .github/scripts/progress.sh --blocked  # 不在自己手上的，以及誰依賴它
 #     bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束
+#     bash .github/scripts/progress.sh --render   # 更新 docs/WBS.md 的進度區塊
 #
 # **這份是算出來的，不是寫出來的。** 沒有任何人維護它。
 #
@@ -106,12 +107,14 @@ SHOW_ALL=0
 ONLY_BLOCKED=0
 CHECK=0
 JSON=0
+RENDER=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)     SHOW_ALL=1 ;;
     --blocked) ONLY_BLOCKED=1 ;;
     --check)   CHECK=1 ;;
     --json)    JSON=1 ;;
+    --render)  RENDER=1 ;;
     --week)    shift; ONLY_WEEK="${1:-}" ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
@@ -139,13 +142,14 @@ elif ! git fetch -q origin 2>/dev/null; then
 fi
 
 SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" \
-REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
-import os, re, subprocess, pathlib, collections, unicodedata
+RENDER="$RENDER" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
+import os, re, sys, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
 ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 JSON = os.environ.get("JSON") == "1"
+RENDER = os.environ.get("RENDER") == "1"
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
 # 遠端 refs 是不是這一次抓下來的。**不新鮮的時候要說**，見上面 shell 那段。
 REMOTE_FRESH = os.environ.get("REMOTE_FRESH") == "1"
@@ -1253,6 +1257,11 @@ by_group = collections.defaultdict(collections.Counter)
 # 缺口 → 它擋住哪些項目。從各項目的「阻塞」欄反推，沒有人維護。
 blocks = collections.defaultdict(set)
 _state_of = {}
+# 「耐久狀態」：**從這份 tree 重建得出來的那一半。**
+# 「規格審查中」「實作中」「有分支」是從遠端分支推的 —— 分支開了或刪了、
+# repo 沒有新 commit，那個狀態當下就過期。把它寫進版控等於把一個當下的
+# 東西凍成一份紀錄，所以 WBS 的機器區塊只放這一份。
+_durable_of = {}
 for wid in order:
     info = wbs[wid]
     wk = sorted(info["weeks"])
@@ -1284,6 +1293,7 @@ for wid in order:
     cids = change_ids_for(wid)
     cid = change_label(cids)
     _e_ids, _e_shas = _evid.get(wid, ([], []))
+    durable = None   # 只有「看了遠端分支」的那一支要覆寫它
 
     # **有週次就是排得動。** 一個項目底下某一列被擋住，不代表整個項目做不了 ——
     # 那樣會把「可以先做一半」藏起來，而那正是最需要被看見的部分。
@@ -1342,6 +1352,14 @@ for wid in order:
             state, detail, colour = "規格審查中", f"{cid}", Y
         else:
             state, detail, colour = "有分支", f"{cid}", Y
+        # 同一次判斷裡把「不看遠端分支會是什麼」也算出來。
+        # **不要事後從 state 反推** —— 那是同一件事算兩次，遲早會分岔。
+        if states and all(s == "archived" for s in states):
+            durable = "已封存"
+        elif "active" in states:
+            durable = "規格已合併"
+        else:
+            durable = "未開始"
     # Alarm 不是狀態，是警示 —— 疊在算出來的狀態上，不取代它。
     if "Alarm" in marks:
         detail = (detail + " ⚠").strip()
@@ -1357,6 +1375,7 @@ for wid in order:
 
     tally[state] += 1
     _state_of[wid] = state
+    _durable_of[wid] = durable if durable is not None else state
     by_group[re.sub(r"[0-9]+$", "", wid)][state] += 1
     if ONLY_BLOCKED and state not in ("等外部", "待裁決"):
         continue
@@ -1526,6 +1545,127 @@ elif rows:
         pad = 20 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in name)
         print(f"{colour}{wid:<9} {name}{' ' * max(pad,1)}{weeks:<8} {pts:>3}  {state:<12} {detail}{X}")
     print()
+
+# ── docs/WBS.md 的機器區塊 ─────────────────────────────────────────
+#
+# **人只會打開 docs/WBS.md。** 進度以前只存在終端機輸出與不進版控的
+# docs/wbs.html —— 在 GitHub 上打開那份表，看不到任何完成資訊。
+#
+# 這一段把「哪些項目做完了」寫回表裡，但只寫**耐久狀態**：
+# 從這份 tree 重建得出來的那一半。遠端分支推出來的（規格審查中／實作中）
+# 不進來 —— 分支開了或刪了、repo 沒有新 commit，寫進去的東西當下就過期。
+BLOCK_START = "<!-- progress:start 這一段由 `progress.sh --render` 產生，不要手改 -->"
+BLOCK_END = "<!-- progress:end -->"
+
+
+def _digest_of(stripped):
+    """**這個區塊是從哪一份 WBS 原文產生的。不是 commit 的 SHA。**
+
+    不放 commit SHA 的理由：區塊在 commit 裡、SHA 又要放進區塊，
+    自我引用沒有不動點。
+
+    只雜湊「拿掉區塊之後的 WBS 原文」。**change 的狀態刻意不放進來** ——
+    它已經逐項寫在下面那張表裡了，再雜湊一次不會被任何東西觀察到
+    （實測：把 change 那一段從雜湊裡拿掉，198 條測試全綠 —— 它是一個
+    沒有讀者的成分）。這個 repo 自己的規矩是「要嘛可達，要嘛不要留」。
+
+    `tasks.md` 的勾也不放：每打一個勾就換一次指紋的話，這個區塊會變成每個
+    PR 都要重產的東西，而那個勾根本沒有顯示在區塊裡。
+    """
+    import hashlib
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
+
+
+def _strip_block(text):
+    """把既有的區塊拿掉，回傳 `(前段, 後段)`；沒有區塊就回 None。
+
+    **marker 各要恰好一個，而且順序正確。** 少一個、多一個、順序反了都
+    直接失敗 —— 那些情況下「區塊是哪一段」沒有唯一答案，猜一個就是 fail-open。
+    """
+    if text.count(BLOCK_START) != 1 or text.count(BLOCK_END) != 1:
+        return None
+    i = text.index(BLOCK_START)
+    j = text.index(BLOCK_END)
+    if j < i:
+        return None
+    return text[:i], text[j + len(BLOCK_END):]
+
+
+def _render_block(stripped):
+    """區塊的內容。**只放 ID、耐久狀態、依據** —— 名稱、週次、點數不複製。
+
+    複製過來的東西會跟上面那張表漂；而且每個 PR 都動到那幾欄，
+    衝突面積會大到沒有人願意維護它。
+    """
+    lines = [BLOCK_START, "",
+             "### 目前做到哪裡（機器產生）", "",
+             "**沒有列出來的項目就是「未開始」。**"
+             "「規格審查中」「實作中」不在這裡 —— 那兩個是從遠端分支推的，"
+             "不是這份 tree 重建得出來的，寫進版控當下就會過期。"
+             "要看那兩個狀態跑 `bash .github/scripts/progress.sh`。", "",
+             # **第一欄不可以叫 `ID`。** 這個區塊住在 docs/WBS.md 裡面，
+             # 而 WBS 的解析器認的表頭就是「第一欄是 ID、下一行是分隔線」——
+             # 叫 `ID` 的話它會被當成另一張工作分解表，然後因為只有三欄而報錯。
+             # （實測：`--check` 紅在「第 40 行是工作分解表的表頭，但只有 3 欄」。
+             # 產生出來的東西要能通過這份文件自己的文法，那也是驗收的一部分。）
+             "| 項目 | 狀態 | 依據 |", "|---|---|---|"]
+    n = 0
+    for wid in order:
+        st = _durable_of.get(wid, "")
+        if st in ("", "未開始"):
+            continue
+        _i, _s = _evid.get(wid, ([], []))
+        if _s:
+            why = "、".join("`" + x[:12] + "`" for x in _s)
+        else:
+            why = "、".join("`" + x + "`" for x in change_ids_for(wid)) or "—"
+        lines.append(f"| {wid} | {st} | {why} |")
+        n += 1
+    tal = collections.Counter(_durable_of[w] for w in order)
+    lines += ["",
+              "共 " + str(len(order)) + " 項："
+              + "、".join(f"{k} {v}" for k, v in sorted(tal.items(), key=lambda kv: -kv[1])),
+              "",
+              "來源指紋 `" + _digest_of(stripped) + "`"
+              "（這一段是從哪一份 WBS 原文產生的。不放 commit SHA —— "
+              "區塊在 commit 裡、SHA 又放進區塊的話，自我引用沒有不動點）",
+              "", BLOCK_END]
+    return "\n".join(lines)
+
+
+if RENDER or CHECK:
+    _wp = pathlib.Path("docs/WBS.md")
+    _txt = _wp.read_text(encoding="utf-8") if _wp.is_file() else None
+    if _txt is None:
+        if RENDER:
+            print("✗ 沒有 docs/WBS.md，沒有東西可以產生", file=sys.stderr)
+            raise SystemExit(1)
+    elif BLOCK_START not in _txt and BLOCK_END not in _txt:
+        # 兩個 marker 都沒有 —— 這個功能是選填的，沒開就是沒開。
+        if RENDER:
+            print("✗ docs/WBS.md 裡沒有這兩行，先手動加一次（放在你希望"
+                  "進度出現的位置）：", file=sys.stderr)
+            print("    " + BLOCK_START, file=sys.stderr)
+            print("    " + BLOCK_END, file=sys.stderr)
+            raise SystemExit(1)
+    else:
+        _parts = _strip_block(_txt)
+        if _parts is None:
+            violations.append(
+                "docs/WBS.md 的 progress marker 壞了："
+                "`progress:start` 與 `progress:end` 要各恰好一個、而且 start 在前")
+            if RENDER:
+                print(violations[-1], file=sys.stderr)
+                raise SystemExit(1)
+        else:
+            _want = _parts[0] + _render_block(_parts[0] + _parts[1]) + _parts[1]
+            if RENDER:
+                _wp.write_text(_want, encoding="utf-8")
+                print("✓ 已更新 docs/WBS.md 的進度區塊")
+            elif _want != _txt:
+                violations.append(
+                    "docs/WBS.md 的進度區塊跟現在的狀態對不上 —— "
+                    "跑 `bash .github/scripts/progress.sh --render` 再 commit")
 
 if violations:
     print()

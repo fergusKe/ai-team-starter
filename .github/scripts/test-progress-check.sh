@@ -282,6 +282,39 @@ mkchange() {
   done
 }
 
+# mkmarkers [start 行] [end 行]：把進度區塊的 marker 加進 fixture 的 WBS
+mkmarkers() {
+  {
+    printf '\n'
+    printf '%s\n' "${1:-<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->}"
+    printf '%s\n' "${2:-<!-- progress:end -->}"
+  } >> "$W/docs/WBS.md"
+}
+
+# render：在 fixture 上跑 --render，回傳它的退出碼
+render() { (cd "$W" && bash "$SCRIPT" --render >/dev/null 2>&1); }
+
+# run_block_has / run_block_absent <說明> <字串>：區塊裡有沒有這個字
+run_block() {
+  local mode="$1" desc="$2" needle="$3" body
+  body="$(python3 - "$W/docs/WBS.md" <<'EOF'
+import io, sys
+t = io.open(sys.argv[1], encoding="utf-8").read()
+a = t.find("<!-- progress:start")
+b = t.find("<!-- progress:end -->")
+print(t[a:b] if a >= 0 and b > a else "")
+EOF
+)"
+  if [ "$mode" = have ]; then
+    case "$body" in *"$needle"*) echo "✓ $desc"; PASS=$((PASS + 1)); return ;; esac
+    echo "✗ ${desc} —— 區塊裡沒有「${needle}」"
+  else
+    case "$body" in *"$needle"*) ;; *) echo "✓ $desc"; PASS=$((PASS + 1)); return ;; esac
+    echo "✗ ${desc} —— 區塊裡不該有「${needle}」，但它出現了"
+  fi
+  bump_fail
+}
+
 # mkevid <涵蓋證據那一格的內容> [表頭第八欄的字]：追加一張**八欄**的表
 #
 # 第八欄是選填的（只有需要的那張表加），所以 fixture 要能造出「同一份 WBS
@@ -953,6 +986,93 @@ mkchange evd-a01 evd-a01-other
 mkevid "change:evd-a01"
 run_field_has "證據非空就只認證據，不再混用命名推導" "EVD-A01" "evidence_changes" "evd-a01"
 run_all_absent "命名推導的第二個 change 不准偷偷加進來" "+1"
+
+
+# ── docs/WBS.md 的進度區塊 ────────────────────────────────────────
+#
+# **人只會打開 docs/WBS.md。** 進度以前只存在終端機輸出與不進版控的
+# `docs/wbs.html` —— 在 GitHub 上打開那份表，看不到任何完成資訊。
+
+# 沒有 marker 就是沒開這個功能，`--check` 不能因此紅（它是選填的）；
+# 但 `--render` 要講清楚怎麼開，不能默默什麼都不做。
+baseline
+run 0 "沒有 marker 時 --check 不紅（這個功能是選填的）" ""
+baseline
+if render; then echo "✗ 沒有 marker 時 --render 要失敗並教人怎麼開"; bump_fail
+else echo "✓ 沒有 marker 時 --render 失敗並教人怎麼開"; PASS=$((PASS + 1)); fi
+
+# 產生之後要綠，而且區塊裡真的有東西
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+run 0 "產生之後 --check 綠" ""
+run_block have "區塊列出有進度的項目" "| APP-C01 | 規格已合併 |"
+run_block have "區塊帶來源指紋" "來源指紋"
+
+# ★ **這一條是用來殺 identity renderer 的。**
+#
+# 「重產之後沒有 diff」只驗了**產出有沒有存檔**，沒驗**產出有沒有反映真實
+# 狀態**。把 renderer 改成「把現有內容原樣吐回去」，那種檢查永遠是綠的。
+# 這一條改的是**來源**（多開一個 change），區塊故意不重產 —— 正確的
+# renderer 會算出不一樣的東西所以紅；identity renderer 算出一模一樣的東西，
+# 於是**這條測試不會紅，測試套件自己就抓到了**。
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+mkchange app-p03-y
+run 1 "來源變了但區塊沒重產：--check 要紅" "跟現在的狀態對不上"
+
+# 重產之後就綠了 —— 沒有這條的話，「永遠報對不上」也會讓上一條通過。
+render
+run 0 "重產之後 --check 綠" ""
+
+# **從遠端分支推的狀態不准進版控。** 分支開了或刪了、repo 沒有新 commit，
+# 寫進去的東西當下就過期。
+baseline
+mkchange app-c01-x
+mkremote feat/app-c01-x--slice
+mkmarkers
+render
+run_block absent "區塊裡不准有「實作中」" "| APP-C01 | 實作中 |"
+run_block have "同一項在區塊裡是耐久狀態「規格已合併」" "| APP-C01 | 規格已合併 |"
+
+# marker 壞掉不可以用猜的 —— 那些情況下「區塊是哪一段」沒有唯一答案。
+baseline
+mkmarkers "<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->" "沒有結束 marker"
+run 1 "只有 start 沒有 end 要紅" "marker 壞了"
+
+baseline
+mkmarkers "<!-- progress:end -->" "<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->"
+run 1 "順序反了要紅" "marker 壞了"
+
+# 區塊**不複製**名稱、週次、點數 —— 複製過來的東西會跟上面那張表漂，
+# 而且每個 PR 都動到那幾欄，衝突面積會大到沒有人願意維護它。
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+run_block absent "區塊不複製項目名稱" "應用骨架"
+
+# **沒有進度的項目不列出來** —— 161 項全列進去，區塊會比表本身還長，
+# 而且「未開始」是預設值，列出來不帶任何資訊。
+run_block absent "未開始的項目不列出來" "| APP-P03 |"
+
+# 指紋要跟著輸入動。**沒有這一條，把指紋算成常數不會有人發現。**
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+D1="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+edit "APP-C01 | 應用骨架" "APP-C01 | 應用骨架改名"
+render
+D2="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+if [ -n "$D1" ] && [ "$D1" != "$D2" ]; then
+  echo "✓ WBS 內容變了，來源指紋跟著變"; PASS=$((PASS + 1))
+else
+  echo "✗ WBS 內容變了，來源指紋卻沒變（${D1} → ${D2}）"; bump_fail
+fi
 
 
 # 讀阻塞類型表要跟工作分解表**用同一份切列**（`split_row`）。
