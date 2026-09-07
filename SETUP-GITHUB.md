@@ -106,8 +106,14 @@ mv .github/CODEOWNERS.example .github/CODEOWNERS
 
 **但 `Spec` 那一關不要拿掉。** 它排在 `npm ci` 之後是刻意的 ——
 `npx openspec` 要先有 `node_modules` 才解析得到 lockfile 鎖住的那個版本。
-真的沒有 spec 變更的 change（純重構、工具、文件），在它的 `.openspec.yaml`
-標 `skip_specs: true`，不是把這一關刪掉。
+真的沒有 spec 變更的東西（純重構、工具、文件）**走 `chore/` 分支** ——
+那條通道不需要 change，代價是 20000 bytes 的上界。
+
+> ⚠️ **不要用 `.openspec.yaml` 的 `skip_specs: true`。** CLI 收這個旗標，
+> 但 `docs/DECISIONS.md`〈不提供 `skip_specs` 之類的流程豁免〉明文拒絕它：
+> 旗標一旦存在，「這算不算純工具變更」就回到語意判斷，而那正是路徑白名單
+> 失敗的同一個問題。`chore/` 做同一件事，但上界是**大小**，不看內容性質。
+> **這個旗標目前還沒有機器在擋 —— 那是已知缺口，見 `docs/DECISIONS.md`。**
 
 非 Node 專案沒有 lockfile 可以鎖，就改回釘死版本的
 `npx --yes @fission-ai/openspec@1.11.0`，並自己確保團隊裝的是同一版。

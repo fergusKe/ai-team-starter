@@ -167,6 +167,22 @@ git 預設做 rename 偵測，而 `--name-only` 對 rename **只顯示新路徑*
 而那正是路徑白名單失敗的同一個問題。`chore/` 分類做的是同一件事，
 但它的上界是**大小**（不看內容性質），而且不得碰 `openspec/` 與 `.github/`。
 
+**⚠️ 已知缺口（2026-09-07 外部審查實測）：這條政策目前沒有機器在執行。**
+OpenSpec CLI 自己收 `skip_specs: true` —— 一個只有 proposal、沒有任何
+Requirement／Scenario 的 change，`openspec validate --strict` 回 valid；
+而 `check-pr-branch.sh` 在 specs 目錄不存在時直接跳過 Scenario ID 檢查。
+兩者合起來的後果是具體的：**那份 proposal 合併進 main 之後，就能滿足
+`feat/` 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進沒有 bytes
+上界的實作通道** —— 「無規格變更只能走有大小上界的通道」這項機器保證失效。
+
+還是要人批准，所以不是自動繞過 review。但**只改文件不會改變這個結果**，
+所以 `SETUP-GITHUB.md` 那句警告不算修好，它只是讓缺口被看見。
+
+堵它的範圍很小（`spec/` 不接受 `skip_specs` 為真、沒有實際 delta 的 change
+不得通過），但要配負向測試，而負向 fixture 必須用**main 上沒有舊 Scenario ID
+的新 change**，否則會被「不准刪 Scenario ID」那條防禦擋掉 —— 那樣測到的
+不是這條防禦。**這是獨立的一輪，不要跟 CI 接線混在同一個 PR。**
+
 ---
 
 ## bypass 清單預設是空的

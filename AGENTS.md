@@ -102,7 +102,10 @@ archive/<change-id>       delta 同步進 openspec/specs/
 - **不得為了讓 `openspec validate` 過而編造 requirement。** 真的沒有 spec 變更
   （純重構、工具、文件），走 `chore/` 分支 —— 那條通道不需要 change。
   但它有 20000 bytes 的上界，而且不得碰 `openspec/` 與 `.github/`。
-  超過上界就代表它其實需要一份規格。
+  **超過上界不代表它需要一份規格** —— bytes 大小證明不了有行為變更。
+  超過就先拆成可以各自獨立合併、各自過檢查的小變更（只切檔案數、
+  但中間版本跑不起來，不算拆分）。真的拆不開又確實沒有規格變更，
+  **現行流程不支援，回來討論治理政策 —— 不要編一份 requirement 過關**。
 
 ## 寫規格的判準
 
@@ -179,8 +182,10 @@ change id 與 slice 的分界，不需要任何消歧邏輯。
 
 ### 引用 ID 的寫法
 
-`docs/WBS.md`、`docs/ROADMAP.md`、`AGENTS.md`、`CLAUDE.md`、`README.md`、
-`CONTEXT.md` 這六份裡提到的每一個 ID 都會被驗存在。**寫法只有這幾種**：
+**模板預設驗兩份**：`docs/WBS.md` 與 `docs/ROADMAP.md`。權威是
+`progress.sh` 開頭的 `REF_SOURCES` —— **要驗哪幾份去看那一行，不要相信文件裡的清單**
+（清單會漂；這一段之前就寫成六份，那是某個衍生專案的設定）。
+被驗的文件裡提到的每一個 ID 都要真的存在。**寫法只有這幾種**：
 
 ```
 APP-C01                單一個
@@ -278,7 +283,7 @@ bash .github/scripts/test-progress-check.sh
 
 ## 注意力預算
 
-**這套流程最終的信任錨是三個人的 approval，而 agent 的產出速度沒有上限。**
+**這套流程最終的信任錨是人的 approval，而 agent 的產出速度沒有上限。**
 
 上面所有的閘門都在保護「人類有批准」這件事，但**沒有任何機制能保護
 「人類批准的時候真的有在看」** —— approve 的簽章永遠是真的，
