@@ -596,6 +596,13 @@ ARCHIVE_IDENTITY
     # `docs/WBS.md` 也在清單裡：**它是 CI 在驗的產物。**
     # `progress.sh --check` 從它讀決策期限、fallback 與依賴，
     # 改它會直接改變閘門的判定，所以它屬於規則面，不是文件面。
+    # `prompts/` 也在清單裡：**它們是給人與 LLM 的操作規則**，而且
+    # `test-prompts.sh` 是一支真的合約測試（會抽出裡面的 shell 區塊實跑，
+    # 再把產生的分支拿去問這個閘門）。改了提示鏈就是改了流程 ——
+    # 那跟改 `AGENTS.md` 同一個性質，該被單獨看見。
+    # （實測：把〈完成的定義〉的驗證方式寫進 prompts/05 的那個 PR
+    #  被擋在「夾帶產品程式碼或規格」，而它一行程式碼都沒動。）
+    #
     # `docs/ROADMAP.md` 一起放進來的理由現在跟它一樣了：
     # `--check` 會掃它提到的每一個 ID，指到不存在的東西就紅。
     # （它本來只是治理選擇 —— 那時機器不讀它。排程從它身上刪掉之後，
@@ -605,7 +612,7 @@ ARCHIVE_IDENTITY
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1

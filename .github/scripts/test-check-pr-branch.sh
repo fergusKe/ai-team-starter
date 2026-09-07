@@ -394,6 +394,11 @@ run 0 main governance/setup-doc   "改 SETUP-GITHUB.md"       sh -c 'echo "x" >>
 # 「其他測試全過」不能證明這兩條走得通。
 run 0 main governance/wbs         "改 docs/WBS.md"           sh -c 'mkdir -p docs && echo "x" >> docs/WBS.md'
 run 0 main governance/roadmap     "改 docs/ROADMAP.md"       sh -c 'mkdir -p docs && echo "x" >> docs/ROADMAP.md'
+# prompts/ 是規則面：它們是給人與 LLM 的操作規則，而且 test-prompts.sh 是一支
+# 真的合約測試。改了提示鏈就是改了流程。
+# （實測：把驗證方式寫進 prompts/05 的那個 PR 被擋在「夾帶產品程式碼或規格」，
+#  而它一行程式碼都沒動。）
+run 0 main governance/prompts     "改 prompts/"              sh -c 'mkdir -p prompts && echo "x" >> prompts/05-verify.md'
 run 1 main governance/sneak-docs  "夾帶 docs/ 底下別的檔案"    sh -c 'mkdir -p docs && echo "x" > docs/RANDOM.md'
 run 1 main governance/sneak-code "夾帶產品程式碼"           sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main governance/sneak-spec "動 changes/"            sh -c 'echo "x" >> openspec/changes/demo-change/proposal.md'
