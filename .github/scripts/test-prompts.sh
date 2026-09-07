@@ -145,7 +145,11 @@ chmod +x "$W/bin/gh"
   # 把 02 的區塊裡的 placeholder 換成真的 id，然後照跑
   export PATH="$W/bin:$PATH" GH_LOG="$W/gh.log"
   printf '%s\n' "$B02" | sed "s/<change-name>/$CID/g" > "$W/block02.sh"
-  bash "$W/block02.sh"
+  # **`-e` 是必要的**：沒有它，區塊中途任何一句失敗都會被吞掉，後面照樣跑完，
+  # RC02 仍然是 0。2026-09-07 審查實測：把 `git add` 改成 `git add …; false`，
+  # 整支測試 17/17 全綠 —— 因為壞掉的那一步不影響最後一句的退出碼。
+  # 使用者是一句一句照著貼的，中途失敗他會看到；這裡要模擬那個行為。
+  bash -e "$W/block02.sh"
 ) >"$W/run02.log" 2>&1
 RC02=$?
 

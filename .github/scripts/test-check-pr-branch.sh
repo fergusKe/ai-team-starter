@@ -126,6 +126,21 @@ run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p d
 #
 # 這裡故意給一個**一定會失敗**的期望（合法的 chore 小改，卻期望 exit=1），
 # 斷言 run 判它紅。在子 shell 裡跑，計數不會被污染。
+# 先驗**計數**還活著。只看訊息的話，`FAIL=$((FAIL+1))` 被改成 `+0` 時
+# 訊息照樣印 —— 2026-09-07 審查實測，那個突變在只看訊息的版本下 72/72 存活。
+# （同一個錯我在 test-progress-check.sh 修過一次，這支漏了。）
+_fail_before=$FAIL
+run 1 main chore/selftest-count "自測（不計入）" sh -c 'echo "一行" >> README.md' >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  printf '  \033[32m✓\033[0m %-46s\n' "run 自測：失敗真的會被計進 \$FAIL"; PASS=$((PASS+1))
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %-46s\n' "run 自測：失敗沒有被計進 \$FAIL —— 綠燈是假的"
+fi
+# 不要再加 N —— 上面那次 `run` 自己已經加過了。加了的話總數會比
+# PASS+FAIL 多一，而「總數對不上」等於這份數字沒人在看。
+
 run_selftest_output="$(
   PASS=0; FAIL=0; N=800
   run 1 main chore/selftest-should-pass "自測（不計入）" sh -c 'echo "一行" >> README.md' 2>&1
@@ -181,6 +196,9 @@ if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "openspec" ] && [ "\$2" = "status" ];
     badjson) printf 'not-json\\n'; exit 0 ;;
     missing) printf '%s\\n' '{"artifacts":[]}'; exit 0 ;;
     unknown) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"future"}]}'; exit 0 ;;
+    blocked) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"blocked"}]}'; exit 0 ;;
+    dupspecs) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"done"},{"id":"specs","status":"skipped"}]}'; exit 0 ;;
+    exit7)   printf '%s\\n' '{"artifacts":[{"id":"specs","status":"done"}]}'; exit 7 ;;
   esac
 fi
 exec "$REAL_NPX" "\$@"
@@ -207,7 +225,7 @@ run_status() { # run_status <期望exit> <STATUS_MODE> <說明> <訊息片段>
   if [ "$got" = "$want" ] && grep -q -- "$needle" "$ROOT/c$N.out"; then
     printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
   else
-    printf '  \033[31m✗\033[0m %-46s 期望=%s／含「%s」，實際 exit=%s\n' "$want" "$desc" "$needle" "$got"
+    printf '  \033[31m✗\033[0m %-46s 期望=%s／含「%s」，實際 exit=%s\n' "$desc" "$want" "$needle" "$got"
     FAIL=$((FAIL+1)); sed 's/^/      /' "$ROOT/c$N.out" | head -5
   fi
 }
@@ -219,6 +237,11 @@ run_status 1 missing "artifacts 裡沒有 specs → 拒" "找不到 \`specs\` �
 run_status 1 unknown "status 是沒見過的值 → 拒"    "只接受 \`done\`"
 # 陽性對照：同一個 fixture、不攔 status 的話要綠。
 # 沒有它的話，上面四條可能只是「假 npx 把什麼都弄壞了」。
+run_status 1 blocked  "status = blocked → 拒"         "被擋住"
+# 合法 JSON ＋ 非零退出碼。`|| true` 會吞掉 rc，實測整支閘門回 rc=0。
+run_status 1 exit7    "status 印了合法 JSON 但 exit 7 → 拒" "以 exit 7 結束"
+# artifacts 裡兩筆 specs。取第一筆就 break 的話會挑到 done 而放行。
+run_status 1 dupspecs "artifacts 裡有兩筆 specs → 拒"  "有 2 筆"
 run_status 0 ""      "不攔 status 時同一份規格要過"  "spec 階段"
 
 echo "── 規格豁免封堵（新 change，main 上沒有它的 Scenario ID）──"

@@ -184,8 +184,19 @@ proposal、沒有任何 Requirement／Scenario 的 change，`openspec validate -
 
 閘門**不再自己判**「`specs/` 在不在、裡面有沒有 `#### Scenario:`」，
 改成讀 `openspec status --change <id> --json`，要求 `specs` artifact 的
-status 是 `done`。實測（1.11.0）的三個值：`done`（規格寫好了）、
-`ready`（還沒寫）、`skipped`（被旗標豁免，或檔案放在 discovery 看不到的位置）。
+status 是 `done`。1.11.0 的型別明列**四個**值：
+
+| 值 | 意思 |
+|---|---|
+| `done` | **output glob 找到檔案** —— 注意這**不等於「規格有效」** |
+| `ready` | 還沒寫（沒有 specs/，也沒設旗標） |
+| `skipped` | 被旗標豁免，或檔案放在 discovery 看不到的位置 |
+| `blocked` | 依賴的 artifact 還沒完成（例如連 proposal 都沒有） |
+
+`done` 的精確語意值得記一次：它只說「glob 找到輸出」。實測放一個
+`specs/demo/notes.md`（完全不是 delta spec）也會是 `done`。
+**內容有效性是後面 `openspec validate --strict` 在判的**，這兩關各管一半，
+不要把 `done` 讀成「規格寫好了」。
 
 **為什麼改**：第一版自己判，被打出一條**完整的安全繞過**（外部審查實測）：
 

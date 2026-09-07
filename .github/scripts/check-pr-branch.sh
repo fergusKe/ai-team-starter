@@ -167,11 +167,20 @@ SPEC_FLAG_HINT
     # JSON 用**環境變數**傳，不要用管線 —— `cmd | python3 - <<'EOF'` 裡
     # heredoc 會佔住 stdin，`sys.stdin.read()` 讀到的是空的，
     # 於是每一次都走「沒有輸出 → 拒」那條路。（實測踩過，測試當場抓到。）
-    STATUS_JSON="$(npx openspec status --change "$ID" --json 2>/dev/null || true)" \
+    # `|| true` 會吞掉 status 的非零退出碼 —— 實測（2026-09-07 審查）：
+    # 一個先吐出**完整合法 JSON**、再 `exit 7` 的 status，整支閘門回 rc=0。
+    # 指令失敗就是讀不到答案，不管它印了什麼。所以 rc 要一起傳下去判。
+    # `|| STATUS_RC=$?` 是必要的：`set -e` 之下，賦值裡的命令替換失敗會**直接把
+    # 腳本殺掉**（實測 exit 7），下面那段診斷訊息根本來不及印。方向雖然還是
+    # fail-closed，但使用者只會看到一個沒有解釋的退出碼。
+    STATUS_RC=0
+    STATUS_JSON="$(npx openspec status --change "$ID" --json 2>/dev/null)" || STATUS_RC=$?
+    STATUS_JSON="$STATUS_JSON" STATUS_RC="$STATUS_RC" \
     python3 - "$ID" <<'SPEC_IDENTITY'
 import sys, os, json
 cid = sys.argv[1]
 raw = os.environ.get("STATUS_JSON", "")
+rc = os.environ.get("STATUS_RC", "")
 
 def die(*msg):
     for m in msg: print(m, file=sys.stderr)
@@ -179,6 +188,9 @@ def die(*msg):
     print("  代價是 20000 bytes 的上界（不看內容性質）。", file=sys.stderr)
     sys.exit(1)
 
+if rc != "0":
+    die(f"✗ `openspec status --change {cid} --json` 以 exit {rc} 結束。",
+        "  指令失敗就是讀不到答案 —— 不管它印了什麼。fail-closed。")
 if not raw.strip():
     die(f"✗ `openspec status --change {cid} --json` 沒有輸出 —— 無法確認有沒有規格。",
         "  讀不到就當作沒有（fail-closed）。node_modules 裝好了嗎？")
@@ -188,19 +200,28 @@ except Exception as e:
     die(f"✗ `openspec status --change {cid} --json` 的輸出不是合法 JSON：{e}",
         "  解析不了就當作沒有（fail-closed）。")
 
-specs = None
-for a in data.get("artifacts") or []:
-    if isinstance(a, dict) and a.get("id") == "specs":
-        specs = a
-        break
-if specs is None:
+# **恰好一筆**。原本取第一筆就 break，於是
+#   {"artifacts":[{"id":"specs","status":"done"},{"id":"specs","status":"skipped"}]}
+# 會挑到 done 而放行（2026-09-07 實測 rc=0）。
+# 對一份宣稱 fail-closed 的 JSON 合約，歧義資料要拒絕，不是挑一筆用。
+matches = [a for a in (data.get("artifacts") or [])
+           if isinstance(a, dict) and a.get("id") == "specs"]
+if len(matches) == 0:
     die("✗ `openspec status` 的 artifacts 裡找不到 `specs` 這一項。",
         "  OpenSpec 換版改了輸出形狀會走到這裡 —— 認不得就拒，不要猜。")
+if len(matches) > 1:
+    die(f"✗ `openspec status` 的 artifacts 裡有 {len(matches)} 筆 `specs`。",
+        "  歧義的資料一律拒 —— 挑其中一筆用等於讓輸入決定要看哪個答案。")
+specs = matches[0]
 
-# 實測（openspec 1.11.0）的三個值：
-#   done     規格寫好了，OpenSpec 讀得到 delta
+# openspec 1.11.0 的型別明列四個值（instruction-loader.d.ts）：
+#   done     **output glob 找到檔案**——注意這不等於「規格有效」，
+#            內容有效性是後面 `openspec validate --strict` 在判的
 #   ready    還沒寫（沒有 specs/，也沒設旗標）
 #   skipped  被 skip_specs 豁免，或 spec 檔放在 discovery 看不到的位置
+#   blocked  依賴的 artifact 還沒完成（例如連 proposal 都沒有）
+#
+# 只接受 done。ready／skipped／blocked 都不是一個合法 spec PR 的狀態。
 #
 # spec/ 這條通道是「把談定的規格凍進 main」，所以**只接受 done**。
 # 其餘一律拒 —— 包含以後版本新增的值：認不得就拒，不要猜（fail-closed）。
@@ -213,6 +234,9 @@ if st == "skipped":
 if st == "ready":
     die(f"✗ OpenSpec 說 {cid} 的規格**還沒寫**（specs artifact status = ready）。",
         "  找不到任何 delta spec。spec/ 的 PR 要帶著寫好的規格，不是佔位。")
+if st == "blocked":
+    die(f"✗ OpenSpec 說 {cid} 的 specs 被擋住（specs artifact status = blocked）。",
+        "  它依賴的 artifact 還沒完成 —— 通常是連 proposal 都還沒寫。")
 if st != "done":
     die(f"✗ `specs` artifact 的 status 是 `{st}`，這支閘門只接受 `done`。",
         "  認不得的值一律拒（fail-closed）—— 放行等於把判斷交給一個沒人讀過的字串。")

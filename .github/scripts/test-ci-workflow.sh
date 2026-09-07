@@ -58,6 +58,15 @@ for i in range(c + 1, len(lines)):
         end = i; break
 job = lines[c:end]
 
+# 認不得的 key 寫法一律 parse-fail。
+# 2026-09-07 審查實測：`"i\u0066": false` 被真的 YAML parser 解成 `if: false`，
+# 而這支只認 bare 與單純 quoted 的 key，於是「沒看見就通過」——那是 fail-open。
+# 這裡不去支援 YAML 的全部跳脫語法（支援不完），改成**看到就拒**。
+for l in job:
+    if re.search(r"""^\s*['"][^'"]*\\[uUx][0-9A-Fa-f]""", l) or re.search(r"^\s*[?&*]", l):
+        die("YAML key 用了這支 parser 不支援的寫法（跳脫序列／anchor／複雜 key）：\n    "
+            + l.strip() + "\n  認不得就拒，不要猜。")
+
 steps, cur = [], None
 for l in job:
     if re.match(r"^      - ", l):
@@ -99,6 +108,8 @@ names   = [(field(s, "name") or "").strip() for s in steps]
 runs    = [field(s, "run") or "" for s in steps]
 coe     = [field(s, "continue-on-error") for s in steps]
 ifs     = [field(s, "if") for s in steps]
+# 自訂 shell 可以整步中和：`shell: bash {0} || true` 讓 run 怎麼寫都不會紅。
+shells  = [field(s, "shell") for s in steps]
 
 # job 層的鍵（縮排 4 格，不在 steps: 底下）。
 # 2026-09-07 審查抓到：原本只掃 step 層，`ci:` 底下加一行
@@ -135,6 +146,8 @@ put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
 put("job_continue_on_error", "1" if "continue-on-error" in job_keys else "0")
 # job 層的 `if: false` 會讓整個 job 被 skip，而 skip 在 required check 上算通過。
 put("job_if", "1" if "if" in job_keys else "0")
+# job 層的 defaults.run.shell 會套用到每一步，效果跟逐步加 shell: 一樣。
+put("job_defaults", "1" if "defaults" in job_keys else "0")
 
 # env 值要**完全相等**，不是「包含」。`prefix-${{ github.head_ref }}` 也含那串字，
 # 但傳進閘門的就不是分支名了（2026-09-07 審查的存活突變之一）。
@@ -148,7 +161,9 @@ put("branch_env_head_exact", "1" if e.get("HEAD_REF", "").strip() == "${{ github
 for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
     want = "bash .github/scripts/%s" % t_
     idxs = [i for i, r in enumerate(runs) if t_ in r]
-    put("exact_" + t_, "1" if any(runs[i].strip() == want and ifs[i] is None for i in idxs) else "0")
+    put("exact_" + t_, "1" if any(
+        runs[i].strip() == want and ifs[i] is None and shells[i] is None
+        for i in idxs) else "0")
     put("actual_" + t_, (runs[idxs[0]].strip() if idxs else ""))
 
 # npm ci 那一步也不得被 if: 關掉（關掉再在後面放一個真的，順序檢查會被騙過）。
@@ -219,9 +234,9 @@ GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
 # T5：四支閘門測試都要在 ci job 裡
 for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh; do
   if [ "$(get "exact_$t")" = "1" ]; then
-    ok "ci job 跑 ${t}，且 run 剛好是那一句、沒有 if:"
+    ok "ci job 跑 ${t}，run 剛好是那一句、沒有 if:／shell:"
   else
-    bad "ci job 跑 ${t}，且 run 剛好是那一句、沒有 if:" \
+    bad "ci job 跑 ${t}，run 剛好是那一句、沒有 if:／shell:" \
         "實際 run：$(get "actual_$t")（預期剛好 bash .github/scripts/${t}）"
   fi
 done
@@ -239,6 +254,10 @@ done
 [ "$(get job_if)" = "0" ] \
   && ok "ci job 自己沒有 if:" \
   || bad "ci job 自己沒有 if:" "job 層設了 if:，整個 job 可能被 skip 而算通過"
+# defaults.run.shell 會套到每一步，等於一次中和全部。
+[ "$(get job_defaults)" = "0" ] \
+  && ok "ci job 沒有 defaults:（不能用 defaults.run.shell 一次中和全部）" \
+  || bad "ci job 沒有 defaults:" "job 層設了 defaults，可能用 defaults.run.shell 中和每一步"
 
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS+FAIL))"
