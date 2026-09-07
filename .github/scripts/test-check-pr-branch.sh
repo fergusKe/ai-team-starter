@@ -15,7 +15,11 @@ set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
 GATE="$REPO/.github/scripts/check-pr-branch.sh"
-ROOT="$(mktemp -d -t gate-test)"
+# `mktemp -d -t PREFIX` 在 macOS 是「拿 PREFIX 當前綴」，在 GNU coreutils 卻是
+# 「TEMPLATE 相對於 TMPDIR」而且要求含 XXXXXX —— 少了就報錯、$() 收到空字串，
+# 於是所有路徑變成 /c53 這種。這支測試接進 CI 的第一次跑就是這樣紅的：
+# 在 macOS 永遠綠、在 ubuntu runner 永遠壞，而它之前不在 CI 裡所以沒人知道。
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gate-test.XXXXXXXX")"
 BASELINE="$ROOT/_baseline"
 PASS=0; FAIL=0; N=0
 
