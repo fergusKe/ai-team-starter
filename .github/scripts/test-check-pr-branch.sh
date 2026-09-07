@@ -106,7 +106,7 @@ run 0 main chore/tidy-readme   "小改"                     sh -c 'echo "一行"
 run 1 main chore/sneak-spec    "碰 openspec/"             sh -c 'echo "x: 1" >> openspec/config.yaml'
 run 1 main chore/sneak-ci      "碰 .github/"              sh -c 'echo "#" >> .github/workflows/ci.yml'
 run 1 main chore/symlink       "加 symlink"               sh -c 'ln -s /etc/passwd link.txt'
-run 1 main chore/binary        "加 binary（含 NUL）"       sh -c 'printf "PNG\x00\x01\x02\x03binary" > blob.bin'
+run 1 main chore/binary        "加 binary（含 NUL）"       sh -c '{ printf PNG; head -c 4 /dev/zero; printf binary; } > blob.bin'
 run 1 main chore/huge          "超過 bytes 上限"           sh -c 'head -c 30000 /dev/zero | tr "\0" "a" > big.txt'
 run 1 main chore/minified      "一行 minified"             sh -c 'head -c 30000 /dev/zero | tr "\0" "x" | tr -d "\n" > min.js'
 run 0 main chore/lockfile-bump "大 lockfile 不計入大小"     sh -c 'head -c 40000 /dev/zero | tr "\0" "b" > package-lock.json'
