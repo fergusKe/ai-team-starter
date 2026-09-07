@@ -748,6 +748,20 @@ if wbs_path.exists():
             in_table = len(cells) >= 5
             if in_table:
                 ncols = len(cells)
+            # **前七欄的位置是固定的，第八欄只能是「涵蓋證據」。**
+            # 這一欄是選填的（只有需要的那張表加），所以不能靠位置猜 ——
+            # 加在別的位置、或加了第九欄，底下每一列的意思都會跟著移位，
+            # 而畫面上還是一張正常的表。
+            if in_table and len(cells) >= 8:
+                _h8 = plain(cells[7])
+                if _h8 != "涵蓋證據":
+                    violations.append(
+                        f"docs/WBS.md 第 {lineno} 行：工作分解表的第 8 欄表頭是"
+                        f"「{_h8}」，只能是「涵蓋證據」")
+                if len(cells) > 8:
+                    violations.append(
+                        f"docs/WBS.md 第 {lineno} 行：工作分解表最多 8 欄，"
+                        f"這張表有 {len(cells)} 欄")
             found_table = found_table or in_table
             cur = None
             continue
@@ -781,6 +795,12 @@ if wbs_path.exists():
         # 第六、七欄是選填的。舊的五欄表格照樣讀得動。
         blocked = cells[5].strip() if len(cells) > 5 else ""
         mark = cells[6].strip() if len(cells) > 6 else ""
+        # 第八欄「涵蓋證據」也是選填的。它解的是這個盲區：
+        # 一項工作**做完了，但沒有跟它同名的 change**，於是永遠算不出狀態。
+        # 實例：`FE-O10 CI 補齊` 有自己的 PR，但改 `.github/` 只能走
+        # `governance/`，而 `governance/` 不准碰 `openspec/` —— 規則互斥造成
+        # 的結構性盲區，不是誰忘了開 change。
+        evid = cells[7].strip() if len(cells) > 7 else ""
         is_id_row = bool(re.fullmatch(ID_RE, wid))   # 跟引用掃描同一份文法
         # 第一欄有東西、卻不是合法 ID —— 例如 `FE-P3` 少打一個 0 ——
         # 原本會被當成上一個項目的續行，把內容默默併過去。**要報。**
@@ -796,7 +816,7 @@ if wbs_path.exists():
             wbs[wid] = {"name": name, "weeks": set(), "pts": 0,
                         "blocked": "", "mark": "", "blockers": set(),
                         "deadline": None, "fallback": False, "rows": [],
-                        "detail": []}
+                        "detail": [], "evidence": ""}
             order.append(wid)
         if cur is None:
             # 表格的第一筆資料列沒有 ID —— 漏貼或誤刪都很平常，
@@ -854,6 +874,16 @@ if wbs_path.exists():
                 wbs[cur]["fallback"] = True
             else:
                 violations.append(f"{cur}：`【沒答案就】` 後面沒有寫出實質的處置")
+        # **涵蓋證據只寫在項目的第一列。** 寫在續行的話，讀的人會以為它只涵蓋
+        # 那一列的工作，而機器是把它套在整個項目上 —— 兩種讀法不一樣，
+        # 而且沒有任何跡象。與其挑一種，不如不准。
+        if evid:
+            if not is_id_row:
+                violations.append(
+                    f"{cur}（docs/WBS.md 第 {lineno} 行）：涵蓋證據要寫在項目的"
+                    f"第一列（有 ID 的那一列），不能寫在續行")
+            else:
+                wbs[cur]["evidence"] = evid
         if pts.isdigit():
             wbs[cur]["pts"] += int(pts)
         # 每一列的阻塞都要收 —— 一個項目底下常常只有某幾列被擋住
@@ -1092,6 +1122,93 @@ def setup_todo():
     return todo
 
 
+EVID_CHANGE = re.compile(r"^change:([a-z0-9]+(?:-[a-z0-9]+)*)$")
+EVID_COMMIT = re.compile(r"^commit:([0-9a-f]{40})$")
+
+
+def _commit_state(sha):
+    """這個 commit 在不在**這份 tree 的歷史**裡。
+
+    回傳 `ok` / `missing`（本機沒有這個物件）/ `not-ancestor`（有這個物件，
+    但它不在 HEAD 的祖先鏈上 —— 例如還在別人的分支上沒有合併）。
+
+    **`missing` 跟 `not-ancestor` 不可以混為一談。** 前者可能只是遠端不新鮮
+    （淺 clone、還沒 fetch），後者是「這個證據真的還沒進來」。
+    講錯的話，會叫人去查一個根本不存在的問題。
+    """
+    try:
+        r = subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"],
+                           capture_output=True)
+        if r.returncode != 0:
+            return "missing"
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+                           capture_output=True)
+        return "ok" if r.returncode == 0 else "not-ancestor"
+    except Exception:
+        return "missing"
+
+
+def parse_evidence(wid, raw):
+    """把「涵蓋證據」那一格拆成 `change:` 與 `commit:` 兩種指標。
+
+    回傳 `(change_ids, commits, errors)`。
+
+    **這一欄非空的時候，它就是完整的對應** —— 不再偷偷混用
+    `FE-O10 → fe-o10-*` 的命名推導。兩種來源同時生效的話，
+    「這個狀態是從哪裡來的」就沒有單一答案了。
+
+    機器能證明的只有「證據存在、而且已經合併」。**它證明不了那個 commit
+    在語意上真的完成了這一項** —— 那一格仍然要人讀 diff。
+    """
+    ids, shas, errs, seen = [], [], [], set()
+    for part in re.split(r"[\s、,，]+", raw.strip()):
+        if not part:
+            continue
+        if part in seen:
+            errs.append(f"{wid}：涵蓋證據的 `{part}` 寫了不只一次")
+            continue
+        seen.add(part)
+        m = EVID_CHANGE.match(part)
+        if m:
+            cid = m.group(1)
+            if cid not in changes:
+                errs.append(f"{wid}：涵蓋證據指到 `{cid}`，"
+                            f"但 openspec/changes/ 與 archive/ 裡都沒有它")
+            else:
+                ids.append(cid)
+            continue
+        m = EVID_COMMIT.match(part)
+        if m:
+            sha = m.group(1)
+            st = _commit_state(sha)
+            if st == "missing":
+                errs.append(f"{wid}：涵蓋證據的 commit `{sha[:12]}` "
+                            f"在本機找不到（還沒 fetch？淺 clone？）")
+            elif st == "not-ancestor":
+                errs.append(f"{wid}：涵蓋證據的 commit `{sha[:12]}` "
+                            f"不在目前 HEAD 的歷史裡 —— 還沒合併的東西不算證據")
+            else:
+                shas.append(sha)
+            continue
+        errs.append(f"{wid}：涵蓋證據的 `{part}` 不是認得的寫法"
+                    f"（只有 `change:<change-id>` 與 `commit:<40 位完整 SHA>`；"
+                    f"短 SHA 不算 —— 它會隨著 repo 長大而變得不唯一）")
+    return ids, shas, errs
+
+
+# 每一項的證據**只解析一次**，錯誤在這裡一次收完 ——
+# 解析兩次就有兩種結果的可能，那正是這支腳本到處在防的事。
+_evid = {}
+for _w in order:
+    _raw = wbs[_w].get("evidence", "")
+    if _raw:
+        _i, _s, _e = parse_evidence(_w, _raw)
+        violations.extend(_e)
+        _evid[_w] = (_i, _s)
+    else:
+        _evid[_w] = ([], [])
+
+
 def change_ids_for(wid):
     """狀態計算要用的**清單**（可能是空的）。顯示用的字串在 `change_label()`。
 
@@ -1110,6 +1227,11 @@ def change_ids_for(wid):
     根因不是判斷寫錯，是**顯示字串與查詢鍵共用同一個回傳值** ——
     所以這裡拆成兩支：算狀態的拿清單，印出來的才做格式化。
     """
+    # **涵蓋證據非空的時候，它就是完整的對應。** 不再回退到命名推導 ——
+    # 兩種來源同時生效的話，「這個狀態是從哪裡來的」就沒有單一答案了。
+    _e_ids, _e_shas = _evid.get(wid, ([], []))
+    if _e_ids or _e_shas:
+        return _e_ids
     hits = changes_for(wid)
     if not hits:
         hits = [c for c in branches if c == wid.lower()
@@ -1161,6 +1283,7 @@ for wid in order:
     # 多個 change 時它是 `"fe-x01-a +1"` 這種顯示字串，查不到任何東西。
     cids = change_ids_for(wid)
     cid = change_label(cids)
+    _e_ids, _e_shas = _evid.get(wid, ([], []))
 
     # **有週次就是排得動。** 一個項目底下某一列被擋住，不代表整個項目做不了 ——
     # 那樣會把「可以先做一半」藏起來，而那正是最需要被看見的部分。
@@ -1179,6 +1302,16 @@ for wid in order:
             state, detail, colour = "矛盾", f"標 Cancelled 但 {cid} 已封存", R
         else:
             state, detail, colour = "已取消", reason, D
+    elif not cids and _e_shas:
+        # 有 commit 證據、但沒有對應的 change。**這是規則互斥造成的盲區**
+        # （改 `.github/` 只能走 `governance/`，而 `governance/` 不准碰
+        # `openspec/`），不是誰忘了開 change。
+        #
+        # 狀態叫「已完成」不叫「已封存」—— **機器只證明了那個 commit 存在
+        # 而且已經合併，沒有證明它在語意上真的做完這一項。** 借用 OpenSpec
+        # 的字會讓兩種強度不同的結論長得一樣。
+        _more = f" +{len(_e_shas) - 1}" if len(_e_shas) > 1 else ""
+        state, detail, colour = "已完成", f"commit:{_e_shas[0][:12]}{_more}", G
     elif not cids and not schedulable and (blocked or mark_word in ("Pending", "TBD")):
         state = "待裁決" if mark_word == "TBD" else "等外部"
         detail, colour = blocked or mark, R
@@ -1345,6 +1478,11 @@ if JSON:
             "pts": info["pts"], "blockers": sorted(info["blockers"]),
             "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
             "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
+            # 涵蓋證據：原文 ＋ 解析結果。**兩個都要** —— 原文是人寫的東西，
+            # 解析結果是機器信的東西，只給後者的話就沒辦法看出兩者對不上。
+            "evidence": info.get("evidence", ""),
+            "evidence_changes": _evid.get(wid, ([], []))[0],
+            "evidence_commits": _evid.get(wid, ([], []))[1],
             # **change 的關聯以前只存在於終端機表格。** `--json` 是網頁與
             # Excel 的唯一資料來源，那邊看不到就等於這件事沒有被算過 ——
             # 而「同一個 ID 開了兩個 change」這種事更是完全看不出來。
