@@ -111,7 +111,7 @@ if not inst: die("ci job 裡找不到 `run: npm ci`")
 put("install_before_branch", "1" if min(inst) < bi else "0")
 put("install_idx", str(min(inst))); put("branch_idx", str(bi))
 
-for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh"):
+for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
     put("has_" + t, "1" if any(t in r for r in runs) else "0")
 
 put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
@@ -158,8 +158,8 @@ GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
   && ok "npm ci 排在 Branch 之前" \
   || bad "npm ci 排在 Branch 之前" "npm ci 在第 $(get install_idx) 步、Branch 在第 $(get branch_idx) 步"
 
-# T5：三支閘門測試都要在 ci job 裡
-for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh; do
+# T5：四支閘門測試都要在 ci job 裡
+for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh; do
   [ "$(get "has_$t")" = "1" ] && ok "ci job 有跑 $t" || bad "ci job 有跑 $t" "workflow 裡找不到這一步"
 done
 

@@ -83,6 +83,33 @@ run() { # run <期望exit> <base> <分支> <說明> <造檔案的指令...>
 echo "── base 檢查 ──"
 run 1 dev  feat/demo-change--x "base 不是 main"          sh -c 'mkdir -p src && echo a > src/a.ts'
 
+# run 只看 exit code。但一個案例可能因為**別的**防禦而紅，那樣斷言就指不到
+# 被測的東西（這個 repo 抓過六種這類形狀，見 docs/DECISIONS.md）。
+# 新加的三條防禦都要能被別的東西搶先擋掉，所以它們用這一支：連訊息一起驗。
+run_msg() { # run_msg <期望exit> <base> <分支> <說明> <訊息片段> <造檔案的指令...>
+  local want="$1" base="$2" br="$3" desc="$4" needle="$5"; shift 5
+  N=$((N+1))
+  local W="$ROOT/c$N"
+  git clone -q "$BASELINE" "$W" 2>/dev/null
+  echo node_modules >> "$W/.git/info/exclude"
+  ln -s "$REPO/node_modules" "$W/node_modules" 2>/dev/null
+  ( cd "$W" && git config user.email t@t && git config user.name t \
+    && git checkout -qb "$br" && "$@" >/dev/null 2>&1
+    git add -A >/dev/null 2>&1; git commit -qm x >/dev/null 2>&1 )
+  ( cd "$W" && bash "$GATE" "$base" "$br" ) >"$ROOT/c$N.out" 2>&1
+  local got=$?
+  if [ "$got" = "$want" ] && grep -q -- "$needle" "$ROOT/c$N.out"; then
+    printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
+  else
+    if [ "$got" != "$want" ]; then
+      printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"
+    else
+      printf '  \033[31m✗\033[0m %-46s exit 對但訊息不含「%s」\n' "$desc" "$needle"
+    fi
+    FAIL=$((FAIL+1)); sed 's/^/      /' "$ROOT/c$N.out" | head -6
+  fi
+}
+
 echo "── spec/ ──"
 run 0 main spec/demo-change "只動自己的 change"          sh -c 'echo "" >> openspec/changes/demo-change/proposal.md'
 run 0 main spec/demo-change "可以加 ADR"                 sh -c 'mkdir -p docs/adr && echo "# ADR" > docs/adr/0001-x.md'
@@ -90,6 +117,33 @@ run 1 main spec/demo-change "夾帶產品程式碼"              sh -c 'mkdir -p
 run 1 main spec/demo-change "動別人的 change"             sh -c 'mkdir -p openspec/changes/other && echo x > openspec/changes/other/proposal.md'
 run 1 main spec/Bad--Id     "id 格式不合"                 sh -c 'echo x > z.md'
 run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p docs/adr && echo x > docs/adr/0002-y.md'
+
+echo "── 規格豁免封堵（新 change，main 上沒有它的 Scenario ID）──"
+# 用 fresh-change 而不是 demo-change：demo-change 的 Scenario ID 已經在 main 上，
+# 這幾個 fixture 會被「刪掉 main 上的 Scenario」那條防禦先擋掉，
+# 於是 exit=1 是真的、但擋它的不是我們要測的防禦。訊息斷言會抓出這種情況。
+run_msg 1 main spec/fresh-change "skip_specs 旗標一律拒" "不提供規格豁免旗標" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "schema: spec-driven\nskip_specs: true\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+run_msg 1 main spec/fresh-change "沒有 delta spec 不得走 spec/" "沒有任何 delta spec" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+run_msg 1 main spec/fresh-change "specs/ 在但一條 Scenario 都沒有" "沒有任何 \`#### Scenario:\`" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/demo
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n有目錄沒內容。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 空殼\n系統 SHALL 做某件事。\n" > openspec/changes/fresh-change/specs/demo/spec.md'
+
+# 陽性對照：一份正常的新規格要綠，否則上面三條可能只是「所有新 change 都被擋」。
+run 0 main spec/fresh-change "正常的新規格照樣過" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/demo
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n新功能。\n\n## What Changes\n- 加一條\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 新需求\n系統 SHALL 提供新行為，並在輸入不合法時回錯誤。\n\n#### Scenario: [FRESH-01-S01] 正常路徑\n- **WHEN** 觸發\n- **THEN** 成功\n\n#### Scenario: [FRESH-01-S02] 不合法\n- **WHEN** 輸入不合法\n- **THEN** 回錯誤\n" > openspec/changes/fresh-change/specs/demo/spec.md'
 
 echo "── feat/ fix/ ──"
 run 0 main feat/demo-change--slice "change 已在 main"     sh -c 'mkdir -p src && echo a > src/a.ts'

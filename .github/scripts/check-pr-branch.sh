@@ -104,6 +104,60 @@ case "$HEAD" in
       exit 1
     fi
 
+    # ── 規格豁免：三條政策檢查，排在 `openspec validate` 之前 ────────────────
+    #
+    # 為什麼要在 validate **之前**：CLI 自己遇到「沒有 delta」時，錯誤訊息會說
+    #   「set "skip_specs: true" in the change's .openspec.yaml instead」
+    # —— 它在推薦這個 repo 明文禁止的東西（docs/DECISIONS.md〈不提供 skip_specs
+    # 之類的流程豁免〉）。排在後面的話，使用者先看到的是那句錯誤的建議。
+    #
+    # 這也是這三條為什麼不能只當「縱深防禦」放在後面：驗證過了 —— 放在 validate
+    # 之後它們**永遠跑不到**，而跑不到的防禦沒辦法被測試鎖住，
+    # 那就是〈一條恆真的測試比沒有測試更糟〉那條。要嘛可達，要嘛不要留。
+    #
+    # 洞本身（2026-09-07 實測）：`skip_specs: true` ＋ 只有 proposal 的 change，
+    # `openspec validate --strict` 回 valid rc=0。那份 proposal 合併進 main 之後
+    # 就滿足 feat/ 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進
+    # **沒有 bytes 上界**的實作通道 —— 「無規格變更只走有大小上界的通道」失效。
+    python3 - "$ID" <<'SPEC_EXEMPTION'
+import sys, re, pathlib
+cid = sys.argv[1]
+base = pathlib.Path("openspec/changes") / cid
+
+def die(*msg):
+    for m in msg: print(m, file=sys.stderr)
+    print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
+    print("  代價是 20000 bytes 的上界（不看內容性質，所以沒有語意判斷的空間）。", file=sys.stderr)
+    sys.exit(1)
+
+# 1. 豁免旗標：拒的是「這個鍵出現」，不是「它的值為真」。
+#    判斷真假就要解析 YAML 的 truthiness，而 `skip_specs: "false"`（字串）
+#    在不同解析器可能是真 —— 那又是一個 fail-open 的表面。
+#    政策說**不提供**這個旗標，所以它出現本身就是違規。fail-closed。
+cfg = base / ".openspec.yaml"
+if cfg.is_file():
+    for ln, line in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
+        if re.match(r"^\s*skip_specs\s*:", line):
+            die(f"✗ openspec/changes/{cid}/.openspec.yaml:{ln} 出現 skip_specs。",
+                f"    {line.strip()}",
+                "  這個 repo 不提供規格豁免旗標。",
+                "  （OpenSpec CLI 的錯誤訊息會建議你設這個旗標 —— 那句建議對這個 repo 不適用。）")
+
+# 2. 沒有任何 delta spec。spec/ 這條通道的存在理由就是把規格談定並凍進 main。
+specs = base / "specs"
+if not specs.is_dir():
+    die(f"✗ openspec/changes/{cid}/specs/ 不存在 —— 這個 change 沒有任何 delta spec。",
+        "  spec/ 是用來把規格談定並凍進 main 的，沒有規格就沒有東西可以凍。")
+
+# 3. 目錄在、檔案在，但一條 `#### Scenario:` 都沒有 —— 空殼跟沒有是同一件事。
+n = sum(1 for f in specs.rglob("*.md")
+          for line in f.read_text(encoding="utf-8").splitlines()
+          if line.startswith("#### Scenario:"))
+if n == 0:
+    die(f"✗ openspec/changes/{cid}/specs/ 裡沒有任何 `#### Scenario:`。",
+        "  一份沒有 Scenario 的 delta spec 不構成可驗收的規格。")
+SPEC_EXEMPTION
+
     npx openspec validate "$ID" --strict
 
     # Scenario 穩定 ID。
@@ -116,8 +170,11 @@ case "$HEAD" in
 import sys, re, pathlib, subprocess
 cid, base = sys.argv[1], sys.argv[2]
 root = pathlib.Path("openspec/changes") / cid / "specs"
+# 上面的〈規格豁免〉那段已經保證 specs/ 存在且至少有一條 Scenario，
+# 所以這裡到不了。留著是純防禦，不重複那邊的訊息 ——
+# 同一件事寫在兩個地方一定會漂。
 if not root.is_dir():
-    sys.exit(0)                       # 沒有 delta spec 的 change，交給 validate 管
+    sys.exit(1)
 
 ID_RE  = re.compile(r"^\[([A-Z0-9]+(?:-[A-Z0-9]+)*-S[0-9]{2})\]\s+\S")
 HEAD_RE = re.compile(r"^####\s+Scenario:\s*(.*)$")
