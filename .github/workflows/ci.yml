@@ -131,6 +131,12 @@ jobs:
       - name: Workflow contract tests
         run: bash .github/scripts/test-ci-workflow.sh
 
+      # 提示檔自己的合約測試：文件教的操作，閘門收不收得下。
+      # 它會照 prompts/02 的 shell 區塊真的開一次分支，再拿去問閘門 ——
+      # 「教錯分支前綴」這種錯之前活了很久，因為沒有東西在讀提示檔。
+      - name: Prompts contract tests
+        run: bash .github/scripts/test-prompts.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——

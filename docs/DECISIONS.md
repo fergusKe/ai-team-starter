@@ -167,21 +167,37 @@ git 預設做 rename 偵測，而 `--name-only` 對 rename **只顯示新路徑*
 而那正是路徑白名單失敗的同一個問題。`chore/` 分類做的是同一件事，
 但它的上界是**大小**（不看內容性質），而且不得碰 `openspec/` 與 `.github/`。
 
-**⚠️ 已知缺口（2026-09-07 外部審查實測）：這條政策目前沒有機器在執行。**
-OpenSpec CLI 自己收 `skip_specs: true` —— 一個只有 proposal、沒有任何
-Requirement／Scenario 的 change，`openspec validate --strict` 回 valid；
-而 `check-pr-branch.sh` 在 specs 目錄不存在時直接跳過 Scenario ID 檢查。
-兩者合起來的後果是具體的：**那份 proposal 合併進 main 之後，就能滿足
-`feat/` 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進沒有 bytes
-上界的實作通道** —— 「無規格變更只能走有大小上界的通道」這項機器保證失效。
+**這條政策原本沒有機器在執行（2026-09-07 外部審查實測，同日堵掉）。**
 
-還是要人批准，所以不是自動繞過 review。但**只改文件不會改變這個結果**，
-所以 `SETUP-GITHUB.md` 那句警告不算修好，它只是讓缺口被看見。
+洞是這樣的：OpenSpec CLI 自己收 `skip_specs` —— `skip_specs: true` ＋ 只有
+proposal、沒有任何 Requirement／Scenario 的 change，`openspec validate --strict`
+回 valid rc=0；而 `check-pr-branch.sh` 的 Scenario ID 檢查在 specs/ 不存在時直接
+放行，註解還寫著「交給 validate 管」。**兩層各自以為對方在管。**
 
-堵它的範圍很小（`spec/` 不接受 `skip_specs` 為真、沒有實際 delta 的 change
-不得通過），但要配負向測試，而負向 fixture 必須用**main 上沒有舊 Scenario ID
-的新 change**，否則會被「不准刪 Scenario ID」那條防禦擋掉 —— 那樣測到的
-不是這條防禦。**這是獨立的一輪，不要跟 CI 接線混在同一個 PR。**
+後果是具體的：那份 proposal 合併進 main 之後就滿足了 `feat/` 的「規格已在 main 上」
+存在檢查，讓沒有規格的東西走進**沒有 bytes 上界**的實作通道 ——
+「無規格變更只走有大小上界的通道」這項機器保證整個失效。
+
+**堵法**：`spec/` 加三條政策檢查。兩個設計決定值得記：
+
+**一、拒的是「`skip_specs` 這個鍵出現」，不是「它的值為真」。** 判斷真假就要
+解析 YAML 的 truthiness，而 `skip_specs: "false"`（字串）在不同解析器可能是真 ——
+那又是一個 fail-open 的表面。政策說**不提供**這個旗標，所以它出現本身就是違規。
+
+**二、三條檢查排在 `npx openspec validate` 之前。** 兩個理由：
+
+- CLI 遇到「沒有 delta」時，錯誤訊息會說 **「set `"skip_specs: true"` in the
+  change's `.openspec.yaml` instead」** —— 它在推薦這個 repo 明文禁止的東西。
+  排在後面的話，使用者先看到的是那句錯誤的建議。
+- 更重要的：**放在後面它們永遠跑不到。** 第一版就是放在後面，四條負向測試裡有
+  兩條當場紅了 —— 不是因為防禦壞掉，是因為 `validate` 先擋，斷言指不到被測的東西。
+  跑不到的防禦沒辦法被測試鎖住，那就是〈一條恆真的測試比沒有測試更糟〉。
+  **要嘛可達，要嘛不要留。**
+
+那四條測試用的是 `run_msg`（連**專屬錯誤訊息**一起斷言，不是只看 exit code），
+fixture 一律用 **main 上不存在的新 change** —— 用既有的 `demo-change` 會被
+「不准刪／改 main 上的 Scenario ID」那條先擋掉，exit=1 是真的但擋它的不是這條。
+突變電池 4 個 0 存活（含「把整段移回 validate 之後」那個）。
 
 ---
 
