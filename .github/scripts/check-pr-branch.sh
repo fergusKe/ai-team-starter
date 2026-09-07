@@ -88,9 +88,58 @@ list() { echo "$CHANGED" | grep -E "$1" | sed 's/^/    /'; }
 
 ID_RE='^[a-z0-9]+(-[a-z0-9]+)*$'
 
+# ── docs/WBS.md 的進度區塊：spec/ 與 archive/ 只准動那一段 ────────────────
+#
+# 那個區塊是 `progress.sh --render` 產生的，內容由 change 的狀態決定 ——
+# **所以「加一個 change」與「archive 一個 change」本來就會讓它過期**，
+# 而那兩種分支原本不准碰 `docs/WBS.md`。結果是流程鎖死：
+#
+#     spec/<id> 加一個 change → 區塊過期 → progress.sh --check 紅
+#     而 spec/ 不能改 docs/WBS.md → 沒辦法把它修綠
+#
+# （實測：PR #62 就是這樣紅的。跟覆蓋閘門那次是同一型的鎖死。）
+#
+# 放寬的邊界要精確：**允許改，但把區塊拿掉之後的內容必須逐字不變。**
+# 週次、點數、標記、阻塞 —— 那些是治理決定，仍然只有 governance/ 能動。
+wbs_block_only() { # wbs_block_only <base-ref> ；只動了區塊回 0
+  python3 - "$1" <<'WBSONLY'
+import subprocess, sys
+base = sys.argv[1]
+S, E = "<!-- progress:start", "<!-- progress:end -->"
+
+def strip(text):
+    """拿掉區塊之後的內容。marker 不成對就丟例外，由下面統一擋掉。
+
+    這裡原本還有「各恰好一個」與「順序正確」兩道守衛。**兩道都不可達** ——
+    下面那個逐字比對已經擋掉所有那些形狀了（實測：把兩道守衛各拿掉一次，
+    83 條測試全綠）。不可達的防禦鎖不住，要嘛可達，要嘛不要留。
+    """
+    i, j = text.index(S), text.index(E)
+    return text[:i] + text[j + len(E):]
+
+def show(ref):
+    r = subprocess.run(["git", "show", f"{ref}:docs/WBS.md"],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+old, new = show(base), show("HEAD")
+# 檔案是新增的、或任一邊的 marker 壞掉 —— 都不放行，交給 governance/ 處理。
+if old is None or new is None:
+    sys.exit(1)
+try:
+    a, b = strip(old), strip(new)
+except ValueError:
+    # marker 不成對（少一個、順序反了）—— 沒有唯一答案，交給 governance/。
+    sys.exit(1)
+sys.exit(0 if a == b else 1)
+WBSONLY
+}
+
+
 case "$HEAD" in
 
   # ── spec/<id> ── 規格階段
+
   spec/*)
     ID="${HEAD#spec/}"
     [[ "$ID" =~ $ID_RE ]] || fail "change id '${ID}' 格式不合。只准小寫、數字、單個連字號，且不得含 '--'。"
@@ -98,10 +147,17 @@ case "$HEAD" in
     # 只准動自己這個 change 的目錄，加上 ADR。
     # ADR 要放進來是因為 config.yaml 要求重大決策「同時」留一份 ADR，
     # 而 ADR 在 docs/adr/ 不在 changes/ 底下。少了這條，有 design 的 change 開不出 PR。
-    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/changes/${ID}/|docs/adr/)" || true)"; [ -n "$OUT" ]; then
-      echo "✗ spec/${ID} 只能修改 openspec/changes/${ID}/** 與 docs/adr/**。" >&2
+    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/changes/${ID}/|docs/adr/|docs/WBS\.md$)" || true)"; [ -n "$OUT" ]; then
+      echo "✗ spec/${ID} 只能修改 openspec/changes/${ID}/**、docs/adr/** 與 docs/WBS.md 的進度區塊。" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
+    fi
+
+    # 動了 docs/WBS.md 的話，只准動進度區塊。
+    if echo "$CHANGED" | grep -qx 'docs/WBS.md'; then
+      wbs_block_only "origin/${BASE}" \
+        || fail "spec/${ID} 動到 docs/WBS.md 進度區塊以外的地方。週次、點數、標記、阻塞是治理決定，請走 governance/。"
+      echo "✓ docs/WBS.md 只動了進度區塊"
     fi
 
     # ── 規格豁免：兩道檢查，排在 `openspec validate` 之前 ────────────────────
@@ -421,10 +477,18 @@ SCENARIO_IDS
 
     # 沒有這個類別的話，archive PR 開不出來：
     # spec/ 超出範圍、feat/ 禁止刪 specs、chore/ 禁止碰 openspec。
-    if OUT="$(echo "$CHANGED" | grep -vE "^openspec/(changes/${ID}/|changes/archive/|specs/)" || true)"; [ -n "$OUT" ]; then
-      echo "✗ archive/${ID} 只能動 openspec/changes/${ID}/、changes/archive/、specs/。" >&2
+    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/(changes/${ID}/|changes/archive/|specs/)|docs/WBS\.md$)" || true)"; [ -n "$OUT" ]; then
+      echo "✗ archive/${ID} 只能動 openspec/changes/${ID}/、changes/archive/、specs/ 與 docs/WBS.md 的進度區塊。" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
+    fi
+
+    # 動了 docs/WBS.md 的話，只准動進度區塊 —— archive 會讓那個項目從
+    # 「規格已合併」變「已封存」，區塊必然過期，而原本 archive/ 不准碰它。
+    if echo "$CHANGED" | grep -qx 'docs/WBS.md'; then
+      wbs_block_only "origin/${BASE}" \
+        || fail "archive/${ID} 動到 docs/WBS.md 進度區塊以外的地方。請走 governance/。"
+      echo "✓ docs/WBS.md 只動了進度區塊"
     fi
 
     # 原目錄只能是刪除（archive 是搬走，不是改完再搬）。

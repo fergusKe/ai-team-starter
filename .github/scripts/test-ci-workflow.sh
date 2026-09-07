@@ -140,7 +140,7 @@ put("install_before_branch", "1" if min(inst) < bi else "0")
 put("install_idx", str(min(inst))); put("branch_idx", str(bi))
 
 for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh",
-           "test-scenario-coverage.sh"):
+           "test-scenario-coverage.sh", "check-scenario-coverage.sh"):
     put("has_" + t, "1" if any(t in r for r in runs) else "0")
 
 put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
@@ -160,13 +160,48 @@ put("branch_env_head_exact", "1" if e.get("HEAD_REF", "").strip() == "${{ github
 # deny-list 列不完：`|| true`、`|| :`、`|| echo x`、`|| exit 0`、`; true`…
 # 只要 run 不是剛好那一句，就當作被動過。
 for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh",
-           "test-scenario-coverage.sh"):
+           "test-scenario-coverage.sh", "check-scenario-coverage.sh"):
     want = "bash .github/scripts/%s" % t_
     idxs = [i for i, r in enumerate(runs) if t_ in r]
     put("exact_" + t_, "1" if any(
         runs[i].strip() == want and ifs[i] is None and shells[i] is None
         for i in idxs) else "0")
     put("actual_" + t_, (runs[idxs[0]].strip() if idxs else ""))
+
+# 四個工程品質步驟。**它們原本完全沒被鎖住** —— 把 Build 改成 `run: true`，
+# 這支測試照樣 17/17（外部審查實測）。而 `FE-X01-S10` 的 `ci-job` 豁免正是
+# 拿「CI 有跑這四步」當證據，那條證據站不住的話豁免也站不住。
+#
+# **掃整份 workflow，不是只掃 ci job。** 模板把這四關放在獨立的 `quality:`
+# job，衍生專案放在 `ci:` —— 兩種擺法都合法，而「它們有沒有真的跑」跟放在
+# 哪個 job 無關。（第一版只掃 ci job，於是模板四條全紅，而模板其實是對的。）
+all_steps, _cur = [], None
+_after_jobs = lines[j + 1:]
+for l in _after_jobs:
+    if re.match(r"^      - ", l):
+        if _cur is not None: all_steps.append(_cur)
+        _cur = [re.sub(r"^(      )- ", r"\1  ", l)]
+    elif _cur is not None and (l.startswith("        ") or not l.strip()):
+        _cur.append(l)
+    elif _cur is not None and l.strip():
+        all_steps.append(_cur); _cur = None
+if _cur is not None: all_steps.append(_cur)
+all_names = [(field(s, "name") or "").strip() for s in all_steps]
+all_runs = [field(s, "run") or "" for s in all_steps]
+all_ifs = [field(s, "if") for s in all_steps]
+all_shells = [field(s, "shell") for s in all_steps]
+
+for _n, _want in (("Lint", "npm run lint"), ("Typecheck", "npm run typecheck"),
+                  ("Test", "npm test"), ("Build", "npm run build")):
+    _i = [k for k, nm in enumerate(all_names) if nm == _n]
+    put("quality_" + _n, "1" if (_i and all_runs[_i[0]].strip() == _want
+                                 and all_ifs[_i[0]] is None and all_shells[_i[0]] is None) else "0")
+    put("quality_actual_" + _n, (all_runs[_i[0]].strip() if _i else "（沒有這一步）"))
+
+# **整份 workflow 都不准出現 continue-on-error。** 原本只掃 ci job 的 step 層
+# 與 job 層 —— 別的 job（例如模板的 `quality:`）設了它，一樣是「失敗不算失敗」。
+put("coe_anywhere", "1" if re.search(r"^\s*(?:continue-on-error|\"continue-on-error\"|'continue-on-error'):",
+                                     "\n".join(lines), re.M) else "0")
 
 # npm ci 那一步也不得被 if: 關掉（關掉再在後面放一個真的，順序檢查會被騙過）。
 inst_live = [i for i in inst if ifs[i] is None]
@@ -247,6 +282,44 @@ for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test
         "實際 run：$(get "actual_$t")（預期剛好 bash .github/scripts/${t}）"
   fi
 done
+
+# T5b：四個工程品質步驟也要真的跑
+for q in Lint Typecheck Test Build; do
+  if [ "$(get "quality_$q")" = "1" ]; then
+    ok "ci job 的 ${q} 步驟 run 剛好是那一句、沒有 if:／shell:"
+  else
+    bad "ci job 的 ${q} 步驟 run 剛好是那一句、沒有 if:／shell:" \
+        "實際：$(get "quality_actual_$q")"
+  fi
+done
+
+# T5b2：整份 workflow 都不准有 continue-on-error
+[ "$(get coe_anywhere)" = "0" ] \
+  && ok "整份 ci.yml 都沒有 continue-on-error（不是只有 ci job）" \
+  || bad "整份 ci.yml 都沒有 continue-on-error" "別的 job 設了它，一樣是失敗不算失敗"
+
+# T5c：**有規格的專案一定要接覆蓋閘門。**
+#
+# 這一條取代了原本「模板與衍生各自維護一份必跑清單」的宣告式分岔 ——
+# 那個分岔要靠人記得，而外部審查實測：在模板複本加一份正式 main spec、
+# 完全沒有測試，這支測試仍然全過。改成同一條規則，兩邊都適用：
+#   沒有規格 → 不要求（剛複製的模板）
+#   有規格   → ci.yml 一定要有那一步，而且不得被中和
+HAS_SPECS=0
+if [ -d "$ROOT/openspec/specs" ] \
+   && grep -rqE '^####[[:space:]]+Scenario:' "$ROOT/openspec/specs" 2>/dev/null; then
+  HAS_SPECS=1
+fi
+if [ "$HAS_SPECS" = 1 ]; then
+  if [ "$(get exact_check-scenario-coverage.sh)" = "1" ]; then
+    ok "有規格，而且 ci.yml 接了 check-scenario-coverage.sh"
+  else
+    bad "有規格，而且 ci.yml 接了 check-scenario-coverage.sh" \
+        "openspec/specs/ 裡有 Scenario，但 ci.yml 沒有那一步（實際：$(get actual_check-scenario-coverage.sh)）"
+  fi
+else
+  ok "還沒有任何規格，覆蓋閘門先不要求（剛複製的模板）"
+fi
 
 # T6：ci job 不得有 continue-on-error（失敗要真的失敗）
 # step 層與 **job 層**都要掃。job 層的 continue-on-error 是 Actions 正式支援的

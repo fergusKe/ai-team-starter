@@ -167,6 +167,24 @@ if files == 0:
 if not scenarios and files:
     die("掃了 %d 份規格檔卻一條 Scenario 都沒有 —— 標題文法變了嗎？" % files)
 
+def _commit_state(sha):
+    """這個 commit 在不在**這份 tree 的歷史**裡。跟 `progress.sh` 同一份語意。
+
+    `missing`（本機沒有這個物件）跟 `not-ancestor`（有物件但還沒合併）
+    **不可以混為一談** —— 前者可能只是淺 clone，後者是證據真的還沒進來。
+    """
+    import subprocess
+    try:
+        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"],
+                          capture_output=True).returncode != 0:
+            return "missing"
+        return "ok" if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+            capture_output=True).returncode == 0 else "not-ancestor"
+    except Exception:
+        return "missing"
+
+
 # ── 測試：真的跑過而且通過的葉節點標題 ─────────────────────────────
 try:
     data = json.load(io.open(os.environ["REPORT"], encoding="utf-8"))
@@ -236,6 +254,34 @@ if any(k == "ci-job" for k, *_ in exempt.values()):
         if not hit:
             die(f"{sid} 的 ci-job 豁免，證據欄 `{ev}` 裡沒有任何一個是 "
                 f"ci.yml 真的有的步驟名稱（現有：{'、'.join(sorted(step_names))}）")
+
+# ── `manual-browser` 的證據要是不可變、離線取得回的 ────────────────
+#
+# **「PR #37 的 V1 驗證紀錄」不是證據，是宣告。** PR 內文可以被編輯、附件
+# 可以被刪，而且要連網才查得到 —— 一份離線的 clone 沒辦法確認它存在
+# （外部審查指出：`gh pr view 37` 在沙箱裡 rc=1，無法確認附件）。
+#
+# 約定：證據欄要含一個 **40 位完整 commit SHA**，而且它要在 HEAD 的歷史裡。
+# commit 進了 main 就改不掉、離線也驗得到、`git show` 就取得回它帶的內容
+# （通常是那個 change 的 `tasks.md`／`design.md` 裡的驗證紀錄）。
+#
+# **這不是要求要有圖片。** 機器證明不了「人真的看過畫面」——
+# 它能證明的是「這份紀錄存在、而且從此不會變」。人工項的可信度來自
+# review，不是來自截圖；截圖進 repo 只是讓 diff 變大，沒有多證明什麼。
+SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+for sid, (kind, ev, _why) in exempt.items():
+    if kind != "manual-browser":
+        continue
+    m = SHA_RE.search(ev)
+    if not m:
+        die(f"{sid} 的 manual-browser 豁免，證據欄 `{ev}` 裡沒有 40 位完整 "
+            f"commit SHA —— PR 號碼與連結會變，commit 不會")
+        continue
+    st = _commit_state(m.group(0))
+    if st != "ok":
+        die(f"{sid} 的 manual-browser 豁免指到的 commit `{m.group(0)[:12]}` "
+            + ("在本機找不到（還沒 fetch？淺 clone？）" if st == "missing"
+               else "不在目前 HEAD 的歷史裡 —— 還沒合併的東西不算證據"))
 
 for s in missing:
     die(f"{s}（{scenarios[s]}）沒有任何通過的測試指著它，也沒有 VERIFY-BY 豁免")

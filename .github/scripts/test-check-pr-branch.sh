@@ -54,6 +54,9 @@ cat > openspec/changes/demo-change/proposal.md <<'EOF'
 - 無
 EOF
 printf '## 1. 規格\n- [x] 1.1 談定\n- [x] 1.2 實作\n' > openspec/changes/demo-change/tasks.md
+# 一份帶進度區塊的 WBS —— spec/ 與 archive/ 只准動 marker 之間的內容。
+mkdir -p docs
+printf '# WBS\n\n<!-- progress:start x -->\n舊的區塊內容\n<!-- progress:end -->\n\n| ID | 項目 |\n|---|---|\n| APP-C01 | 骨架 |\n' > docs/WBS.md
 cat > openspec/changes/demo-change/specs/demo/spec.md <<'EOF'
 ## ADDED Requirements
 
@@ -125,6 +128,43 @@ run 0 main spec/demo-change "只動自己的 change"          sh -c 'echo "" >> 
 run 0 main spec/demo-change "可以加 ADR"                 sh -c 'mkdir -p docs/adr && echo "# ADR" > docs/adr/0001-x.md'
 run 1 main spec/demo-change "夾帶產品程式碼"              sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main spec/demo-change "動別人的 change"             sh -c 'mkdir -p openspec/changes/other && echo x > openspec/changes/other/proposal.md'
+
+# **進度區塊是機器產生的，而它的內容由 change 的狀態決定** —— 加一個 change
+# 就會讓它過期，所以 spec/ 與 archive/ 必須能重產它，否則流程鎖死
+# （實測：PR #62 就是這樣紅的）。但邊界要精確：只准動 marker 之間。
+run 0 main spec/demo-change "可以重產 docs/WBS.md 的進度區塊" \
+  sh -c 'python3 - <<EOF
+import io
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("舊的區塊內容","新算出來的區塊內容"))
+EOF'
+run 1 main spec/demo-change "不准動區塊以外的 WBS" \
+  sh -c 'printf "| APP-C02 | 偷加的項目 |\n" >> docs/WBS.md'
+run 1 main spec/demo-change "marker 壞掉時不放行" \
+  sh -c 'python3 - <<EOF
+import io
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("<!-- progress:end -->",""))
+EOF'
+run 0 main archive/demo-change "archive 也可以重產進度區塊" \
+  sh -c 'python3 - <<EOF
+import io, os, shutil
+os.makedirs("openspec/changes/archive/2026-01-01-demo-change", exist_ok=True)
+shutil.copytree("openspec/changes/demo-change", "openspec/changes/archive/2026-01-01-demo-change", dirs_exist_ok=True)
+shutil.rmtree("openspec/changes/demo-change")
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("舊的區塊內容","封存之後的區塊內容"))
+EOF' 
+# 兩組 marker：`.index()` 只會找到第一組，於是「區塊是哪一段」沒有唯一答案。
+# 少了這一條，把「各恰好一個」的檢查拿掉不會有測試變紅（實測存活）。
+run 1 main spec/demo-change "WBS 有兩組 marker 時不放行" \
+  sh -c 'printf "\n<!-- progress:start x -->\n第二組\n<!-- progress:end -->\n" >> docs/WBS.md'
+
+# 把 docs/WBS.md 整個刪掉也不是「只動區塊」。
+# 少了這一條，「讀不到檔案就放行」不會有測試變紅（實測存活）。
+run 1 main spec/demo-change "把 docs/WBS.md 刪掉不放行" \
+  sh -c 'rm docs/WBS.md'
+
 run 1 main spec/Bad--Id     "id 格式不合"                 sh -c 'echo x > z.md'
 run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p docs/adr && echo x > docs/adr/0002-y.md'
 

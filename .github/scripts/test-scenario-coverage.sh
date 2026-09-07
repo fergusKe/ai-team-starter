@@ -162,13 +162,14 @@ add_verify() { printf '%s\n' "$1" >> "$W/repo/openspec/specs/demo/spec.md"; }
 
 # 豁免要真的生效（陽性對照 —— 少了它，「一律報缺」也會讓上面那些全綠）
 setup
-python3 - "$W/repo/openspec/specs/demo/spec.md" <<'PY'
+HEADSHA="$(git -C "$W/repo" rev-parse HEAD)"
+python3 - "$W/repo/openspec/specs/demo/spec.md" "$HEADSHA" <<'PY'
 import io, sys
 p = sys.argv[1]
 t = io.open(p, encoding="utf-8").read()
 t = t.replace("#### Scenario: [DEMO-01-S02] 第二條\n\n- **WHEN** a\n- **THEN** b",
               "#### Scenario: [DEMO-01-S02] 第二條\n\n- **WHEN** a\n- **THEN** b\n"
-              "- **VERIFY-BY** `manual-browser`｜PR #1 的截圖｜這條要真的畫面才驗得到")
+              "- **VERIFY-BY** `manual-browser`｜" + sys.argv[2] + " 的驗證紀錄｜這條要真的畫面才驗得到")
 io.open(p, "w", encoding="utf-8").write(t)
 PY
 FAKE_JSON='{"testResults":[{"assertionResults":[
@@ -208,7 +209,7 @@ FAKE_JSON="$(json_all_pass)"
 run 1 "不認得的豁免種類要紅" "不在列舉裡"
 
 setup
-add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜TBD'
+add_verify "- **VERIFY-BY** \`manual-browser\`｜$(git -C "$W/repo" rev-parse HEAD)｜TBD"
 FAKE_JSON="$(json_all_pass)"
 run 1 "豁免沒有實質理由要紅" "沒有寫出實質理由"
 
@@ -224,9 +225,24 @@ add_verify '- **VERIFY-BY** `manual-browser`｜｜這條要真的畫面才驗得
 FAKE_JSON="$(json_all_pass)"
 run 1 "豁免中間欄位是空的要紅" "要三段"
 
+# **`manual-browser` 的證據要是不可變、離線取得回的。**「PR #37 的紀錄」
+# 不是證據，是宣告 —— PR 內文可以編輯、附件可以刪，而且要連網才查得到
+# （外部審查實測：沙箱裡 `gh pr view 37` rc=1，無法確認附件是否存在）。
+setup
+add_verify '- **VERIFY-BY** `manual-browser`｜PR #37 的 V1 驗證紀錄｜這條要真的畫面才驗得到'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "manual-browser 只寫 PR 號碼要紅" "沒有 40 位完整 commit SHA"
+
+setup
+add_verify '- **VERIFY-BY** `manual-browser`｜0000000000000000000000000000000000000000 的紀錄｜這條要真的畫面才驗得到'
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]}]}]}'
+run 1 "manual-browser 指到不存在的 commit 要紅" "在本機找不到"
+
 # **過期的豁免要拿掉。** 測試補上了、豁免還留著，那張免死金牌會一直有效。
 setup
-add_verify '- **VERIFY-BY** `manual-browser`｜PR #1｜這條要真的畫面才驗得到'
+add_verify "- **VERIFY-BY** \`manual-browser\`｜$(git -C "$W/repo" rev-parse HEAD)｜這條要真的畫面才驗得到"
 FAKE_JSON="$(json_all_pass)"
 run 1 "同時有通過的測試與豁免要紅（豁免過期）" "豁免過期了"
 
