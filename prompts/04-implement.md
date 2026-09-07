@@ -1,6 +1,7 @@
 # 04 實作
 
-先確認：**這個 change 的 specs 已經在 PR 上談定了嗎？** 沒有就回 `03`。
+先確認：**這個 change 的規格 PR 已經合併進 main 了嗎？** 沒有就回 `03`。
+（只是「在 PR 上談定」不夠 —— `feat/` 的閘門是去 main 上找 proposal。）
 
 ```
 /opsx:apply

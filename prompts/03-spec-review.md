@@ -3,8 +3,8 @@
 先跑機器檢查：
 
 ```bash
-openspec validate <change> --strict
-openspec status --change <change>
+npx openspec validate <change> --strict
+npx openspec status --change <change>
 ```
 
 `validate` 只看結構。下面這六題才是它檢查不出來的，
@@ -23,4 +23,17 @@ openspec status --change <change>
 有問題直接說，不要幫我合理化。
 
 修完之後把 PR 從 draft 轉出來讓人 review 規格。
-**規格談定才進 `04`。**
+
+**規格 PR 合併之後**，才開實作分支：
+
+```bash
+git switch main
+git pull --ff-only          # 不要產生 merge commit
+git switch -c feat/<change-name>--<slice>
+```
+
+`feat/` 的閘門會去 main 上找 `openspec/changes/<change-name>/proposal.md`，
+所以**這一步不能省** —— 規格還沒進 main 就開實作分支，一定被擋。
+一個 change 可以有很多個 `--<slice>` 分支。
+
+**規格合併才進 `04`。**
