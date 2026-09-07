@@ -428,5 +428,12 @@ run 1 main hotfix       "沒有前綴" sh -c 'echo x > z.md'
 
 echo
 echo "通過 ${PASS} / 失敗 ${FAIL} / 共 ${N}"
-echo "測試目錄：$ROOT"
+# 成功就清掉工作目錄，失敗才留現場。這一支每次留一份完整的 repo clone
+# （約 70MB）—— 跑幾十次就會塞爆使用者自己的碟。理由見
+# `test-progress-check.sh` 開頭那段（實測 9.6G）。
+if [ "$FAIL" = 0 ]; then
+  cd "$(dirname "${BASH_SOURCE[0]}")" && rm -rf "${ROOT}"
+else
+  echo "測試目錄留著給你看：${ROOT}"
+fi
 [ "$FAIL" = 0 ]

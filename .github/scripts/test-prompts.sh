@@ -239,5 +239,10 @@ fi
 
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS+FAIL))"
-echo "測試目錄：$W"
+# 成功就清掉，失敗才留現場 —— 理由見 `test-progress-check.sh` 開頭那段。
+if [ "$FAIL" -eq 0 ]; then
+  cd "$(dirname "${BASH_SOURCE[0]}")" && rm -rf "${W}"
+else
+  echo "測試目錄留著給你看：${W}"
+fi
 [ "$FAIL" -eq 0 ]
