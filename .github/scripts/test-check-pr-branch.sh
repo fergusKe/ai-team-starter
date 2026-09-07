@@ -118,6 +118,28 @@ run 1 main spec/demo-change "動別人的 change"             sh -c 'mkdir -p op
 run 1 main spec/Bad--Id     "id 格式不合"                 sh -c 'echo x > z.md'
 run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p docs/adr && echo x > docs/adr/0002-y.md'
 
+# run_msg 自己的陽性對照。
+#
+# 它是這一批新測試唯一的斷言強度來源 —— 如果它壞掉（比方 grep 的引號寫錯導致
+# 永遠 match），那四條負向測試會全部變成只看 exit code，而那正是它們要防的事。
+# 「工具說綠」跟「工具還活著」是兩件事：這裡故意餵一個**絕不會出現**的訊息，
+# 斷言 run_msg 判它紅。在子 shell 裡跑，計數不會被污染。
+selftest_output="$(
+  PASS=0; FAIL=0; N=900
+  run_msg 1 main spec/fresh-change "自測（不計入）" "這串字絕不會出現在任何輸出裡" \
+    sh -c 'mkdir -p openspec/changes/fresh-change
+           printf "schema: spec-driven\nskip_specs: true\n" > openspec/changes/fresh-change/.openspec.yaml
+           printf "## Why\nx\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md' 2>&1
+)"
+N=$((N+1))
+case "$selftest_output" in
+  *"exit 對但訊息不含"*)
+    printf '  \033[32m✓\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"; PASS=$((PASS+1)) ;;
+  *)
+    printf '  \033[31m✗\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"
+    printf '      實際輸出：%s\n' "$selftest_output"; FAIL=$((FAIL+1)) ;;
+esac
+
 echo "── 規格豁免封堵（新 change，main 上沒有它的 Scenario ID）──"
 # 用 fresh-change 而不是 demo-change：demo-change 的 Scenario ID 已經在 main 上，
 # 這幾個 fixture 會被「刪掉 main 上的 Scenario」那條防禦先擋掉，
@@ -126,6 +148,20 @@ run_msg 1 main spec/fresh-change "skip_specs 旗標一律拒" "不提供規格�
   sh -c 'mkdir -p openspec/changes/fresh-change
          printf "schema: spec-driven\nskip_specs: true\n" > openspec/changes/fresh-change/.openspec.yaml
          printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+# flow style 是第一版的實際繞法（regex 綁行首）：CLI 認、我們的 regex 不認。
+run_msg 1 main spec/fresh-change "skip_specs 用 flow style 寫也要拒" "不提供規格豁免旗標" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "{schema: spec-driven, skip_specs: true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n用 flow style 藏旗標。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+# 第 1 條（子字串比對）刻意不涵蓋完整 YAML key 語意 —— Unicode escape
+# `"skip\u005fspecs"` 它抓不到。這一條驗**邊界仍然成立**：被第 2 條擋下來，
+# 而且吐的是第 2 條的訊息（不是第 1 條的），證明擋它的是檔案系統檢查。
+run_msg 1 main spec/fresh-change "旗標用 Unicode escape 藏，仍被邊界擋住" "沒有任何 delta spec" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "{\"schema\": \"spec-driven\", \"skip\\u005fspecs\": true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n藏旗標。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
 
 run_msg 1 main spec/fresh-change "沒有 delta spec 不得走 spec/" "沒有任何 delta spec" \
   sh -c 'mkdir -p openspec/changes/fresh-change

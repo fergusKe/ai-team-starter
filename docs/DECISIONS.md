@@ -180,9 +180,25 @@ proposal、沒有任何 Requirement／Scenario 的 change，`openspec validate -
 
 **堵法**：`spec/` 加三條政策檢查。兩個設計決定值得記：
 
-**一、拒的是「`skip_specs` 這個鍵出現」，不是「它的值為真」。** 判斷真假就要
-解析 YAML 的 truthiness，而 `skip_specs: "false"`（字串）在不同解析器可能是真 ——
-那又是一個 fail-open 的表面。政策說**不提供**這個旗標，所以它出現本身就是違規。
+**一、邊界是「檔案系統」，不是「讀懂那個旗標」。**
+
+三條檢查裡，**2 與 3（`specs/` 在不在、裡面有沒有 `#### Scenario:`）才是邊界** ——
+它們看檔案系統，完全不解析 YAML，所以旗標怎麼寫都繞不過。
+第 1 條（子字串比對 `skip_specs`）**只是早期訊息**，作用是在常見寫法下先給出
+這個 repo 自己的訊息，而不是讓使用者看到 CLI 那句「set `skip_specs: true`」。
+
+為什麼不做完整的 YAML key 語意：那需要一個 YAML parser，而手刻的每一種都是
+「解析 YAML 的一個子集」—— 同一天實測連續破了兩次：
+
+| 手刻方式 | 被什麼繞過 |
+|---|---|
+| `^\s*skip_specs\s*:`（行首 key） | flow style `{schema: spec-driven, skip_specs: true}` |
+| 全文子字串 `skip_specs` | Unicode escape `"skip\u005fspecs"`，且會誤擋註解 |
+
+**這跟被否決的 truthiness 判斷是同一種病，只是換了位置。** 所以第 1 條誠實地
+只做子字串比對，並且**不宣稱**涵蓋完整 YAML key 語意；漏掉的寫法由 2、3 接住。
+測試裡有一條就是拿 Unicode escape 藏旗標，斷言它被**第 2 條**擋下、
+而且吐的是第 2 條的訊息 —— 證明擋它的是檔案系統檢查，不是那個子字串。
 
 **二、三條檢查排在 `npx openspec validate` 之前。** 兩個理由：
 

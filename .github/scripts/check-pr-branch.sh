@@ -130,18 +130,30 @@ def die(*msg):
     print("  代價是 20000 bytes 的上界（不看內容性質，所以沒有語意判斷的空間）。", file=sys.stderr)
     sys.exit(1)
 
-# 1. 豁免旗標：拒的是「這個鍵出現」，不是「它的值為真」。
-#    判斷真假就要解析 YAML 的 truthiness，而 `skip_specs: "false"`（字串）
-#    在不同解析器可能是真 —— 那又是一個 fail-open 的表面。
-#    政策說**不提供**這個旗標，所以它出現本身就是違規。fail-closed。
+# 1. 豁免旗標：**這是早期訊息，不是邊界。**
+#
+#    邊界是下面的 2 與 3 —— 它們看的是**檔案系統**（specs/ 在不在、裡面有沒有
+#    Scenario），完全不解析 YAML，所以旗標怎麼寫都繞不過。這一條的作用只是
+#    在常見寫法下先給出這個 repo 自己的訊息，而不是讓使用者看到 CLI 那句
+#    「set skip_specs: true」（那是它推薦我們禁止的東西）。
+#
+#    為什麼不做完整的 YAML key 語意：那需要一個 YAML parser。手刻的話，
+#    行首 regex 漏 flow style（`{skip_specs: true}`，2026-09-07 實測繞過），
+#    改成全文子字串又漏 Unicode escape（`"skip\u005fspecs"`，同日實測），
+#    而且會誤擋註解 —— **每一種手刻都是「解析 YAML 的一個子集」，
+#    跟被否決的 truthiness 判斷是同一種病。**
+#
+#    所以這裡誠實地只做子字串比對，並且**不宣稱**它涵蓋完整 YAML key 語意。
+#    漏掉的寫法由 2、3 接住，那兩條沒有解析器可以騙。
 cfg = base / ".openspec.yaml"
 if cfg.is_file():
-    for ln, line in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
-        if re.match(r"^\s*skip_specs\s*:", line):
-            die(f"✗ openspec/changes/{cid}/.openspec.yaml:{ln} 出現 skip_specs。",
-                f"    {line.strip()}",
-                "  這個 repo 不提供規格豁免旗標。",
-                "  （OpenSpec CLI 的錯誤訊息會建議你設這個旗標 —— 那句建議對這個 repo 不適用。）")
+    raw = cfg.read_text(encoding="utf-8")
+    if "skip_specs" in raw:
+        hit = next((f"{i}: {l.strip()}" for i, l in enumerate(raw.splitlines(), 1)
+                    if "skip_specs" in l), "?")
+        die(f"✗ openspec/changes/{cid}/.openspec.yaml 出現 skip_specs。",
+            f"    {hit}",
+            "  這個 repo 不提供規格豁免旗標。")
 
 # 2. 沒有任何 delta spec。spec/ 這條通道的存在理由就是把規格談定並凍進 main。
 specs = base / "specs"

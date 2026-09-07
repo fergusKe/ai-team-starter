@@ -94,6 +94,19 @@ def envmap(raw):
 names   = [(field(s, "name") or "").strip() for s in steps]
 runs    = [field(s, "run") or "" for s in steps]
 coe     = [field(s, "continue-on-error") for s in steps]
+ifs     = [field(s, "if") for s in steps]
+
+# job 層的鍵（縮排 4 格，不在 steps: 底下）。
+# 2026-09-07 審查抓到：原本只掃 step 層，`ci:` 底下加一行
+# `continue-on-error: true` 整個 job 失敗都不算失敗，而測試全綠。
+job_keys = {}
+in_steps = False
+for l in job:
+    if re.match(r"^    steps:\s*$", l): in_steps = True; continue
+    if in_steps and re.match(r"^    [A-Za-z_-]+:", l): in_steps = False
+    if in_steps: continue
+    m = re.match(r"^    ([A-Za-z_-]+):\s?(.*)$", l)
+    if m: job_keys[m.group(1)] = m.group(2)
 
 f = open(out, "w", encoding="utf-8")
 def put(k, v): f.write("%s\t%s\n" % (k, v))
@@ -115,6 +128,23 @@ for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow
     put("has_" + t, "1" if any(t in r for r in runs) else "0")
 
 put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
+put("job_continue_on_error", "1" if "continue-on-error" in job_keys else "0")
+
+# env 值要**完全相等**，不是「包含」。`prefix-${{ github.head_ref }}` 也含那串字，
+# 但傳進閘門的就不是分支名了（2026-09-07 審查的存活突變之一）。
+put("branch_env_base_exact", "1" if e.get("BASE_REF", "").strip() == "${{ github.base_ref }}" else "0")
+put("branch_env_head_exact", "1" if e.get("HEAD_REF", "").strip() == "${{ github.head_ref }}" else "0")
+
+# 每一支必跑的測試：不得有 if:（會被 skip）、run 不得被 `|| true` 之類中和。
+for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
+    idxs = [i for i, r in enumerate(runs) if t_ in r]
+    put("neutralised_" + t_, "1" if any(
+        ifs[i] is not None or re.search(r"\|\|\s*(true|:)|&&\s*true|;\s*true\s*$", runs[i])
+        for i in idxs) else "0")
+
+# npm ci 那一步也不得被 if: 關掉（關掉再在後面放一個真的，順序檢查會被騙過）。
+inst_live = [i for i in inst if ifs[i] is None]
+put("install_live_before_branch", "1" if inst_live and min(inst_live) < bi else "0")
 f.close()
 PARSE
 if [ $? -ne 0 ]; then
@@ -129,13 +159,14 @@ echo "── ci.yml 合約 ──"
 # T1：Branch 那一步的 run 不得直接含 GitHub expression
 BRUN="$(get branch_run)"
 case "$BRUN" in
-  *'${{'*) bad "Branch 的 run 不含 \${{ }}（要走 env 中介變數）" "run: $BRUN" ;;
+  *'${{'*) bad "Branch 的 run 不含 \${{ }}（要走 env 中介變數）" "run: ${BRUN}" ;;
   *)       ok "Branch 的 run 不含 \${{ }}（走 env 中介變數）" ;;
 esac
 
 # T2：env 有把兩個 ref 綁成中介變數
-case "$(get branch_env_base)" in *github.base_ref*) ok "env.BASE_REF 綁 github.base_ref" ;; *) bad "env.BASE_REF 綁 github.base_ref" ;; esac
-case "$(get branch_env_head)" in *github.head_ref*) ok "env.HEAD_REF 綁 github.head_ref" ;; *) bad "env.HEAD_REF 綁 github.head_ref" ;; esac
+# 完全相等，不是包含 —— `prefix-${{ github.head_ref }}` 也「包含」那串字。
+[ "$(get branch_env_base_exact)" = "1" ] && ok "env.BASE_REF 完全等於 github.base_ref" || bad "env.BASE_REF 完全等於 github.base_ref" "實際：$(get branch_env_base)"
+[ "$(get branch_env_head_exact)" = "1" ] && ok "env.HEAD_REF 完全等於 github.head_ref" || bad "env.HEAD_REF 完全等於 github.head_ref" "實際：$(get branch_env_head)"
 
 # T3：實際跑一次，斷言分支名逐字傳進閘門（假 checker 只記錄 argv）
 EVIL='chore/$(printf CI_WORKFLOW_TEST_INJECTED)'
@@ -149,24 +180,35 @@ FAKE
 ( cd "$W/repo" && BASE_REF="main" HEAD_REF="$EVIL" bash -c "$BRUN" ) >/dev/null 2>&1
 GOT_N="$(cat "$W/repo/argv.count" 2>/dev/null || echo 0)"
 GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
-[ "$GOT_N" = "2" ] && ok "閘門收到剛好 2 個參數" || bad "閘門收到剛好 2 個參數" "實際 $GOT_N 個"
+[ "$GOT_N" = "2" ] && ok "閘門收到剛好 2 個參數" || bad "閘門收到剛好 2 個參數" "實際 ${GOT_N} 個"
 [ "$GOT_2" = "$EVIL" ] && ok "分支名逐字傳入（\$() 沒有被執行）" \
-                       || bad "分支名逐字傳入（\$() 沒有被執行）" "送進去：$EVIL／收到：$GOT_2"
+                       || bad "分支名逐字傳入（\$() 沒有被執行）" "送進去：${EVIL}／收到：${GOT_2}"
 
 # T4：npm ci 要排在 Branch 之前（否則 Branch 內部那次 npx 會繞過 lockfile）
-[ "$(get install_before_branch)" = "1" ] \
-  && ok "npm ci 排在 Branch 之前" \
-  || bad "npm ci 排在 Branch 之前" "npm ci 在第 $(get install_idx) 步、Branch 在第 $(get branch_idx) 步"
+[ "$(get install_live_before_branch)" = "1" ] \
+  && ok "有一步「真的會跑的」npm ci 排在 Branch 之前" \
+  || bad "有一步「真的會跑的」npm ci 排在 Branch 之前" "npm ci 在第 $(get install_idx) 步、Branch 在第 $(get branch_idx) 步（帶 if: 的不算）"
 
 # T5：四支閘門測試都要在 ci job 裡
 for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh; do
-  [ "$(get "has_$t")" = "1" ] && ok "ci job 有跑 $t" || bad "ci job 有跑 $t" "workflow 裡找不到這一步"
+  if [ "$(get "has_$t")" != "1" ]; then
+    bad "ci job 有跑 $t" "workflow 裡找不到這一步"
+  elif [ "$(get "neutralised_$t")" = "1" ]; then
+    bad "ci job 有跑 $t 且沒被中和" "那一步帶了 if: 或 run 被 || true 之類中和掉"
+  else
+    ok "ci job 有跑 ${t}（沒有 if:、沒被 || true 中和）"
+  fi
 done
 
 # T6：ci job 不得有 continue-on-error（失敗要真的失敗）
+# step 層與 **job 層**都要掃。job 層的 continue-on-error 是 Actions 正式支援的
+# 失敗處理面，設了之後整個 job 失敗都不算失敗 —— 原本只掃 step 層，它存活。
 [ "$(get continue_on_error)" = "0" ] \
-  && ok "ci job 沒有 continue-on-error" \
-  || bad "ci job 沒有 continue-on-error" "有步驟設了 continue-on-error"
+  && ok "沒有步驟設 continue-on-error" \
+  || bad "沒有步驟設 continue-on-error" "有步驟設了 continue-on-error"
+[ "$(get job_continue_on_error)" = "0" ] \
+  && ok "ci job 自己沒有 continue-on-error" \
+  || bad "ci job 自己沒有 continue-on-error" "job 層設了 continue-on-error，整個 job 紅了也不算失敗"
 
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS+FAIL))"

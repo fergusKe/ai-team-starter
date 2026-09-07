@@ -41,7 +41,9 @@ extract() { # extract <檔> > <shell 區塊全文>
   python3 - "$1" <<'EX'
 import sys, re
 t = open(sys.argv[1], encoding="utf-8").read()
-blocks = re.findall(r"(?ms)^```bash\n(.*?)^```", t)
+# closing fence 必須是**單獨一行**的 ```。少了 `[ \t]*$`，```not-a-closing-fence
+# 也會被當成結束，抽出來的區塊就不是使用者真的會照做的那一段。
+blocks = re.findall(r"(?ms)^```bash\n(.*?)^```[ \t]*$", t)
 if not blocks:
     sys.exit("NO_BASH_BLOCK")
 sys.stdout.write("\n".join(blocks))
@@ -64,9 +66,11 @@ PU02="$(printf '%s\n' "$B02" | grep -oE 'git push -u origin [a-z]+/' | head -1 |
   || bad "02 的 push 目標跟開的分支一致" "switch=${SW02:-?} push=${PU02:-?}"
 
 # ── T3：gh pr create 明帶 --base main ──────────────────────────────────────
-printf '%s\n' "$B02" | grep -q -- '--base main' \
-  && ok "02 的 gh pr create 帶 --base main" \
-  || bad "02 的 gh pr create 帶 --base main" "分支閘只接受 base=main，不明寫會依賴預設分支設定"
+# 驗 `--base` 的**下一個 token 等於 main**。子字串比對放得過 `--base mainland`。
+BASEVAL="$(printf '%s\n' "$B02" | tr ' ' '\n' | grep -A1 -x -- '--base' | tail -1)"
+[ "$BASEVAL" = "main" ] \
+  && ok "02 的 --base 值精確等於 main" \
+  || bad "02 的 --base 值精確等於 main" "實際：${BASEVAL:-（沒有 --base）}"
 
 # ── T4：提示檔裡的 openspec 一律是 npx openspec ────────────────────────────
 # 裸 openspec 解析到的是全域那份，不是 lockfile 鎖住的版本（README 有一整節）。
@@ -98,7 +102,8 @@ git clone -q "$W/origin.git" "$W/repo" 2>/dev/null
 mkdir -p "$W/bin"
 cat > "$W/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$GH_LOG"
+# 逐項記錄，不用 $* —— 那會抹平 argv 邊界，驗不出選項與值的對應。
+{ printf 'ARGV'; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >> "$GH_LOG"
 STUB
 chmod +x "$W/bin/gh"
 
@@ -126,14 +131,57 @@ chmod +x "$W/bin/gh"
 ) >"$W/run02.log" 2>&1
 RC02=$?
 
+[ "$RC02" = "0" ] \
+  && ok "02 的 shell 區塊整段跑完 rc=0" \
+  || bad "02 的 shell 區塊整段跑完 rc=0" "rc=${RC02}，log: ${W}/run02.log"
+
 BR="$(cd "$W/repo" && git branch --show-current 2>/dev/null || true)"
 [ "$BR" = "spec/$CID" ] \
   && ok "照 02 跑完，人在 spec/<id> 分支上" \
-  || bad "照 02 跑完，人在 spec/<id> 分支上" "實際分支：${BR:-?}（rc=$RC02，log: $W/run02.log）"
+  || bad "照 02 跑完，人在 spec/<id> 分支上" "實際分支：${BR:-?}（rc=${RC02}，log: ${W}/run02.log）"
 
-grep -q -- "--base main" "$W/gh.log" 2>/dev/null \
-  && ok "gh pr create 真的收到 --base main" \
-  || bad "gh pr create 真的收到 --base main" "gh 替身收到：$(cat "$W/gh.log" 2>/dev/null || echo 無)"
+# 替身要驗**子指令**，不只驗旗標。只 grep `--base main` 的話，
+# `gh issue create --base main` 也會綠 —— 替身收得下，使用者電腦上會爛。
+# 逐項比對：子指令必須剛好是 `pr create`，`--base` 的下一項剛好是 `main`。
+# 只 grep 字串的話，`gh issue create --base mainland` 也會綠。
+GHCHK="$(python3 - "$W/gh.log" <<'GHPY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+if not p.is_file():
+    print("NOLOG"); raise SystemExit
+for line in p.read_text(encoding="utf-8").splitlines():
+    parts = line.split("\t")
+    if not parts or parts[0] != "ARGV":
+        continue
+    argv = parts[1:]
+    if argv[:2] != ["pr", "create"]:
+        continue
+    if "--base" not in argv:
+        print("NOBASE"); raise SystemExit
+    i = argv.index("--base")
+    print("OK" if argv[i+1:i+2] == ["main"] else "BADVAL")
+    raise SystemExit
+print("NOPRCREATE")
+GHPY
+)"
+case "$GHCHK" in
+  OK) ok "gh 收到的剛好是 pr create，且 --base 的值是 main" ;;
+  *)  bad "gh 收到的剛好是 pr create，且 --base 的值是 main" "判定=${GHCHK}" ;;
+esac
+
+# 遠端要真的有那個 ref 且指到本機 HEAD —— push 目的地寫錯
+# （例如 spec/<id>:spec/wrong）的話上面每一條都還是綠的。
+LOCAL_SHA="$(cd "$W/repo" && git rev-parse HEAD 2>/dev/null || true)"
+REMOTE_SHA="$(cd "$W/origin.git" && git rev-parse "refs/heads/spec/$CID" 2>/dev/null || true)"
+[ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$LOCAL_SHA" ] \
+  && ok "origin 的 refs/heads/spec/<id> 指到本機 HEAD" \
+  || bad "origin 的 refs/heads/spec/<id> 指到本機 HEAD" "local=${LOCAL_SHA:-?} remote=${REMOTE_SHA:-（不存在）}"
+
+# commit 要真的產生。git commit --dry-run 不留 commit，但前面全部會綠。
+NCOMMIT="$(cd "$W/repo" && git rev-list --count HEAD 2>/dev/null || echo 0)"
+[ "$NCOMMIT" -ge 2 ] \
+  && ok "02 真的產生了一個 commit" \
+  || bad "02 真的產生了一個 commit" "HEAD 上只有 ${NCOMMIT} 個 commit"
 
 # 最後一步才是重點：閘門收不收這個分支
 if [ -n "$BR" ]; then
@@ -141,7 +189,7 @@ if [ -n "$BR" ]; then
   GRC=$?
   [ "$GRC" = "0" ] \
     && ok "閘門接受 02 教出來的分支（rc=0）" \
-    || bad "閘門接受 02 教出來的分支（rc=0）" "rc=$GRC：$(head -3 "$W/gate.out" | tr '\n' ' ')"
+    || bad "閘門接受 02 教出來的分支（rc=0）" "rc=${GRC}：$(head -3 "$W/gate.out" | tr '\n' ' ')"
 fi
 
 echo
