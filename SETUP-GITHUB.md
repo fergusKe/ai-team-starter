@@ -231,8 +231,9 @@ base 不是 `main` 一律擋 —— ruleset 只保護 main，別處拿到的綠�
 bash .github/scripts/test-check-pr-branch.sh
 ```
 
-33 個案例，含各種負向情境（base 不是 main、回改規格、symlink、submodule、
-binary、一行 minified、archive 沒補 Purpose、未知前綴）。
+每一條分支規則各造一次違規，斷言它真的會擋（base 不是 main、回改規格、
+symlink、submodule、binary、一行 minified、archive 沒補 Purpose、未知前綴⋯⋯）。
+**案例數不寫在這裡** —— 腳本自己會印，寫死一個數字只會漂。
 
 **改完再跑一次。** 那支腳本是執法層本體 —— 調一個上界、加一個分類、
 動一條 regex，都可能在別的地方開一個洞，而**洞是安靜的**：
