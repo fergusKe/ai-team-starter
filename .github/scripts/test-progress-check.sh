@@ -56,6 +56,13 @@ bump_fail() { FAIL=$((FAIL + 1)); }
 # 一份最小但合法的工作分解表。每個案例都從它出發，只壞一個地方 ——
 # 這樣紅燈的原因就只可能是那一個地方。
 baseline() {
+  # **每個案例都從乾淨的 OpenSpec 狀態出發。** 這裡以前只重寫 WBS，
+  # `openspec/changes/` 留著上一個案例造的 change —— 於是「一個封存、
+  # 一個還在做」那條案例吃到了前一條留下的封存目錄，量到的是別人的狀態。
+  # 實測：那條斷言預期「規格已合併」，拿到「已封存」，而**被測的程式是對的**。
+  # 一支專門在抓 fail-open 的腳本，自己的 fixture 先漏了。
+  # `.git` 同理 —— 遠端分支也是狀態的輸入，留著就會漏到下一個案例。
+  rm -rf "$W/openspec" "$W/.git"
   mkdir -p "$W/docs"
   cat > "$W/docs/WBS.md" <<'WBS'
 # 測試用的工作分解
@@ -183,6 +190,20 @@ run_all_has() {
   bump_fail
 }
 
+# run_all_absent <說明> <不該出現的字>：--all 的輸出裡**不可以**有這個
+#
+# `run_all_has` 的反面。有些缺陷的形狀是**多印了東西**，不是少印 ——
+# 例如把兩個 change 其中一個的進度條印在項目那一列上（`+1 1/2`），
+# 那個分數看起來像整個項目的進度，其實只是其中一個 change 的。
+run_all_absent() {
+  local desc="$1" needle="$2"
+  if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "$needle"; then
+    echo "✗ ${desc} —— --all 的輸出裡不該有「${needle}」，但它出現了"
+    bump_fail; return
+  fi
+  echo "✓ $desc"; PASS=$((PASS + 1))
+}
+
 run_json_has() {
   local desc="$1" out n
   out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null)"
@@ -239,6 +260,33 @@ mkchange() {
     mkdir -p "$W/openspec/changes/$c"
     printf '# %s\n' "$c" > "$W/openspec/changes/$c/proposal.md"
     printf -- '- [x] 一\n- [ ] 二\n' > "$W/openspec/changes/$c/tasks.md"
+  done
+}
+
+# mkremote <遠端分支名>...：在 fixture 裡造一個遠端分支
+#
+# 狀態的輸入有三個來源：change 目錄、tasks.md 的勾、**遠端分支**。
+# 前兩個造得出來、第三個以前造不出來 —— 於是所有「看分支」的判斷
+# 都沒有測試看得到。實測：把分支集合改成只看第一個 change，全綠。
+mkremote() {
+  local b
+  git -C "$W" init -q 2>/dev/null
+  git -C "$W" commit -q --allow-empty -m x --author "t <t@t.invalid>" 2>/dev/null \
+    || GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+       GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m x
+  for b in "$@"; do
+    git -C "$W" update-ref "refs/remotes/origin/$b" HEAD
+  done
+}
+
+# mkarchived <change-id>...：已封存的 change（目錄名帶日期前綴）
+mkarchived() {
+  local c d
+  for c in "$@"; do
+    d="$W/openspec/changes/archive/2026-01-01-$c"
+    mkdir -p "$d"
+    printf '# %s\n' "$c" > "$d/proposal.md"
+    printf -- '- [x] 一\n- [x] 二\n' > "$d/tasks.md"
   done
 }
 
@@ -378,6 +426,7 @@ selftest_count() { # selftest_count <說明> <helper 與參數...>
   fi
 }
 selftest_count "run_all_has 自測"      run_all_has      "自測（不計入）" "這串字絕不會出現在 --all 的輸出裡"
+selftest_count "run_all_absent 自測"   run_all_absent   "自測（不計入）" "WBS 共"
 selftest_count "run_json_has 自測"     run_json_has     "自測（不計入）" "這個_key_絕不存在"
 selftest_count "run_setup 自測"        run_setup        "自測（不計入）" "have" "這串字絕不會出現在輸出裡"
 selftest_count "run_field_has 自測"    run_field_has    "自測（不計入）" "NO-SUCH-ITEM" "state" "不可能的值"
@@ -701,6 +750,46 @@ run_field_has "同一個 ID 的每一個 change 都要進 --json" "APP-C01" "cha
 baseline
 mkchange app-c01-api app-c01-ui
 run_all_has "同一個 ID 開了兩個 change：列上看得出來" "+1"
+
+# **看得見不等於算得對。** 上面兩條都綠的時候，狀態仍然是錯的：
+#
+#   APP-C01  兩個 change 都已封存   有分支   app-c01-api +1
+#
+# 根因是 `change_for()` 回傳 `"app-c01-api +1"` 這個**顯示字串**，
+# 下游拿它去 `changes.get(cid, {})` —— 那個鍵永遠不存在，於是
+# `c = {}`、`br = set()`，四個判斷全不成立，掉進 `else` 報「有分支」。
+# **一個項目只要有兩個 change，就永遠算不出「已封存」。**
+#
+# 上面那兩條測的是「有沒有被看見」，這一條測的是「算得對不對」——
+# 兩者都要，少了這一條，把聚合改回 `hits[0]` 或改回混用回傳值都不會紅。
+baseline
+mkarchived app-c01-api app-c01-ui
+run_field_has "兩個 change 都封存了就是已封存（不是有分支）" "APP-C01" "state" "已封存"
+
+# 反面：只要有一個沒封存，就**不是**已封存 —— 還有東西在動，那才是要被看見的。
+# 沒有這一條的話，「全部封存」的判斷被改成「任一封存」不會紅。
+baseline
+mkarchived app-c01-api
+mkchange app-c01-ui
+run_field_has "一個封存、一個還在做：不算已封存" "APP-C01" "state" "規格已合併"
+
+# **多個 change 不印進度條。** `x/y` 只可能是其中一個 change 的分數，
+# 擺在項目那一列上會被讀成整個項目的進度 —— 那是一個看起來很具體的謊。
+# 這一條是突變逼出來的：把聚合改回 `changes.get(cids[0])`，狀態全部照樣對
+# （字典裡 active 一定排在 archived 前面，所以「取第一個」跟聚合同解），
+# **161 條全綠**；差別只在那一列多出 `+1 1/2`。少了這一條，取第一個存活。
+baseline
+mkchange app-c01-api app-c01-ui
+run_all_absent "兩個 change 時不印其中一個的進度條" "+1 1/2"
+
+# **分支也要聚合。** 兩個 change 裡只有**第二個**有實作分支時，
+# 項目就是「實作中」—— 只看第一個的話會少報成「規格已合併」。
+# 這一條也是突變逼出來的：分支集合改成 `branches.get(cids[0])`，
+# 在沒有遠端分支的 fixture 上完全看不出來，163 條全綠。
+baseline
+mkchange app-c01-api app-c01-ui
+mkremote feat/app-c01-ui--slice
+run_field_has "第二個 change 有實作分支：項目就是實作中" "APP-C01" "state" "實作中"
 
 # 讀阻塞類型表要跟工作分解表**用同一份切列**（`split_row`）。
 # 分開寫的話，含 `\|` 的類型詞在兩邊會被切成不一樣的東西 ——

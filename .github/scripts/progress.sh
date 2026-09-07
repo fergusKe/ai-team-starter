@@ -1071,17 +1071,33 @@ def setup_todo():
     return todo
 
 
-def change_for(wid):
-    """列上顯示哪一個。**多個的時候要看得出來有多個。**
+def change_ids_for(wid):
+    """狀態計算要用的**清單**（可能是空的）。顯示用的字串在 `change_label()`。
 
     只回 `hits[0]` 的話，第二個 change 既不在列上、也不在孤兒清單、
     也不在 `--json` 裡 —— 它從整個輸出消失。以前是錯訊號（被當成孤兒），
     改成 `changes_for` 之後變成**沒有訊號**，那更糟。
+
+    **這裡曾經回傳顯示字串，那是一個沉默的 bug。** 2026-09-07 實測：
+    原本多個 change 時回傳 `f"{hits[0]} +{n}"`，而下游拿它去
+    `changes.get(cid, {})` —— 那個鍵永遠不存在，於是 `c = {}`、`br = set()`，
+    四個判斷全不成立，掉進 `else` 報「有分支」。
+
+        FE-W04  有兩個 change（兩個都已封存）  有分支  fe-w04-physics +1
+
+    **一個項目只要有兩個 change，就永遠算不出「已封存」。**
+    根因不是判斷寫錯，是**顯示字串與查詢鍵共用同一個回傳值** ——
+    所以這裡拆成兩支：算狀態的拿清單，印出來的才做格式化。
     """
     hits = changes_for(wid)
     if not hits:
         hits = [c for c in branches if c == wid.lower()
                 or c.startswith(wid.lower() + "-")]
+    return hits
+
+
+def change_label(hits):
+    """列上顯示哪一個。**多個的時候要看得出來有多個。** 只用來印，不要拿去查表。"""
     if not hits:
         return None
     return hits[0] if len(hits) == 1 else f"{hits[0]} +{len(hits) - 1}"
@@ -1120,7 +1136,10 @@ for wid in order:
     mark_word = sorted(exclusive)[0] if exclusive else ""
     blocked = info.get("blocked", "") or "、".join(sorted(info.get("blockers", ())))
 
-    cid = change_for(wid)
+    # `cids` 算狀態，`cid` 只拿來印。**不要把 cid 拿去查任何字典** ——
+    # 多個 change 時它是 `"fe-x01-a +1"` 這種顯示字串，查不到任何東西。
+    cids = change_ids_for(wid)
+    cid = change_label(cids)
 
     # **有週次就是排得動。** 一個項目底下某一列被擋住，不代表整個項目做不了 ——
     # 那樣會把「可以先做一半」藏起來，而那正是最需要被看見的部分。
@@ -1133,31 +1152,39 @@ for wid in order:
     elif mark_word == "Cancelled":
         # 決定不做。**不算未開始** —— 那會讓「還有多少沒做」永遠虛高。
         reason = mark_reason
-        if cid and changes.get(cid, {}).get("state") == "archived":
+        if any(changes.get(c, {}).get("state") == "archived" for c in cids):
             # 標成不做，卻有 change 已經封存了 —— 兩個真實來源打架。
             # **不要挑一個信**，把矛盾攤出來讓人去改。
             state, detail, colour = "矛盾", f"標 Cancelled 但 {cid} 已封存", R
         else:
             state, detail, colour = "已取消", reason, D
-    elif cid is None and not schedulable and (blocked or mark_word in ("Pending", "TBD")):
+    elif not cids and not schedulable and (blocked or mark_word in ("Pending", "TBD")):
         state = "待裁決" if mark_word == "TBD" else "等外部"
         detail, colour = blocked or mark, R
-    elif cid is None:
+    elif not cids:
         state, detail, colour = "未開始", "", D
     else:
-        c = changes.get(cid, {})
-        br = branches.get(cid, set())
-        prog = c.get("prog")
+        # **聚合，不是挑第一個。** 每一個判斷都看全部 change：
+        #   全部封存        → 已封存（少一個沒封存就不是，那還有東西在動）
+        #   任一個有實作分支 → 實作中
+        #   任一個還 active  → 規格已合併
+        # 「一個封存、一個還在做」不是矛盾，是正常的分段交付 —— 它會落在
+        # 「實作中／規格已合併」，因為還有東西在動，那才是要被看見的事。
+        cs = [changes.get(c, {}) for c in cids]
+        brs = set().union(*(branches.get(c, set()) for c in cids))
+        states = [c.get("state") for c in cs]
+        # 進度條只在單一 change 時顯示 —— 多個 change 的 x/y 相加沒有意義。
+        prog = cs[0].get("prog") if len(cs) == 1 else None
         bar = ""
         if prog and prog[1]:
             bar = f"{prog[0]}/{prog[1]}"
-        if c.get("state") == "archived":
+        if states and all(s == "archived" for s in states):
             state, detail, colour = "已封存", f"{cid}", G
-        elif "feat" in br or "fix" in br:
+        elif "feat" in brs or "fix" in brs:
             state, detail, colour = "實作中", f"{cid} {bar}".strip(), Y
-        elif c.get("state") == "active":
+        elif "active" in states:
             state, detail, colour = "規格已合併", f"{cid} {bar}".strip(), Y
-        elif "spec" in br:
+        elif "spec" in brs:
             state, detail, colour = "規格審查中", f"{cid}", Y
         else:
             state, detail, colour = "有分支", f"{cid}", Y
