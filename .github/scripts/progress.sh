@@ -1609,8 +1609,13 @@ def _render_block(stripped):
              # （實測：`--check` 紅在「第 40 行是工作分解表的表頭，但只有 3 欄」。
              # 產生出來的東西要能通過這份文件自己的文法，那也是驗收的一部分。）
              "| 項目 | 狀態 | 依據 |", "|---|---|---|"]
+    # **依狀態排，不依 ID 排。** 讀的人問的是「哪些做完了」——
+    # 按 ID 排的話那幾項會被外部缺口埋在中間。同狀態內再按 ID，
+    # 所以順序仍然是決定性的（diff 才不會亂跳）。
+    _rank = {"已封存": 0, "已完成": 1, "規格已合併": 2, "常態": 3,
+             "矛盾": 4, "待裁決": 5, "等外部": 6, "已取消": 7}
     n = 0
-    for wid in order:
+    for wid in sorted(order, key=lambda w: (_rank.get(_durable_of.get(w, ""), 9), w)):
         st = _durable_of.get(wid, "")
         if st in ("", "未開始"):
             continue
