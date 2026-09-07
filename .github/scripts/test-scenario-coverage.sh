@@ -23,7 +23,7 @@ bump_fail() { FAIL=$((FAIL + 1)); }
 # 每個案例都從乾淨的狀態出發，只壞一個地方。
 setup() {
   rm -rf "$W/repo"
-  mkdir -p "$W/repo/openspec/specs/demo" "$W/repo/bin"
+  mkdir -p "$W/repo/openspec/specs/demo" "$W/repo/bin" "$W/tmp"
   ( cd "$W/repo" && git init -q \
     && git -c user.email=t@t.invalid -c user.name=t commit -q --allow-empty -m x )
   cat > "$W/repo/openspec/specs/demo/spec.md" <<'SPEC'
@@ -69,7 +69,10 @@ json_all_pass() {
 # run <期望退出碼> <說明> <訊息片段>：在 fixture 上跑閘門
 run() {
   local want="$1" desc="$2" needle="$3" out rc
-  out="$(cd "$W/repo" && PATH="$W/repo/bin:$PATH" \
+  # **TMPDIR 指到自己的工作目錄。** 閘門失敗時會保留它的暫存目錄（那是對的，
+  # 失敗要留現場），而這支測試裡有 16 個案例**故意失敗** —— 跑一次就在系統的
+  # $TMPDIR 留 16 個目錄。指到 $W 之後，它們跟著 $W 一起被清掉。
+  out="$(cd "$W/repo" && PATH="$W/repo/bin:$PATH" TMPDIR="$W/tmp" \
          FAKE_JSON="${FAKE_JSON:-}" FAKE_RC="${FAKE_RC:-0}" bash "$GATE" 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
@@ -184,6 +187,13 @@ setup
 add_verify '- **VERIFY-BY** `manual-browser`｜只有兩段'
 FAKE_JSON="$(json_all_pass)"
 run 1 "豁免格式不是三段要紅" "要三段"
+
+# **三段都要有東西。** `manual-browser｜｜理由` 切出來仍然是三段，
+# 中間那段是空字串 —— 沒有證據的豁免跟有證據的長得一模一樣。
+setup
+add_verify '- **VERIFY-BY** `manual-browser`｜｜這條要真的畫面才驗得到'
+FAKE_JSON="$(json_all_pass)"
+run 1 "豁免中間欄位是空的要紅" "要三段"
 
 # **過期的豁免要拿掉。** 測試補上了、豁免還留著，那張免死金牌會一直有效。
 setup

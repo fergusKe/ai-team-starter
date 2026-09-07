@@ -105,6 +105,10 @@ for root in roots:
                     die(f"{f}:{i} 的 VERIFY-BY 不屬於任何 Scenario（孤兒豁免）")
                     continue
                 parts = [x.strip() for x in mv.group(1).split("｜")]
+                # **三段都要有東西。** `manual-browser｜｜理由` 切出來仍然是
+                # 三段，中間那段是空字串 —— 沒有證據的豁免跟有證據的長得一樣。
+                # （Gemini 3.1 Pro 預測、實測存活的突變：拿掉 `not all(parts)`
+                # 之後 19 條測試全綠。）
                 if len(parts) != 3 or not all(parts):
                     die(f"{cur} 的豁免格式不對，要三段："
                         f"`- **VERIFY-BY** <種類>｜<證據>｜<理由>`（{f}:{i}）")

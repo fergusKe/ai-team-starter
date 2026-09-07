@@ -1047,6 +1047,14 @@ baseline
 mkmarkers "<!-- progress:end -->" "<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->"
 run 1 "順序反了要紅" "marker 壞了"
 
+# **貼成兩組也要紅。** 只驗「至少各有一個」的話，`.index()` 會找到第一組、
+# 裁掉它，留下第二組 —— 整份文件的結構就壞了，而且沒有任何訊息。
+# （Gemini 3.1 Pro 預測、實測存活的突變：把 `!= 1` 改成 `== 0` 之後全綠。）
+baseline
+mkmarkers
+mkmarkers
+run 1 "貼成兩組 marker 要紅" "marker 壞了"
+
 # 區塊**不複製**名稱、週次、點數 —— 複製過來的東西會跟上面那張表漂，
 # 而且每個 PR 都動到那幾欄，衝突面積會大到沒有人願意維護它。
 baseline
