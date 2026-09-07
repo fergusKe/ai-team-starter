@@ -158,21 +158,34 @@ run_msg 1 main spec/fresh-change "skip_specs 用 flow style 寫也要拒" "不�
 # 第 1 條（子字串比對）刻意不涵蓋完整 YAML key 語意 —— Unicode escape
 # `"skip\u005fspecs"` 它抓不到。這一條驗**邊界仍然成立**：被第 2 條擋下來，
 # 而且吐的是第 2 條的訊息（不是第 1 條的），證明擋它的是檔案系統檢查。
-run_msg 1 main spec/fresh-change "旗標用 Unicode escape 藏，仍被邊界擋住" "沒有任何 delta spec" \
+run_msg 1 main spec/fresh-change "旗標用 Unicode escape 藏，仍被邊界擋住" "沒有 delta spec" \
   sh -c 'mkdir -p openspec/changes/fresh-change
          printf "{\"schema\": \"spec-driven\", \"skip\\u005fspecs\": true}\n" > openspec/changes/fresh-change/.openspec.yaml
          printf "## Why\n藏旗標。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
 
-run_msg 1 main spec/fresh-change "沒有 delta spec 不得走 spec/" "沒有任何 delta spec" \
+run_msg 1 main spec/fresh-change "沒有 delta spec 不得走 spec/" "status = ready" \
   sh -c 'mkdir -p openspec/changes/fresh-change
          printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
          printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
 
-run_msg 1 main spec/fresh-change "specs/ 在但一條 Scenario 都沒有" "沒有任何 \`#### Scenario:\`" \
+# 這個案例 OpenSpec 的 status 是 done（它看得到那個檔），所以擋它的是
+# `openspec validate --strict` 本身。斷言指向它的訊息才是因果正確的 ——
+# 指向我們的訊息會變成「exit 對但擋它的不是被測的那條」。
+run_msg 1 main spec/fresh-change "specs/ 在但一條 Scenario 都沒有" "must include at least one scenario" \
   sh -c 'mkdir -p openspec/changes/fresh-change/specs/demo
          printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
          printf "## Why\n有目錄沒內容。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
          printf "## ADDED Requirements\n\n### Requirement: 空殼\n系統 SHALL 做某件事。\n" > openspec/changes/fresh-change/specs/demo/spec.md'
+
+# Codex R5 找到的完整繞過：OpenSpec 的 discovery 忽略 dot-directory，
+# 而閘門原本自己用 rglob 掃 specs/ —— 兩邊對「存在規格」的定義漂掉。
+# 旗標用 Unicode escape 藏（第 1 條看不到）＋ Scenario 放在 .hidden/ 裡，
+# 舊版整支閘門回 rc=0。現在改成問 OpenSpec，它會說 specs 是 skipped。
+run_msg 1 main spec/fresh-change "Scenario 藏在 dot-directory 裡不算規格" "沒有 delta spec" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/.hidden
+         printf "{\"schema\": \"spec-driven\", \"skip\\u005fspecs\": true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n藏在 dot-directory。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 幌子\n系統 SHALL 做某事，並在不合法時回錯誤。\n\n#### Scenario: [FRESH-01-S01] 正常\n- **WHEN** a\n- **THEN** b\n" > openspec/changes/fresh-change/specs/.hidden/spec.md'
 
 # 陽性對照：一份正常的新規格要綠，否則上面三條可能只是「所有新 change 都被擋」。
 run 0 main spec/fresh-change "正常的新規格照樣過" \

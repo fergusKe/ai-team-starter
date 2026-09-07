@@ -180,25 +180,39 @@ proposal、沒有任何 Requirement／Scenario 的 change，`openspec validate -
 
 **堵法**：`spec/` 加三條政策檢查。兩個設計決定值得記：
 
-**一、邊界是「檔案系統」，不是「讀懂那個旗標」。**
+**一、邊界是「問 OpenSpec 自己」，不是「我們也判一次有沒有規格」。**
 
-三條檢查裡，**2 與 3（`specs/` 在不在、裡面有沒有 `#### Scenario:`）才是邊界** ——
-它們看檔案系統，完全不解析 YAML，所以旗標怎麼寫都繞不過。
-第 1 條（子字串比對 `skip_specs`）**只是早期訊息**，作用是在常見寫法下先給出
-這個 repo 自己的訊息，而不是讓使用者看到 CLI 那句「set `skip_specs: true`」。
+閘門**不再自己判**「`specs/` 在不在、裡面有沒有 `#### Scenario:`」，
+改成讀 `openspec status --change <id> --json`，要求 `specs` artifact 的
+status 是 `done`。實測（1.11.0）的三個值：`done`（規格寫好了）、
+`ready`（還沒寫）、`skipped`（被旗標豁免，或檔案放在 discovery 看不到的位置）。
 
-為什麼不做完整的 YAML key 語意：那需要一個 YAML parser，而手刻的每一種都是
-「解析 YAML 的一個子集」—— 同一天實測連續破了兩次：
+**為什麼改**：第一版自己判，被打出一條**完整的安全繞過**（外部審查實測）：
 
-| 手刻方式 | 被什麼繞過 |
-|---|---|
-| `^\s*skip_specs\s*:`（行首 key） | flow style `{schema: spec-driven, skip_specs: true}` |
-| 全文子字串 `skip_specs` | Unicode escape `"skip\u005fspecs"`，且會誤擋註解 |
+```
+.openspec.yaml         {"schema":"spec-driven","skip\u005fspecs":true}
+specs/.hidden/spec.md  一條格式完全正確的 Scenario
+```
 
-**這跟被否決的 truthiness 判斷是同一種病，只是換了位置。** 所以第 1 條誠實地
-只做子字串比對，並且**不宣稱**涵蓋完整 YAML key 語意；漏掉的寫法由 2、3 接住。
-測試裡有一條就是拿 Unicode escape 藏旗標，斷言它被**第 2 條**擋下、
-而且吐的是第 2 條的訊息 —— 證明擋它的是檔案系統檢查，不是那個子字串。
+OpenSpec 的 discovery **忽略 dot-directory**，所以它認為沒有 spec、於是接受
+`skip_specs`；而我們的 `rglob("*.md")` **把 dot-directory 算進來**，所以
+「`specs/` 有 Scenario」也成立。兩邊對「存在規格」的定義漂掉，整支閘門回 rc=0。
+
+**這正是〈同一件事寫在兩個地方一定會漂〉—— 我在閘門裡重新實作了一次
+OpenSpec 的 discovery，而且實作錯了。** 解法不是把 discovery 抄得更像
+（`.md` 檔名、capability 目錄層數、要不要跳過 dot-file⋯⋯抄得再像，
+OpenSpec 改版還是會漂），是**去問它**。
+
+`skip_specs` 那條子字串比對留著，但降級成**早期訊息**，作用是先給出本 repo
+的訊息而不是 CLI 那句「set `skip_specs: true`」。它不宣稱涵蓋完整 YAML key
+語意 —— 手刻的每一種都是「解析 YAML 的一個子集」，同一天實測連破兩次：
+行首 regex 被 flow style 繞過、全文子字串被 Unicode escape 繞過。
+漏掉的寫法由 status 檢查接住，那一條沒有解析器可以騙。
+
+**代價**：多一次 `npx openspec status` 呼叫，而且綁死了它的 JSON 形狀。
+所以 fail-closed 寫得很死：沒有輸出、JSON 壞掉、找不到 `specs` 那一項、
+status 是沒見過的值 —— **一律拒**。OpenSpec 換版改輸出形狀時，閘門會紅，
+不會安靜放行。
 
 **二、三條檢查排在 `npx openspec validate` 之前。** 兩個理由：
 

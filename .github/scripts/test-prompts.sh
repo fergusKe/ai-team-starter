@@ -183,6 +183,29 @@ NCOMMIT="$(cd "$W/repo" && git rev-list --count HEAD 2>/dev/null || echo 0)"
   && ok "02 真的產生了一個 commit" \
   || bad "02 真的產生了一個 commit" "HEAD 上只有 ${NCOMMIT} 個 commit"
 
+# 上面三條加起來仍證明不了「規格被 commit 並推上去」（Codex R5 實測）：
+# 把 `git add` 換成 `git commit --allow-empty`，真正的 commit 會因為沒有
+# staged content 而失敗，但區塊沒有 set -e，所以照樣往下 push、照樣呼叫 gh ——
+# rc=0、遠端 ref 對得上、commit 數也 ≥2，全部綠，而遠端那個 commit 是空的。
+#
+# 所以要驗**內容身分**：工作樹乾淨（沒有沒被 commit 的 artifact），
+# 且遠端那個 ref 的 tree 裡真的有 proposal 與 delta spec。
+DIRTY="$(cd "$W/repo" && git status --porcelain 2>/dev/null | grep -v '^?? node_modules' || true)"
+[ -z "$DIRTY" ] \
+  && ok "跑完之後工作樹是乾淨的（artifact 都進了 commit）" \
+  || bad "跑完之後工作樹是乾淨的（artifact 都進了 commit）" "還有未提交：$(printf '%s' "$DIRTY" | head -3 | tr '\n' ' ')"
+
+REMOTE_FILES="$(cd "$W/origin.git" && git ls-tree -r --name-only "refs/heads/spec/$CID" 2>/dev/null || true)"
+HAS_PROPOSAL=0; HAS_SPEC=0
+case "$REMOTE_FILES" in *"openspec/changes/$CID/proposal.md"*) HAS_PROPOSAL=1 ;; esac
+printf '%s\n' "$REMOTE_FILES" | grep -qE "^openspec/changes/$CID/specs/.+\.md$" && HAS_SPEC=1
+[ "$HAS_PROPOSAL" = "1" ] \
+  && ok "遠端那個 ref 的 tree 裡有 proposal.md" \
+  || bad "遠端那個 ref 的 tree 裡有 proposal.md" "遠端只有：$(printf '%s' "$REMOTE_FILES" | grep "changes/$CID" | head -3 | tr '\n' ' ')"
+[ "$HAS_SPEC" = "1" ] \
+  && ok "遠端那個 ref 的 tree 裡有 delta spec" \
+  || bad "遠端那個 ref 的 tree 裡有 delta spec" "找不到 openspec/changes/$CID/specs/**.md"
+
 # 最後一步才是重點：閘門收不收這個分支
 if [ -n "$BR" ]; then
   ( cd "$W/repo" && bash "$GATE" main "$BR" ) >"$W/gate.out" 2>&1

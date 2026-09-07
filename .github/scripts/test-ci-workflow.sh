@@ -74,8 +74,12 @@ if cur is not None: steps.append(cur)
 if not steps: die("ci job 裡抽不到任何步驟")
 
 def field(raw, key):
+    # bare 與 quoted 都要認。只認 bare 的話，`"continue-on-error": true`
+    # 會「沒看見而通過」—— 那是 fail-open，不是 fail-closed。
+    pat = re.compile(r"^\s*(?:%s|\"%s\"|\'%s\'):\s?(.*)$"
+                     % (re.escape(key), re.escape(key), re.escape(key)))
     for l in raw:
-        m = re.match(r"^\s*%s:\s?(.*)$" % re.escape(key), l)
+        m = pat.match(l)
         if m: return m.group(1)
     return None
 
@@ -105,8 +109,8 @@ for l in job:
     if re.match(r"^    steps:\s*$", l): in_steps = True; continue
     if in_steps and re.match(r"^    [A-Za-z_-]+:", l): in_steps = False
     if in_steps: continue
-    m = re.match(r"^    ([A-Za-z_-]+):\s?(.*)$", l)
-    if m: job_keys[m.group(1)] = m.group(2)
+    m = re.match(r"""^    (?:([A-Za-z_-]+)|"([^"]+)"|'([^']+)'):\s?(.*)$""", l)
+    if m: job_keys[m.group(1) or m.group(2) or m.group(3)] = m.group(4)
 
 f = open(out, "w", encoding="utf-8")
 def put(k, v): f.write("%s\t%s\n" % (k, v))
@@ -129,6 +133,8 @@ for t in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow
 
 put("continue_on_error", "1" if any(v is not None for v in coe) else "0")
 put("job_continue_on_error", "1" if "continue-on-error" in job_keys else "0")
+# job 層的 `if: false` 會讓整個 job 被 skip，而 skip 在 required check 上算通過。
+put("job_if", "1" if "if" in job_keys else "0")
 
 # env 值要**完全相等**，不是「包含」。`prefix-${{ github.head_ref }}` 也含那串字，
 # 但傳進閘門的就不是分支名了（2026-09-07 審查的存活突變之一）。
@@ -136,11 +142,14 @@ put("branch_env_base_exact", "1" if e.get("BASE_REF", "").strip() == "${{ github
 put("branch_env_head_exact", "1" if e.get("HEAD_REF", "").strip() == "${{ github.head_ref }}" else "0")
 
 # 每一支必跑的測試：不得有 if:（會被 skip）、run 不得被 `|| true` 之類中和。
+# **精確 allow-list**，不是「列舉會忽略失敗的寫法」。
+# deny-list 列不完：`|| true`、`|| :`、`|| echo x`、`|| exit 0`、`; true`…
+# 只要 run 不是剛好那一句，就當作被動過。
 for t_ in ("test-progress-check.sh", "test-check-pr-branch.sh", "test-ci-workflow.sh", "test-prompts.sh"):
+    want = "bash .github/scripts/%s" % t_
     idxs = [i for i, r in enumerate(runs) if t_ in r]
-    put("neutralised_" + t_, "1" if any(
-        ifs[i] is not None or re.search(r"\|\|\s*(true|:)|&&\s*true|;\s*true\s*$", runs[i])
-        for i in idxs) else "0")
+    put("exact_" + t_, "1" if any(runs[i].strip() == want and ifs[i] is None for i in idxs) else "0")
+    put("actual_" + t_, (runs[idxs[0]].strip() if idxs else ""))
 
 # npm ci 那一步也不得被 if: 關掉（關掉再在後面放一個真的，順序檢查會被騙過）。
 inst_live = [i for i in inst if ifs[i] is None]
@@ -191,12 +200,11 @@ GOT_2="$(sed -n '2p' "$W/repo/argv.list" 2>/dev/null || true)"
 
 # T5：四支閘門測試都要在 ci job 裡
 for t in test-progress-check.sh test-check-pr-branch.sh test-ci-workflow.sh test-prompts.sh; do
-  if [ "$(get "has_$t")" != "1" ]; then
-    bad "ci job 有跑 $t" "workflow 裡找不到這一步"
-  elif [ "$(get "neutralised_$t")" = "1" ]; then
-    bad "ci job 有跑 $t 且沒被中和" "那一步帶了 if: 或 run 被 || true 之類中和掉"
+  if [ "$(get "exact_$t")" = "1" ]; then
+    ok "ci job 跑 ${t}，且 run 剛好是那一句、沒有 if:"
   else
-    ok "ci job 有跑 ${t}（沒有 if:、沒被 || true 中和）"
+    bad "ci job 跑 ${t}，且 run 剛好是那一句、沒有 if:" \
+        "實際 run：$(get "actual_$t")（預期剛好 bash .github/scripts/${t}）"
   fi
 done
 
@@ -209,6 +217,10 @@ done
 [ "$(get job_continue_on_error)" = "0" ] \
   && ok "ci job 自己沒有 continue-on-error" \
   || bad "ci job 自己沒有 continue-on-error" "job 層設了 continue-on-error，整個 job 紅了也不算失敗"
+# job 層的 if: false 會讓整個 job 被 skip —— 而 skipped 在 required check 上算通過。
+[ "$(get job_if)" = "0" ] \
+  && ok "ci job 自己沒有 if:" \
+  || bad "ci job 自己沒有 if:" "job 層設了 if:，整個 job 可能被 skip 而算通過"
 
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS+FAIL))"

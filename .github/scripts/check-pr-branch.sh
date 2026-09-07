@@ -104,71 +104,119 @@ case "$HEAD" in
       exit 1
     fi
 
-    # ── 規格豁免：三條政策檢查，排在 `openspec validate` 之前 ────────────────
+    # ── 規格豁免：兩道檢查，排在 `openspec validate` 之前 ────────────────────
     #
-    # 為什麼要在 validate **之前**：CLI 自己遇到「沒有 delta」時，錯誤訊息會說
+    # 為什麼在 validate **之前**：CLI 遇到「沒有 delta」時，錯誤訊息會說
     #   「set "skip_specs: true" in the change's .openspec.yaml instead」
     # —— 它在推薦這個 repo 明文禁止的東西（docs/DECISIONS.md〈不提供 skip_specs
     # 之類的流程豁免〉）。排在後面的話，使用者先看到的是那句錯誤的建議。
-    #
-    # 這也是這三條為什麼不能只當「縱深防禦」放在後面：驗證過了 —— 放在 validate
-    # 之後它們**永遠跑不到**，而跑不到的防禦沒辦法被測試鎖住，
-    # 那就是〈一條恆真的測試比沒有測試更糟〉那條。要嘛可達，要嘛不要留。
+    # 而且放在後面它們**永遠跑不到**，跑不到的防禦鎖不住 ——
+    # 〈一條恆真的測試比沒有測試更糟〉。要嘛可達，要嘛不要留。
     #
     # 洞本身（2026-09-07 實測）：`skip_specs: true` ＋ 只有 proposal 的 change，
     # `openspec validate --strict` 回 valid rc=0。那份 proposal 合併進 main 之後
     # 就滿足 feat/ 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進
-    # **沒有 bytes 上界**的實作通道 —— 「無規格變更只走有大小上界的通道」失效。
-    python3 - "$ID" <<'SPEC_EXEMPTION'
-import sys, re, pathlib
+    # **沒有 bytes 上界**的實作通道。
+
+    # ── (1) 豁免旗標：這是早期訊息，不是邊界 ────────────────────────────────
+    #
+    # 邊界是下面的 (2)。這一條只是在常見寫法下先給出本 repo 的訊息，
+    # 而不是讓使用者看到 CLI 那句「set skip_specs: true」。
+    #
+    # 為什麼不做完整 YAML key 語意：那需要 parser，而手刻的每一種都是
+    # 「解析 YAML 的一個子集」—— 同一天實測連破兩次：
+    #   `^\s*skip_specs\s*:`（行首 key）→ 被 flow style `{skip_specs: true}` 繞過
+    #   全文子字串 `skip_specs`          → 被 Unicode escape `"skip\u005fspecs"` 繞過
+    # 跟被否決的 truthiness 判斷是同一種病。所以這裡誠實地只做子字串比對，
+    # **不宣稱**涵蓋完整語意；漏掉的寫法由 (2) 接住。
+    python3 - "$ID" <<'SPEC_FLAG_HINT'
+import sys, pathlib
 cid = sys.argv[1]
-base = pathlib.Path("openspec/changes") / cid
-
-def die(*msg):
-    for m in msg: print(m, file=sys.stderr)
-    print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
-    print("  代價是 20000 bytes 的上界（不看內容性質，所以沒有語意判斷的空間）。", file=sys.stderr)
-    sys.exit(1)
-
-# 1. 豁免旗標：**這是早期訊息，不是邊界。**
-#
-#    邊界是下面的 2 與 3 —— 它們看的是**檔案系統**（specs/ 在不在、裡面有沒有
-#    Scenario），完全不解析 YAML，所以旗標怎麼寫都繞不過。這一條的作用只是
-#    在常見寫法下先給出這個 repo 自己的訊息，而不是讓使用者看到 CLI 那句
-#    「set skip_specs: true」（那是它推薦我們禁止的東西）。
-#
-#    為什麼不做完整的 YAML key 語意：那需要一個 YAML parser。手刻的話，
-#    行首 regex 漏 flow style（`{skip_specs: true}`，2026-09-07 實測繞過），
-#    改成全文子字串又漏 Unicode escape（`"skip\u005fspecs"`，同日實測），
-#    而且會誤擋註解 —— **每一種手刻都是「解析 YAML 的一個子集」，
-#    跟被否決的 truthiness 判斷是同一種病。**
-#
-#    所以這裡誠實地只做子字串比對，並且**不宣稱**它涵蓋完整 YAML key 語意。
-#    漏掉的寫法由 2、3 接住，那兩條沒有解析器可以騙。
-cfg = base / ".openspec.yaml"
+cfg = pathlib.Path("openspec/changes") / cid / ".openspec.yaml"
 if cfg.is_file():
     raw = cfg.read_text(encoding="utf-8")
     if "skip_specs" in raw:
         hit = next((f"{i}: {l.strip()}" for i, l in enumerate(raw.splitlines(), 1)
                     if "skip_specs" in l), "?")
-        die(f"✗ openspec/changes/{cid}/.openspec.yaml 出現 skip_specs。",
-            f"    {hit}",
-            "  這個 repo 不提供規格豁免旗標。")
+        print(f"✗ openspec/changes/{cid}/.openspec.yaml 出現 skip_specs。", file=sys.stderr)
+        print(f"    {hit}", file=sys.stderr)
+        print("  這個 repo 不提供規格豁免旗標。", file=sys.stderr)
+        print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
+        print("  代價是 20000 bytes 的上界（不看內容性質）。", file=sys.stderr)
+        sys.exit(1)
+SPEC_FLAG_HINT
 
-# 2. 沒有任何 delta spec。spec/ 這條通道的存在理由就是把規格談定並凍進 main。
-specs = base / "specs"
-if not specs.is_dir():
-    die(f"✗ openspec/changes/{cid}/specs/ 不存在 —— 這個 change 沒有任何 delta spec。",
+    # ── (2) 規格身分：問 OpenSpec 自己，不要複製它的 discovery 規則 ──────────
+    #
+    # 這裡原本自己判「specs/ 在不在、裡面有沒有 #### Scenario:」。
+    # 2026-09-07 審查實測，那是一條**完整的安全繞過**：
+    #
+    #     .openspec.yaml         {"schema":"spec-driven","skip\u005fspecs":true}
+    #     specs/.hidden/spec.md  一條格式完全正確的 Scenario
+    #
+    # OpenSpec 的 discovery **忽略 dot-directory**，所以它認為沒有 spec、
+    # 於是接受 skip_specs；而我們的 `rglob("*.md")` **把 dot-directory 算進來**，
+    # 所以「specs/ 有 Scenario」也成立。兩邊對「存在規格」的定義漂掉了，
+    # 整支閘門實測回 rc=0（`✓ spec 階段：fresh-change`）。
+    #
+    # 這正是〈同一件事寫在兩個地方一定會漂〉—— 我在這裡重新實作了一次
+    # OpenSpec 的 discovery，而且實作錯了。所以改成**跟它要答案**。
+    #
+    # 失敗方向 fail-closed：指令沒輸出、JSON 壞掉、找不到 specs 那一項、
+    # status 是沒見過的值 —— 一律拒，不猜。
+    # JSON 用**環境變數**傳，不要用管線 —— `cmd | python3 - <<'EOF'` 裡
+    # heredoc 會佔住 stdin，`sys.stdin.read()` 讀到的是空的，
+    # 於是每一次都走「沒有輸出 → 拒」那條路。（實測踩過，測試當場抓到。）
+    STATUS_JSON="$(npx openspec status --change "$ID" --json 2>/dev/null || true)" \
+    python3 - "$ID" <<'SPEC_IDENTITY'
+import sys, os, json
+cid = sys.argv[1]
+raw = os.environ.get("STATUS_JSON", "")
+
+def die(*msg):
+    for m in msg: print(m, file=sys.stderr)
+    print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
+    print("  代價是 20000 bytes 的上界（不看內容性質）。", file=sys.stderr)
+    sys.exit(1)
+
+if not raw.strip():
+    die(f"✗ `openspec status --change {cid} --json` 沒有輸出 —— 無法確認有沒有規格。",
+        "  讀不到就當作沒有（fail-closed）。node_modules 裝好了嗎？")
+try:
+    data = json.loads(raw)
+except Exception as e:
+    die(f"✗ `openspec status --change {cid} --json` 的輸出不是合法 JSON：{e}",
+        "  解析不了就當作沒有（fail-closed）。")
+
+specs = None
+for a in data.get("artifacts") or []:
+    if isinstance(a, dict) and a.get("id") == "specs":
+        specs = a
+        break
+if specs is None:
+    die("✗ `openspec status` 的 artifacts 裡找不到 `specs` 這一項。",
+        "  OpenSpec 換版改了輸出形狀會走到這裡 —— 認不得就拒，不要猜。")
+
+# 實測（openspec 1.11.0）的三個值：
+#   done     規格寫好了，OpenSpec 讀得到 delta
+#   ready    還沒寫（沒有 specs/，也沒設旗標）
+#   skipped  被 skip_specs 豁免，或 spec 檔放在 discovery 看不到的位置
+#
+# spec/ 這條通道是「把談定的規格凍進 main」，所以**只接受 done**。
+# 其餘一律拒 —— 包含以後版本新增的值：認不得就拒，不要猜（fail-closed）。
+st = specs.get("status")
+if st == "skipped":
+    die(f"✗ OpenSpec 認為 {cid} **沒有 delta spec**（specs artifact status = skipped）。",
+        "  常見原因：.openspec.yaml 設了 skip_specs，或 spec 檔放在 OpenSpec 的",
+        "  discovery 看不到的位置（例如 dot-directory）。",
         "  spec/ 是用來把規格談定並凍進 main 的，沒有規格就沒有東西可以凍。")
-
-# 3. 目錄在、檔案在，但一條 `#### Scenario:` 都沒有 —— 空殼跟沒有是同一件事。
-n = sum(1 for f in specs.rglob("*.md")
-          for line in f.read_text(encoding="utf-8").splitlines()
-          if line.startswith("#### Scenario:"))
-if n == 0:
-    die(f"✗ openspec/changes/{cid}/specs/ 裡沒有任何 `#### Scenario:`。",
-        "  一份沒有 Scenario 的 delta spec 不構成可驗收的規格。")
-SPEC_EXEMPTION
+if st == "ready":
+    die(f"✗ OpenSpec 說 {cid} 的規格**還沒寫**（specs artifact status = ready）。",
+        "  找不到任何 delta spec。spec/ 的 PR 要帶著寫好的規格，不是佔位。")
+if st != "done":
+    die(f"✗ `specs` artifact 的 status 是 `{st}`，這支閘門只接受 `done`。",
+        "  認不得的值一律拒（fail-closed）—— 放行等於把判斷交給一個沒人讀過的字串。")
+SPEC_IDENTITY
 
     npx openspec validate "$ID" --strict
 
@@ -182,11 +230,11 @@ SPEC_EXEMPTION
 import sys, re, pathlib, subprocess
 cid, base = sys.argv[1], sys.argv[2]
 root = pathlib.Path("openspec/changes") / cid / "specs"
-# 上面的〈規格豁免〉那段已經保證 specs/ 存在且至少有一條 Scenario，
-# 所以這裡到不了。留著是純防禦，不重複那邊的訊息 ——
-# 同一件事寫在兩個地方一定會漂。
-if not root.is_dir():
-    sys.exit(1)
+# 沒有 specs/ 目錄的情況由上面的〈規格身分〉檢查擋掉了（它問 OpenSpec）。
+# 這裡原本留了一條 `if not root.is_dir(): sys.exit(1)` 當縱深防禦，已刪除 ——
+# 正常流程到不了它，而**到不了的分支沒有普通 fixture 驗得到**，
+# 那就違反自己訂的「要嘛可達，要嘛不要留」。掃不到檔案時 seen/bad 都是空的，
+# 後面的邏輯自然什麼都不做。
 
 ID_RE  = re.compile(r"^\[([A-Z0-9]+(?:-[A-Z0-9]+)*-S[0-9]{2})\]\s+\S")
 HEAD_RE = re.compile(r"^####\s+Scenario:\s*(.*)$")
