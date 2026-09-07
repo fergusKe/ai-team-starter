@@ -295,6 +295,49 @@ echo
 
 # ── 正向：乾淨的表格必須是綠的 ────────────────────────────────────
 baseline
+# ── run 自己的陽性對照 ──────────────────────────────────────────────────────
+#
+# 這支撐著 149 條斷言，而**它自己一直沒有讀者**。2026-09-07 自查實測：
+# 把 exit code 比對、訊息比對、或 FAIL 計數任一條弄啞，整套照樣報 149/149。
+#
+#   if [ "$rc" != "$want" ]  →  if false          存活
+#   if [ -n "$needle" ] && ! grep …  →  if false  存活
+#   FAIL=$((FAIL + 1))  →  FAIL=$((FAIL + 0))     存活
+#
+# 「工具說綠」跟「工具還活著」是兩件事。這裡在乾淨狀態下故意給錯的期望，
+# 斷言 run 判它紅。子 shell 隔離計數。
+selftest() { # selftest <說明> <期望輸出片段> <run 的參數...>
+  local desc="$1" want_msg="$2"; shift 2
+  local out
+  out="$( PASS=0; FAIL=0; "$@" 2>&1 )"
+  case "$out" in
+    *"$want_msg"*) echo "✓ $desc"; PASS=$((PASS + 1)) ;;
+    *) echo "✗ ${desc} —— 期望輸出含「${want_msg}」，實際：${out}"; FAIL=$((FAIL + 1)) ;;
+  esac
+}
+# 先驗**計數**還活著。上面那個 selftest 看的是 run 印出來的訊息，
+# 而「FAIL 沒有加一」的時候訊息照樣印 —— 實測 fail-blind 突變因此存活。
+# 所以這裡不看訊息，直接看 $FAIL 有沒有真的加一，然後撤銷。
+_fail_before=$FAIL
+run 1 "自測（不計入）" "" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  echo "✓ run 自測：失敗真的會被計進 \$FAIL"
+  PASS=$((PASS + 1))
+else
+  FAIL=$((_fail_before + 1))
+  echo "✗ run 自測：失敗沒有被計進 \$FAIL —— 這支測試的綠燈是假的"
+fi
+
+selftest "run 自測：退出碼不符時判紅" "期望退出碼 1，實際 0" \
+         run 1 "自測（不計入）" ""
+selftest "run 自測：退出碼對但訊息不符時判紅" "訊息裡沒有" \
+         run 0 "自測（不計入）" "這串字絕不會出現在任何輸出裡"
+# 「不在自己手上」在乾淨 fixture 的 --check 輸出裡一定會出現，
+# 所以 run_absent 拿它當「不該出現的字」必須判紅。
+selftest "run_absent 自測：不該出現的字出現時判紅" "不該出現" \
+         run_absent 0 "自測（不計入）" "不在自己手上"
+
 run 0 "乾淨的表格：綠燈" ""
 
 # ── 標記 ──────────────────────────────────────────────────────────

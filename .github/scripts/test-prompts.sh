@@ -55,6 +55,24 @@ B03="$(extract "$P03")" || { echo "✗ prompts/03 抽不到 \`\`\`bash 區塊"; 
 
 echo "── prompts 合約 ──"
 
+# ── ok()/bad() 自己的陽性對照 ───────────────────────────────────────────────
+#
+# 這支測試唯一的紅燈來源就是 `bad()` 把失敗計進 $FAIL。它壞掉（例如 +1 被寫成
+# +0）的話，**真的有失敗也會報綠** —— 2026-09-07 實測：把 +1 改成 +0、同時
+# 製造一個真的失敗，整支仍然 rc=0。
+#
+# 所以先驗它還活著：叫一次 bad，看 $FAIL 有沒有真的加一，然後撤銷。
+_fail_before=$FAIL
+bad "自測（不計入）" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  ok "bad() 自測：失敗真的會被計進去"
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %s\n' "bad() 自測：它沒有把失敗計進去 —— 這支測試的綠燈是假的"
+fi
+
+
 # ── T1：02 的第一份規格走 spec/，不是 feat/ ────────────────────────────────
 SW02="$(printf '%s\n' "$B02" | grep -oE 'git switch -c [a-z]+/' | head -1 | awk '{print $4}')"
 [ "$SW02" = "spec/" ] && ok "02 開的是 spec/ 分支" || bad "02 開的是 spec/ 分支" "實際：${SW02:-（抽不到 git switch -c）}"

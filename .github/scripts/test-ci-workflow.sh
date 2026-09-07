@@ -165,6 +165,24 @@ get() { awk -F'\t' -v k="$1" '$1==k{sub(/^[^\t]*\t/,""); print; exit}' "$FACTS";
 
 echo "── ci.yml 合約 ──"
 
+# ── ok()/bad() 自己的陽性對照 ───────────────────────────────────────────────
+#
+# 這支測試唯一的紅燈來源就是 `bad()` 把失敗計進 $FAIL。它壞掉（例如 +1 被寫成
+# +0）的話，**真的有失敗也會報綠** —— 2026-09-07 實測：把 +1 改成 +0、同時
+# 製造一個真的失敗，整支仍然 rc=0。
+#
+# 所以先驗它還活著：叫一次 bad，看 $FAIL 有沒有真的加一，然後撤銷。
+_fail_before=$FAIL
+bad "自測（不計入）" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  ok "bad() 自測：失敗真的會被計進去"
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %s\n' "bad() 自測：它沒有把失敗計進去 —— 這支測試的綠燈是假的"
+fi
+
+
 # T1：Branch 那一步的 run 不得直接含 GitHub expression
 BRUN="$(get branch_run)"
 case "$BRUN" in

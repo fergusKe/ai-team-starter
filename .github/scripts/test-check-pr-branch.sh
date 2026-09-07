@@ -118,6 +118,27 @@ run 1 main spec/demo-change "動別人的 change"             sh -c 'mkdir -p op
 run 1 main spec/Bad--Id     "id 格式不合"                 sh -c 'echo x > z.md'
 run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p docs/adr && echo x > docs/adr/0002-y.md'
 
+# run 自己的陽性對照。
+#
+# `run` 撐著 71 條裡的 59 條，而它原本沒有任何東西在驗它還活著 ——
+# 把 `[ "$got" = "$want" ]` 改成 `true`，整套仍然 71/71 全綠（實測）。
+# 這跟 run_msg 那條是同一種病，只是它涵蓋的面積大得多。
+#
+# 這裡故意給一個**一定會失敗**的期望（合法的 chore 小改，卻期望 exit=1），
+# 斷言 run 判它紅。在子 shell 裡跑，計數不會被污染。
+run_selftest_output="$(
+  PASS=0; FAIL=0; N=800
+  run 1 main chore/selftest-should-pass "自測（不計入）" sh -c 'echo "一行" >> README.md' 2>&1
+)"
+N=$((N+1))
+case "$run_selftest_output" in
+  *"期望=1 實際=0"*)
+    printf '  \033[32m✓\033[0m %-46s\n' "run 自測：exit 不符時判紅"; PASS=$((PASS+1)) ;;
+  *)
+    printf '  \033[31m✗\033[0m %-46s\n' "run 自測：exit 不符時判紅"
+    printf '      實際輸出：%s\n' "$run_selftest_output"; FAIL=$((FAIL+1)) ;;
+esac
+
 # run_msg 自己的陽性對照。
 #
 # 它是這一批新測試唯一的斷言強度來源 —— 如果它壞掉（比方 grep 的引號寫錯導致
