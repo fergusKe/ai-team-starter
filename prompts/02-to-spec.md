@@ -16,12 +16,16 @@ artifacts 產完之後，**這一步是 OpenSpec 不管的**：開 draft PR，
 讓討論發生在寫 code 之前。
 
 ```bash
-git switch -c feat/<change-name>
+git switch -c spec/<change-name>
 git add openspec/changes/<change-name>
 git commit -m "spec: <change-name>"
-git push -u origin feat/<change-name>
-gh pr create --draft --title "spec: <change-name>" \
+git push -u origin spec/<change-name>
+gh pr create --draft --base main --title "spec: <change-name>" \
   --body "規格先行，尚未實作。請先看 openspec/changes/<change-name>/。"
 ```
+
+**分支前綴一定要是 `spec/`。** `feat/` 那條要求 proposal **已經在 main 上**，
+所以第一份規格用 `feat/` 開，會被閘門擋下來（`✗ main 上沒有
+openspec/changes/<id>/proposal.md`）。
 
 接著進 `03` 做規格審查。**談定之前不要跑 `/opsx:apply`。**
