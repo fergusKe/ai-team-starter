@@ -121,12 +121,27 @@ PR 標題和內文都不是（它們隨時可以改，而且不影響 CI 看到�
 
 | 分支 | 能改什麼 | 機器上界 |
 |---|---|---|
-| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` | 目錄，加 `openspec validate <id> --strict`，加 **Scenario ID 格式與唯一性** |
+| `spec/<id>` | `openspec/changes/<id>/**` + `docs/adr/**` + **`docs/WBS.md` 的進度區塊** | 目錄，加 `openspec validate <id> --strict`，加 **Scenario ID 格式與唯一性** |
 | `feat/<id>--<slice>` | 不限，但**不得回改**任何 change 的 proposal/design/specs | `<id>` 必須已經在 main 上 |
 | `fix/<id>--<slice>` | 同上 | 同上 |
 | `chore/<描述>` | 不得碰 `openspec/`、`.github/` 與 `.gitattributes` | diff ≤ **20000 bytes**（lockfile 另計 ≤ 1000000），拒絕 binary / symlink / submodule / LFS pointer |
-| `archive/<id>` | 只有那三種 openspec 路徑 | `validate --archived --strict` **與** `validate --all --strict` 都要過 |
+| `archive/<id>` | 那三種 openspec 路徑 + **`docs/WBS.md` 的進度區塊** | `validate --archived --strict` **與** `validate --all --strict` 都要過 |
 | `governance/<描述>` | 規則本身（CI、CODEOWNERS、AGENTS.md、config.yaml） | 只允許列舉的治理路徑；**機器不判斷那些檔案的內容是不是真的治理變更** |
+
+`spec/` 與 `archive/` 為什麼能碰 `docs/WBS.md`：**那個區塊是機器產生的，
+而它的內容由 change 的狀態決定** —— 加一個 change、archive 一個 change，
+都會讓它過期。不准碰的話流程會鎖死（實測過）。邊界是精確的：
+**把區塊拿掉之後的內容必須逐字不變**，週次、點數、標記、阻塞仍然只有
+`governance/` 能動。
+
+### archive 之前先把 tasks 打勾
+
+**archive 的閘門要求「原封不動的搬移」，而 `validate --all --strict` 要求
+沒有未完成項。** 兩者只有先打勾才同時成立 —— 先 archive 再打勾，閘門會紅在
+「archive 不是原封不動的搬移」（實測踩過）。
+
+打勾走 `feat/<id>--<slice>`（`tasks.md` 在實作階段本來就可以動）。
+純規格的 change 沒有程式碼要寫，也還是要有這一個 PR。
 
 **base 一定要是 main。** 對其他分支開 PR 拿到的綠燈不算數，CI 會直接擋 ——
 ruleset 只保護 main，別處的綠燈可以被帶過來。
@@ -251,8 +266,33 @@ bash .github/scripts/check-scenario-coverage.sh
 - **VERIFY-BY** `manual-browser`｜PR #37 的截圖｜WebGL 像素結果 jsdom 證明不了
 ```
 
-種類是**封閉列舉**：`vitest`／`playwright`／`command-negative`／`manual-browser`。
-不認得的種類直接紅 —— 打錯字的豁免等於沒有豁免，而它看起來跟真的一模一樣。
+種類是**封閉列舉**，不認得的直接紅 —— 打錯字的豁免等於沒有豁免，而它看起來跟真的一模一樣：
+
+| 種類 | 用在什麼 | 證據欄要放什麼（**機器在驗**） |
+|---|---|---|
+| `vitest` | 預設，不用寫 | — |
+| `playwright` | E2E 覆蓋的 | — |
+| `command-negative` | 有負向 fixture、而且在 CI 裡會跑的指令 | 指令 |
+| `ci-job` | CI 的 job 本身就是這條的執行 | **`ci.yml` 裡真的存在的步驟名稱** |
+| `manual-browser` | 人在瀏覽器裡看 | **40 位完整 commit SHA，而且在 HEAD 的歷史裡** |
+
+`manual-browser` 為什麼是 SHA 不是 PR 連結：**PR 內文可以編輯、附件可以刪，
+而且要連網才查得到** —— 一份離線的 clone 沒辦法確認它存在。commit 進了 main
+就改不掉、`git show` 就取得回它帶的內容（通常是那個 change 的 `tasks.md`
+裡的驗證紀錄）。
+
+**不要求截圖進 repo。** 一張圖片證明不了它是在什麼版本、什麼環境下拍的，
+只會讓 diff 變大。機器能證明的是「這份紀錄存在、而且從此不會變」，
+剩下的靠 review —— 跟 `commit:` 涵蓋證據同一個強度。
+
+**只掃 `openspec/specs/`，不掃還沒 archive 的 change。** 判準是
+**「一條 Scenario 進入現況描述的那一刻要有人驗它」** —— 那一刻就是 archive。
+
+連 active change 的 delta 一起掃的話，流程會鎖死：`spec/` 分支依設計不能加
+測試，所以第一個 spec PR 就會紅、合進 main 之後 main 一直紅，直到 feat PR
+落地（實測過）。代價講清楚：實作階段漏掉的測試要到 archive PR 才會紅，
+**沒有更早的選項** —— 提早驗就得知道「哪一個 feat slice 是最後一個」，
+而一個 change 可以有很多個 feat PR。
 
 **豁免寫在 Scenario 裡面，不另外開一份清單。** 理由是 `feat/` 分支不得回改
 已批准的 specs（分支閘門擋著），所以豁免只能在 spec PR 階段加 ——
@@ -261,6 +301,22 @@ bash .github/scripts/check-scenario-coverage.sh
 機器還會擋：豁免過期（測試補上了但豁免還留著）、孤兒豁免（指到不存在的
 Scenario）、同一條有兩份豁免、Scenario 沒有穩定 ID、ID 重複、
 以及**一份規格檔都沒掃到**（掃不到不等於全部覆蓋）。
+
+### CI 的四個品質步驟被合約鎖住
+
+`Lint`／`Typecheck`／`Test`／`Build` 四步的 `run` 必須**剛好是那一句**，
+不得有 `if:`／`shell:`／`|| true`。`test-ci-workflow.sh` 掃**整份 workflow**
+（放在 `ci:` 或獨立的 `quality:` job 都可以），而且整份檔案都不准出現
+`continue-on-error`。
+
+為什麼要鎖：用 `ci-job` 豁免的那條 Scenario（「四個工程品質指令都真的跑」）
+拿的就是「CI 有跑這四步」當證據 —— **那條證據站不住的話豁免也站不住**。
+（實測：鎖之前把 `Build` 改成 `run: true`，合約測試照樣全過。）
+
+**有規格就一定要接覆蓋閘門**：`openspec/specs/` 裡有 Scenario 的話，
+`ci.yml` 一定要有 `bash .github/scripts/check-scenario-coverage.sh` 那一步。
+還沒有規格的專案（剛複製的模板）不要求 —— 那支閘門會正確地紅在
+「一份規格檔都沒掃到」。
 
 ### 引用 ID 的寫法
 
