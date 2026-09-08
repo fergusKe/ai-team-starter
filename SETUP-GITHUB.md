@@ -122,7 +122,37 @@ mv .github/CODEOWNERS.example .github/CODEOWNERS
 
 `job` 的 `name: ci` 就是 required check 的名稱，改名要同步改下面的 ruleset。
 
-## 4. Branch Ruleset
+## 4. 合併後自動刪分支（不設的話會堆到沒人管得動）
+
+Settings → General → Pull Requests → ☑ **Automatically delete head branches**
+
+或者：
+
+```bash
+gh api -X PATCH repos/OWNER/REPO -F delete_branch_on_merge=true
+gh api repos/OWNER/REPO -q .delete_branch_on_merge      # 要看到 true
+```
+
+**為什麼要特別講**：這裡的 PR 全部走 **squash 合併**，而 squash 產生的是一個
+全新的 commit —— 原分支的 tip 不是 `main` 的祖先，於是本機刪分支的指令
+**永遠**判定「還沒合併」而拒絕動手，必須改用強制刪除。實際發生過：21 個已經
+合併的分支堆在本機，一般的刪除一個都不肯做，只能逐一確認內容真的在 main 上
+之後強制刪掉。
+
+三層各自要處理，缺一層就會堆：
+
+| 層 | 做法 |
+|---|---|
+| **遠端分支** | 上面那個設定，合併後 GitHub 自己刪 |
+| **本機的遠端追蹤分支**（`origin/xxx`） | `git config fetch.prune true`，`git fetch` 時自己清 |
+| **本機分支** | 合併時用 `gh pr merge <PR> --squash --delete-branch`，它會連本機一起刪 |
+
+最後一層要注意：**分支被 worktree 佔著的時候刪不掉**（訊息是
+`cannot delete branch 'x' used by worktree at ...`）。先 `git worktree remove`
+再合併，或者事後補刪。在 worktree 裡開分支是這個流程的預設做法，
+所以這件事會常常遇到。
+
+## 5. Branch Ruleset
 
 **不要用 UI 一格一格點。** 模板附了 `.github/ruleset.json`，那就是 API payload 本身。
 
@@ -213,7 +243,7 @@ gh api repos/<owner>/<repo>/rulesets/<id> --jq .current_user_can_bypass
 **加了誰就要寫進 `AGENTS.md`。** 不寫的話，讀文件的人（和 agent）會以為
 「每個 PR 都要第二個人看過」對所有人成立 —— 而對清單上的人那是自願，不是機制。
 
-## 5. 分支命名從第一天就被擋
+## 6. 分支命名從第一天就被擋
 
 `.github/scripts/check-pr-branch.sh` 是**封閉列舉**，沒列到的前綴一律紅：
 
@@ -247,7 +277,7 @@ symlink、submodule、binary、一行 minified、archive 沒補 Purpose、未知
 動一條 regex，都可能在別的地方開一個洞，而**洞是安靜的**：
 它不會讓任何東西變紅，只會讓本來該紅的東西變綠。
 
-## 6. 實測 —— 這步不能跳
+## 7. 實測 —— 這步不能跳
 
 **沒有親眼看過閘門擋下東西，就不能宣稱這一層存在。** 四個：
 
