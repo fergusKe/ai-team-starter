@@ -330,27 +330,15 @@ EOF
   bump_fail
 }
 
-# mkevid <涵蓋證據那一格的內容> [表頭第八欄的字]：追加一張**八欄**的表
-#
-# 第八欄是選填的（只有需要的那張表加），所以 fixture 要能造出「同一份 WBS
-# 裡有七欄的表、也有八欄的表」—— 兩種寬度並存正是這個設計的重點，
-# 也是最容易寫壞的地方。
-mkevid() {
-  local h="${2:-涵蓋證據}"
+# mkdone <標記那一格的內容>：追加一張表，項目 EVD-A01 帶著指定的標記。
+# `Done` 是整張表裡**唯一一個人手寫的「事實」**，所以它要有自己的 fixture。
+mkdone() {
   {
     printf '\n## EVD 證據\n\n'
-    printf '| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 | %s |\n' "$h"
-    printf '|---|---|---|---|---|---|---|---|\n'
-    printf '| EVD-A01 | 有證據的項目 | 做事 | W1 | 3 | | | %s |\n' "$1"
+    printf '| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |\n'
+    printf '|---|---|---|---|---|---|---|\n'
+    printf '| EVD-A01 | 治理工作 | 做事 | W1 | 3 | | %s |\n' "$1"
   } >> "$W/docs/WBS.md"
-}
-
-# mkcommit：在 fixture 的 git 歷史裡造一個 commit，印出它的完整 SHA
-mkcommit() {
-  git -C "$W" init -q 2>/dev/null
-  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
-  GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m evid 2>/dev/null
-  git -C "$W" rev-parse HEAD
 }
 
 # mkorigin <ok|broken>：給 fixture 一個 origin
@@ -706,14 +694,16 @@ run_no_item "圍籬裡的範例表格不算工作項目" "APP-X99"
 # ── 同形與不可見字元：靠清單永遠列不完（第六輪）───────────────────
 
 # 下面每一個都曾經**整段靜默**（`APP-Q99` 不存在也不會紅）。
-# 現在靠 Unicode 類別（Cf/Mn 拿掉、Pd 折成 `-`）而不是一串 replace。
+# 現在有兩層：`Pd` 類折成 `-`（於是 `APP﹣Q99` 直接被當成 `APP-Q99` 驗），
+# 非 `Pd` 的相似字元**不折**，由〈認形狀不認字元〉那條報出來。
+# **兩種結局都不是靜默** —— 差別只在「當成正確」與「叫你改成 ASCII」。
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP─Q99\` |"
-run 1 "U+2500 製表線寫的 ID 也要驗" "APP-Q99 不存在"
+run 1 "U+2500 製表線寫的 ID 要報形狀" "不是連字號"
 
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APPーQ99\` |"
-run 1 "U+30FC 日文長音寫的 ID 也要驗" "APP-Q99 不存在"
+run 1 "U+30FC 日文長音寫的 ID 要報形狀" "不是連字號"
 
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP﹣Q99\` |"
@@ -938,96 +928,41 @@ run_json_top "origin 正常時 remote_fresh=True" "remote_fresh" "True"
 baseline
 run_all_has "有 repo 但沒有 origin 也算不新鮮（理由不同）" "沒有設定 origin"
 
-# ── 涵蓋證據（第八欄）───────────────────────────────────────────────
+# ── 標記 Done：治理工作的完成 ──────────────────────────────────────
 #
 # 解的是這個盲區：一項工作**做完了，但沒有跟它同名的 change**，於是永遠
 # 算不出狀態。實例是 `FE-O10 CI 補齊` —— 它有自己的 PR，但改 `.github/`
 # 只能走 `governance/`，而 `governance/` 不准碰 `openspec/`。
 # **規則互斥造成的結構性盲區，不是誰忘了開 change。**
+#
+# 這一格**機器沒有驗過任何東西**（不像其他狀態是從 git 與 OpenSpec 推的），
+# 所以能鎖住的只有三件事：它真的生效、它要有理由、它不准跟 change 並存。
 
-# 認得的兩種寫法要真的生效（陽性對照 —— 少了它，「一律報錯」也會全綠）
+baseline
+mkdone "Done｜governance PR #58，commit ae78a12c"
+run 0 "標 Done 的治理項目：綠" ""
+run_field_has "而且狀態真的是「已完成」" "EVD-A01" "state" "已完成"
+
+# **叫「已完成」不叫「已封存」。** 借用 OpenSpec 的字會讓兩種強度不同的
+# 結論長得一樣 —— 一個是 git 證明的，一個是人宣告的。上面那條
+# `run_field_has "已完成"` 就鎖住了它：改成「已封存」它會紅。
+
+# 沒有理由的 Done，六個月後沒有人知道憑什麼。
+baseline
+mkdone "Done"
+run 1 "Done 沒有寫理由要紅" "理由"
+
+# **有 change 就不准標 Done。** 狀態算得出來，兩個來源就會漂 ——
+# 把矛盾攤出來，不要挑一邊信。
 baseline
 mkchange evd-a01-x
-mkevid "change:evd-a01-x"
-run 0 "涵蓋證據指到存在的 change：綠" ""
-run_field_has "而且狀態真的用了它" "EVD-A01" "state" "規格已合併"
+mkdone "Done｜其實有 change"
+run_field_has "有 change 還標 Done：報矛盾" "EVD-A01" "state" "矛盾"
 
+# 互斥性：Done 跟其他處置不得並存（沿用既有的互斥檢查）。
 baseline
-SHA="$(mkcommit)"
-mkevid "commit:$SHA"
-run 0 "涵蓋證據指到已合併的 commit：綠" ""
-run_field_has "狀態是「已完成」而不是「已封存」" "EVD-A01" "state" "已完成"
-
-# （**借用「已封存」會讓兩種強度不同的結論長得一樣** —— commit 證據只證明
-# 「那個 commit 存在而且已合併」，沒有證明語意上做完了。這一點由上面那條
-# `run_field_has "已完成"` 鎖住：把狀態改成「已封存」它就紅。
-# 原本另外寫了一條「--all 的輸出裡不准出現『已封存』」，那是錯的斷言 ——
-# 遠端不新鮮的警告本文裡就有「已封存」三個字，它抓的是那個。）
-
-# 指到不存在的東西要紅
-baseline
-mkevid "change:no-such-change"
-run 1 "涵蓋證據指到不存在的 change 要紅" "都沒有它"
-
-baseline
-mkcommit >/dev/null
-mkevid "commit:0000000000000000000000000000000000000000"
-run 1 "涵蓋證據指到不存在的 commit 要紅" "在本機找不到"
-
-# **「找不到」跟「還沒合併」要分開講** —— 前者可能只是還沒 fetch，
-# 後者是證據真的還沒進來。講錯會叫人去查一個根本不存在的問題。
-baseline
-mkcommit >/dev/null
-# `commit-tree` 也要身分（runner 上沒有全域 git config）。
-# **而且不可以把錯誤吞掉** —— 原本寫 `2>/dev/null`，於是它在 CI 上失敗、
-# SHA2 是空字串、`commit:` 後面沒東西，測到的變成「寫法不合文法」而不是
-# 「不在 HEAD 歷史裡」。fixture 自己 fail-open，本機看不到（實測：CI 才紅）。
-# **把身分來源縮到只剩明寫的那一份。**
-#
-# 這個修正原本只在「runner 剛好沒有身分」的機器上測得到 —— 拿掉下面那幾個
-# 環境變數，在有全域 git config 的機器上照樣 207/207 全過（外部審查實測）。
-#
-#   GIT_CONFIG_GLOBAL=/dev/null   不讀 ~/.gitconfig
-#   GIT_CONFIG_NOSYSTEM=1          不讀 /etc/gitconfig
-#   -c user.useConfigOnly=true     不准從 hostname／使用者名稱推導
-#
-# 三個一起，identity 就**只能**來自那四個環境變數；拿掉它們在任何機器上
-# 都必然紅。
-SHA2="$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-        GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
-        GIT_COMMITTER_EMAIL=t@t.invalid \
-        git -c user.useConfigOnly=true -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan)"
-[ -n "$SHA2" ] || { echo "✗ 測試腳本自己壞了：commit-tree 沒有產生 SHA"; bump_fail; }
-mkevid "commit:$SHA2"
-run 1 "commit 存在但不在 HEAD 歷史裡要紅" "不在目前 HEAD 的歷史裡"
-
-# 寫法不合文法要紅。**短 SHA 不算** —— 它會隨著 repo 長大而變得不唯一。
-baseline
-mkevid "commit:abc1234"
-run 1 "短 SHA 不算證據" "不是認得的寫法"
-
-baseline
-mkevid "https://github.com/x/y/pull/30"
-run 1 "貼連結不算證據" "不是認得的寫法"
-
-baseline
-mkchange evd-a01-x
-mkevid "change:evd-a01-x change:evd-a01-x"
-run 1 "同一個證據寫兩次要紅" "寫了不只一次"
-
-# **表頭的第八欄只能是「涵蓋證據」。** 加在別的位置或加第九欄，
-# 底下每一列的意思都會跟著移位，而畫面上還是一張正常的表。
-baseline
-mkevid "" "備註"
-run 1 "第八欄表頭不是「涵蓋證據」要紅" "只能是「涵蓋證據」"
-
-# 證據非空時**不回退到命名推導**：兩種來源同時生效的話，
-# 「這個狀態是從哪裡來的」就沒有單一答案了。
-baseline
-mkchange evd-a01 evd-a01-other
-mkevid "change:evd-a01"
-run_field_has "證據非空就只認證據，不再混用命名推導" "EVD-A01" "evidence_changes" "evd-a01"
-run_all_absent "命名推導的第二個 change 不准偷偷加進來" "+1"
+mkdone "Done+Cancelled｜兩個都標"
+run 1 "Done 跟 Cancelled 並存要紅" ""
 
 
 # ── docs/WBS.md 的進度區塊 ────────────────────────────────────────
@@ -1064,11 +999,11 @@ mkchange app-c01-x
 mkmarkers
 render
 mkchange app-p03-y
-run 1 "來源變了但區塊沒重產：--check 要紅" "跟現在的狀態對不上"
+run 0 "來源變了但區塊沒重產：不擋門，但要說出來" "進度區塊跟現在的狀態對不上"
 
-# 重產之後就綠了 —— 沒有這條的話，「永遠報對不上」也會讓上一條通過。
+# 重產之後連提醒都不該有 —— 沒有這條的話，「永遠提醒」也會讓上一條通過。
 render
-run 0 "重產之後 --check 綠" ""
+run_absent 0 "重產之後不再提醒" "進度區塊跟現在的狀態對不上"
 
 # ── 耐久狀態自己也要被鎖住 ────────────────────────────────────────
 #
@@ -1113,16 +1048,13 @@ ORDER
 then echo "✓ 區塊依狀態排序，不依 ID"; PASS=$((PASS + 1))
 else echo "✗ 區塊沒有依狀態排序（已封存的 DEP-G01 要排在常態的 APP-O10 前面）"; bump_fail; fi
 
-# **兩種證據並列時兩個都要留。** `--json` 兩個都有，而區塊原本只印 commit，
-# change 從「依據」欄整個消失 —— 而區塊是大部分人唯一會看的地方。
+# **標 Done 的項目在區塊裡要說出狀態是哪裡來的。** 它沒有 change 可以指，
+# 那一格如果是「—」，看起來像資料掉了。
 baseline
-mkchange evd-a01-x
-SHA3="$(mkcommit)"
-mkevid "change:evd-a01-x commit:$SHA3"
+mkdone "Done｜governance PR #58"
 mkmarkers
 render
-run_block have "並列證據：change 要出現在區塊裡" "evd-a01-x"
-run_block have "並列證據：commit 也要出現在區塊裡" "${SHA3:0:12}"
+run_block have "Done 的項目在區塊裡指得出來源" "標記"
 
 # **指紋要雜湊整份 WBS，不是只有區塊前面那一段。** 把 marker 放在最前面，
 # 於是整份文件都在「區塊之後」；改最後面那一列，只雜湊前半的話指紋不會動。
@@ -1364,7 +1296,7 @@ run 1 "全形數字寫的 ID 也要驗" "APP-C99 不存在"
 
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP−C99\` |"
-run 1 "U+2212 減號寫的 ID 也要驗" "APP-C99 不存在"
+run 1 "U+2212 減號寫的 ID 要報形狀" "不是連字號"
 
 baseline
 edit_roadmap "| 骨架 | \`APP-C01\` |" "| 骨架 | \`APP-C01\`、\`APP-C9​9\` |"

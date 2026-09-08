@@ -12,8 +12,12 @@ npm run lint && npm run typecheck && npm test && npm run build
 
 - [ ] `openspec validate --strict` 通過
 - [ ] 每條 Requirement 都有對應實作
-- [ ] **每個 Scenario 都有對應測試** —— 不是說得出來就好，跑
-      `bash .github/scripts/check-scenario-coverage.sh`，它會告訴你差哪幾條
+- [ ] **每個 Scenario 都有對應測試** —— 跑
+      `bash .github/scripts/check-scenario-coverage.sh`，**把它印出來的缺口清單
+      原文貼上**，然後對每一條說出處置：補測試／改成人工驗證並把紀錄寫進
+      `tasks.md`／說明它為什麼不需要自動測試。
+      **沒有缺口也要貼**「0 條沒有」那一行 —— 沒有貼就是沒有跑。
+      那支回 `2` 代表**量不到**（測試沒綠、報告產不出來），不是沒有缺口。
 - [ ] `tasks.md` 沒有殘留的 `- [ ]`
 - [ ] lint / typecheck / test / build 全綠（貼輸出）
 - [ ] CI 在 PR 上綠燈
@@ -31,11 +35,11 @@ npm run lint && npm run typecheck && npm test && npm run build
 沒有未完成項。** 兩者只有先打勾才同時成立 —— 先 archive 再打勾會紅在
 「archive 不是原封不動的搬移」。純規格的 change 也一樣。
 
-### 這個 change 的 Scenario 到這裡才會被閘門要求
+### 這個 change 的 Scenario 要到 archive 之後才會出現在缺口報告裡
 
-覆蓋閘門只掃 `openspec/specs/`。**archive 是它第一次看見這些 Scenario 的時候**
-—— 沒有測試、也沒有 `VERIFY-BY` 豁免的話，archive PR 會紅。
-不用單元測試驗的，在 Scenario 底下寫豁免（種類與證據格式見 `AGENTS.md`）。
+缺口報告只掃 `openspec/specs/`，而 archive 才會把 delta 折進去。所以**在
+archive PR 之後再跑一次**，把新出現的缺口一起處置掉 —— 沒有任何閘門會替你
+記得這件事。
 
 全部通過、PR 合併之後：
 
