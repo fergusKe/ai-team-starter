@@ -88,9 +88,58 @@ list() { echo "$CHANGED" | grep -E "$1" | sed 's/^/    /'; }
 
 ID_RE='^[a-z0-9]+(-[a-z0-9]+)*$'
 
+# ── docs/WBS.md 的進度區塊：spec/ 與 archive/ 只准動那一段 ────────────────
+#
+# 那個區塊是 `progress.sh --render` 產生的，內容由 change 的狀態決定 ——
+# **所以「加一個 change」與「archive 一個 change」本來就會讓它過期**，
+# 而那兩種分支原本不准碰 `docs/WBS.md`。結果是流程鎖死：
+#
+#     spec/<id> 加一個 change → 區塊過期 → progress.sh --check 紅
+#     而 spec/ 不能改 docs/WBS.md → 沒辦法把它修綠
+#
+# （實測：PR #62 就是這樣紅的。跟覆蓋閘門那次是同一型的鎖死。）
+#
+# 放寬的邊界要精確：**允許改，但把區塊拿掉之後的內容必須逐字不變。**
+# 週次、點數、標記、阻塞 —— 那些是治理決定，仍然只有 governance/ 能動。
+wbs_block_only() { # wbs_block_only <base-ref> ；只動了區塊回 0
+  python3 - "$1" <<'WBSONLY'
+import subprocess, sys
+base = sys.argv[1]
+S, E = "<!-- progress:start", "<!-- progress:end -->"
+
+def strip(text):
+    """拿掉區塊之後的內容。marker 不成對就丟例外，由下面統一擋掉。
+
+    這裡原本還有「各恰好一個」與「順序正確」兩道守衛。**兩道都不可達** ——
+    下面那個逐字比對已經擋掉所有那些形狀了（實測：把兩道守衛各拿掉一次，
+    83 條測試全綠）。不可達的防禦鎖不住，要嘛可達，要嘛不要留。
+    """
+    i, j = text.index(S), text.index(E)
+    return text[:i] + text[j + len(E):]
+
+def show(ref):
+    r = subprocess.run(["git", "show", f"{ref}:docs/WBS.md"],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+old, new = show(base), show("HEAD")
+# 檔案是新增的、或任一邊的 marker 壞掉 —— 都不放行，交給 governance/ 處理。
+if old is None or new is None:
+    sys.exit(1)
+try:
+    a, b = strip(old), strip(new)
+except ValueError:
+    # marker 不成對（少一個、順序反了）—— 沒有唯一答案，交給 governance/。
+    sys.exit(1)
+sys.exit(0 if a == b else 1)
+WBSONLY
+}
+
+
 case "$HEAD" in
 
   # ── spec/<id> ── 規格階段
+
   spec/*)
     ID="${HEAD#spec/}"
     [[ "$ID" =~ $ID_RE ]] || fail "change id '${ID}' 格式不合。只准小寫、數字、單個連字號，且不得含 '--'。"
@@ -98,11 +147,156 @@ case "$HEAD" in
     # 只准動自己這個 change 的目錄，加上 ADR。
     # ADR 要放進來是因為 config.yaml 要求重大決策「同時」留一份 ADR，
     # 而 ADR 在 docs/adr/ 不在 changes/ 底下。少了這條，有 design 的 change 開不出 PR。
-    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/changes/${ID}/|docs/adr/)" || true)"; [ -n "$OUT" ]; then
-      echo "✗ spec/${ID} 只能修改 openspec/changes/${ID}/** 與 docs/adr/**。" >&2
+    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/changes/${ID}/|docs/adr/|docs/WBS\.md$)" || true)"; [ -n "$OUT" ]; then
+      echo "✗ spec/${ID} 只能修改 openspec/changes/${ID}/**、docs/adr/** 與 docs/WBS.md 的進度區塊。" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
     fi
+
+    # 動了 docs/WBS.md 的話，只准動進度區塊。
+    if echo "$CHANGED" | grep -qx 'docs/WBS.md'; then
+      wbs_block_only "origin/${BASE}" \
+        || fail "spec/${ID} 動到 docs/WBS.md 進度區塊以外的地方。週次、點數、標記、阻塞是治理決定，請走 governance/。"
+      echo "✓ docs/WBS.md 只動了進度區塊"
+    fi
+
+    # ── 規格豁免：兩道檢查，排在 `openspec validate` 之前 ────────────────────
+    #
+    # 為什麼在 validate **之前**：CLI 遇到「沒有 delta」時，錯誤訊息會說
+    #   「set "skip_specs: true" in the change's .openspec.yaml instead」
+    # —— 它在推薦這個 repo 明文禁止的東西（docs/DECISIONS.md〈不提供 skip_specs
+    # 之類的流程豁免〉）。排在後面的話，使用者先看到的是那句錯誤的建議。
+    # 而且放在後面它們**永遠跑不到**，跑不到的防禦鎖不住 ——
+    # 〈一條恆真的測試比沒有測試更糟〉。要嘛可達，要嘛不要留。
+    #
+    # 洞本身（2026-09-07 實測）：`skip_specs: true` ＋ 只有 proposal 的 change，
+    # `openspec validate --strict` 回 valid rc=0。那份 proposal 合併進 main 之後
+    # 就滿足 feat/ 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進
+    # **沒有 bytes 上界**的實作通道。
+
+    # ── (1) 豁免旗標：這是早期訊息，不是邊界 ────────────────────────────────
+    #
+    # 邊界是下面的 (2)。這一條只是在常見寫法下先給出本 repo 的訊息，
+    # 而不是讓使用者看到 CLI 那句「set skip_specs: true」。
+    #
+    # 為什麼不做完整 YAML key 語意：那需要 parser，而手刻的每一種都是
+    # 「解析 YAML 的一個子集」—— 同一天實測連破兩次：
+    #   `^\s*skip_specs\s*:`（行首 key）→ 被 flow style `{skip_specs: true}` 繞過
+    #   全文子字串 `skip_specs`          → 被 Unicode escape `"skip\u005fspecs"` 繞過
+    # 跟被否決的 truthiness 判斷是同一種病。所以這裡誠實地只做子字串比對，
+    # **不宣稱**涵蓋完整語意；漏掉的寫法由 (2) 接住。
+    python3 - "$ID" <<'SPEC_FLAG_HINT'
+import sys, pathlib
+cid = sys.argv[1]
+cfg = pathlib.Path("openspec/changes") / cid / ".openspec.yaml"
+if cfg.is_file():
+    raw = cfg.read_text(encoding="utf-8")
+    if "skip_specs" in raw:
+        hit = next((f"{i}: {l.strip()}" for i, l in enumerate(raw.splitlines(), 1)
+                    if "skip_specs" in l), "?")
+        print(f"✗ openspec/changes/{cid}/.openspec.yaml 出現 skip_specs。", file=sys.stderr)
+        print(f"    {hit}", file=sys.stderr)
+        print("  這個 repo 不提供規格豁免旗標。", file=sys.stderr)
+        print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
+        print("  代價是 20000 bytes 的上界（不看內容性質）。", file=sys.stderr)
+        sys.exit(1)
+SPEC_FLAG_HINT
+
+    # ── (2) 規格身分：問 OpenSpec 自己，不要複製它的 discovery 規則 ──────────
+    #
+    # 這裡原本自己判「specs/ 在不在、裡面有沒有 #### Scenario:」。
+    # 2026-09-07 審查實測，那是一條**完整的安全繞過**：
+    #
+    #     .openspec.yaml         {"schema":"spec-driven","skip\u005fspecs":true}
+    #     specs/.hidden/spec.md  一條格式完全正確的 Scenario
+    #
+    # OpenSpec 的 discovery **忽略 dot-directory**，所以它認為沒有 spec、
+    # 於是接受 skip_specs；而我們的 `rglob("*.md")` **把 dot-directory 算進來**，
+    # 所以「specs/ 有 Scenario」也成立。兩邊對「存在規格」的定義漂掉了，
+    # 整支閘門實測回 rc=0（`✓ spec 階段：fresh-change`）。
+    #
+    # 這正是〈同一件事寫在兩個地方一定會漂〉—— 我在這裡重新實作了一次
+    # OpenSpec 的 discovery，而且實作錯了。所以改成**跟它要答案**。
+    #
+    # 失敗方向 fail-closed：指令沒輸出、JSON 壞掉、找不到 specs 那一項、
+    # status 是沒見過的值 —— 一律拒，不猜。
+    # JSON 用**環境變數**傳，不要用管線 —— `cmd | python3 - <<'EOF'` 裡
+    # heredoc 會佔住 stdin，`sys.stdin.read()` 讀到的是空的，
+    # 於是每一次都走「沒有輸出 → 拒」那條路。（實測踩過，測試當場抓到。）
+    # `|| true` 會吞掉 status 的非零退出碼 —— 實測（2026-09-07 審查）：
+    # 一個先吐出**完整合法 JSON**、再 `exit 7` 的 status，整支閘門回 rc=0。
+    # 指令失敗就是讀不到答案，不管它印了什麼。所以 rc 要一起傳下去判。
+    # `|| STATUS_RC=$?` 是必要的：`set -e` 之下，賦值裡的命令替換失敗會**直接把
+    # 腳本殺掉**（實測 exit 7），下面那段診斷訊息根本來不及印。方向雖然還是
+    # fail-closed，但使用者只會看到一個沒有解釋的退出碼。
+    STATUS_RC=0
+    STATUS_JSON="$(npx openspec status --change "$ID" --json 2>/dev/null)" || STATUS_RC=$?
+    STATUS_JSON="$STATUS_JSON" STATUS_RC="$STATUS_RC" \
+    python3 - "$ID" <<'SPEC_IDENTITY'
+import sys, os, json
+cid = sys.argv[1]
+raw = os.environ.get("STATUS_JSON", "")
+rc = os.environ.get("STATUS_RC", "")
+
+def die(*msg):
+    for m in msg: print(m, file=sys.stderr)
+    print("  真的沒有規格變更的東西走 `chore/` 分支 —— 那條不需要 change，", file=sys.stderr)
+    print("  代價是 20000 bytes 的上界（不看內容性質）。", file=sys.stderr)
+    sys.exit(1)
+
+if rc != "0":
+    die(f"✗ `openspec status --change {cid} --json` 以 exit {rc} 結束。",
+        "  指令失敗就是讀不到答案 —— 不管它印了什麼。fail-closed。")
+if not raw.strip():
+    die(f"✗ `openspec status --change {cid} --json` 沒有輸出 —— 無法確認有沒有規格。",
+        "  讀不到就當作沒有（fail-closed）。node_modules 裝好了嗎？")
+try:
+    data = json.loads(raw)
+except Exception as e:
+    die(f"✗ `openspec status --change {cid} --json` 的輸出不是合法 JSON：{e}",
+        "  解析不了就當作沒有（fail-closed）。")
+
+# **恰好一筆**。原本取第一筆就 break，於是
+#   {"artifacts":[{"id":"specs","status":"done"},{"id":"specs","status":"skipped"}]}
+# 會挑到 done 而放行（2026-09-07 實測 rc=0）。
+# 對一份宣稱 fail-closed 的 JSON 合約，歧義資料要拒絕，不是挑一筆用。
+matches = [a for a in (data.get("artifacts") or [])
+           if isinstance(a, dict) and a.get("id") == "specs"]
+if len(matches) == 0:
+    die("✗ `openspec status` 的 artifacts 裡找不到 `specs` 這一項。",
+        "  OpenSpec 換版改了輸出形狀會走到這裡 —— 認不得就拒，不要猜。")
+if len(matches) > 1:
+    die(f"✗ `openspec status` 的 artifacts 裡有 {len(matches)} 筆 `specs`。",
+        "  歧義的資料一律拒 —— 挑其中一筆用等於讓輸入決定要看哪個答案。")
+specs = matches[0]
+
+# openspec 1.11.0 的型別明列四個值（instruction-loader.d.ts）：
+#   done     **output glob 找到檔案**——注意這不等於「規格有效」，
+#            內容有效性是後面 `openspec validate --strict` 在判的
+#   ready    還沒寫（沒有 specs/，也沒設旗標）
+#   skipped  被 skip_specs 豁免，或 spec 檔放在 discovery 看不到的位置
+#   blocked  依賴的 artifact 還沒完成（例如連 proposal 都沒有）
+#
+# 只接受 done。ready／skipped／blocked 都不是一個合法 spec PR 的狀態。
+#
+# spec/ 這條通道是「把談定的規格凍進 main」，所以**只接受 done**。
+# 其餘一律拒 —— 包含以後版本新增的值：認不得就拒，不要猜（fail-closed）。
+st = specs.get("status")
+if st == "skipped":
+    die(f"✗ OpenSpec 認為 {cid} **沒有 delta spec**（specs artifact status = skipped）。",
+        "  常見原因：.openspec.yaml 設了 skip_specs，或 spec 檔放在 OpenSpec 的",
+        "  discovery 看不到的位置（例如 dot-directory）。",
+        "  spec/ 是用來把規格談定並凍進 main 的，沒有規格就沒有東西可以凍。")
+if st == "ready":
+    die(f"✗ OpenSpec 說 {cid} 的規格**還沒寫**（specs artifact status = ready）。",
+        "  找不到任何 delta spec。spec/ 的 PR 要帶著寫好的規格，不是佔位。")
+if st == "blocked":
+    die(f"✗ OpenSpec 說 {cid} 的 specs 被擋住（specs artifact status = blocked）。",
+        "  它依賴的 artifact 還沒完成 —— 通常是連 proposal 都還沒寫。")
+if st != "done":
+    die(f"✗ `specs` artifact 的 status 是 `{st}`，這支閘門只接受 `done`。",
+        "  認不得的值一律拒（fail-closed）—— 放行等於把判斷交給一個沒人讀過的字串。")
+SPEC_IDENTITY
 
     npx openspec validate "$ID" --strict
 
@@ -116,8 +310,11 @@ case "$HEAD" in
 import sys, re, pathlib, subprocess
 cid, base = sys.argv[1], sys.argv[2]
 root = pathlib.Path("openspec/changes") / cid / "specs"
-if not root.is_dir():
-    sys.exit(0)                       # 沒有 delta spec 的 change，交給 validate 管
+# 沒有 specs/ 目錄的情況由上面的〈規格身分〉檢查擋掉了（它問 OpenSpec）。
+# 這裡原本留了一條 `if not root.is_dir(): sys.exit(1)` 當縱深防禦，已刪除 ——
+# 正常流程到不了它，而**到不了的分支沒有普通 fixture 驗得到**，
+# 那就違反自己訂的「要嘛可達，要嘛不要留」。掃不到檔案時 seen/bad 都是空的，
+# 後面的邏輯自然什麼都不做。
 
 ID_RE  = re.compile(r"^\[([A-Z0-9]+(?:-[A-Z0-9]+)*-S[0-9]{2})\]\s+\S")
 HEAD_RE = re.compile(r"^####\s+Scenario:\s*(.*)$")
@@ -280,10 +477,18 @@ SCENARIO_IDS
 
     # 沒有這個類別的話，archive PR 開不出來：
     # spec/ 超出範圍、feat/ 禁止刪 specs、chore/ 禁止碰 openspec。
-    if OUT="$(echo "$CHANGED" | grep -vE "^openspec/(changes/${ID}/|changes/archive/|specs/)" || true)"; [ -n "$OUT" ]; then
-      echo "✗ archive/${ID} 只能動 openspec/changes/${ID}/、changes/archive/、specs/。" >&2
+    if OUT="$(echo "$CHANGED" | grep -vE "^(openspec/(changes/${ID}/|changes/archive/|specs/)|docs/WBS\.md$)" || true)"; [ -n "$OUT" ]; then
+      echo "✗ archive/${ID} 只能動 openspec/changes/${ID}/、changes/archive/、specs/ 與 docs/WBS.md 的進度區塊。" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
+    fi
+
+    # 動了 docs/WBS.md 的話，只准動進度區塊 —— archive 會讓那個項目從
+    # 「規格已合併」變「已封存」，區塊必然過期，而原本 archive/ 不准碰它。
+    if echo "$CHANGED" | grep -qx 'docs/WBS.md'; then
+      wbs_block_only "origin/${BASE}" \
+        || fail "archive/${ID} 動到 docs/WBS.md 進度區塊以外的地方。請走 governance/。"
+      echo "✓ docs/WBS.md 只動了進度區塊"
     fi
 
     # 原目錄只能是刪除（archive 是搬走，不是改完再搬）。
@@ -391,6 +596,13 @@ ARCHIVE_IDENTITY
     # `docs/WBS.md` 也在清單裡：**它是 CI 在驗的產物。**
     # `progress.sh --check` 從它讀決策期限、fallback 與依賴，
     # 改它會直接改變閘門的判定，所以它屬於規則面，不是文件面。
+    # `prompts/` 也在清單裡：**它們是給人與 LLM 的操作規則**，而且
+    # `test-prompts.sh` 是一支真的合約測試（會抽出裡面的 shell 區塊實跑，
+    # 再把產生的分支拿去問這個閘門）。改了提示鏈就是改了流程 ——
+    # 那跟改 `AGENTS.md` 同一個性質，該被單獨看見。
+    # （實測：把〈完成的定義〉的驗證方式寫進 prompts/05 的那個 PR
+    #  被擋在「夾帶產品程式碼或規格」，而它一行程式碼都沒動。）
+    #
     # `docs/ROADMAP.md` 一起放進來的理由現在跟它一樣了：
     # `--check` 會掃它提到的每一個 ID，指到不存在的東西就紅。
     # （它本來只是治理選擇 —— 那時機器不讀它。排程從它身上刪掉之後，
@@ -400,7 +612,7 @@ ARCHIVE_IDENTITY
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1

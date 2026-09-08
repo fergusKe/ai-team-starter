@@ -23,6 +23,16 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gate-test.XXXXXXXX")"
 BASELINE="$ROOT/_baseline"
 PASS=0; FAIL=0; N=0
 
+# 失敗登記**只有這一個入口**。
+#
+# 2026-09-07 實測：原本 $FAIL 分散在十幾處各自加一，而自測只走得到其中兩處 ——
+# 逐個弄啞（+1 改 +0），十三處存活，整套照樣報全過。
+# 「自測通過」在那種形狀下只覆蓋了自測剛好走過的那幾條路徑。
+#
+# 收成一個入口之後，弄啞它 → 每一條斷言的紅燈同時消失 → 自測必然抓到。
+# 這不是遞迴自證，是把要信任的表面從十幾個縮到一個，再對那一個做陽性對照。
+bump_fail() { FAIL=$((FAIL + 1)); }
+
 [ -f "$GATE" ] || { echo "找不到 $GATE" >&2; exit 2; }
 
 mkdir -p "$BASELINE"
@@ -44,6 +54,9 @@ cat > openspec/changes/demo-change/proposal.md <<'EOF'
 - 無
 EOF
 printf '## 1. 規格\n- [x] 1.1 談定\n- [x] 1.2 實作\n' > openspec/changes/demo-change/tasks.md
+# 一份帶進度區塊的 WBS —— spec/ 與 archive/ 只准動 marker 之間的內容。
+mkdir -p docs
+printf '# WBS\n\n<!-- progress:start x -->\n舊的區塊內容\n<!-- progress:end -->\n\n| ID | 項目 |\n|---|---|\n| APP-C01 | 骨架 |\n' > docs/WBS.md
 cat > openspec/changes/demo-change/specs/demo/spec.md <<'EOF'
 ## ADDED Requirements
 
@@ -75,7 +88,7 @@ run() { # run <期望exit> <base> <分支> <說明> <造檔案的指令...>
   if [ "$got" = "$want" ]; then
     printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
   else
-    printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"; FAIL=$((FAIL+1))
+    printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"; bump_fail
     sed 's/^/      /' "$ROOT/c$N.out" | head -5
   fi
 }
@@ -83,13 +96,268 @@ run() { # run <期望exit> <base> <分支> <說明> <造檔案的指令...>
 echo "── base 檢查 ──"
 run 1 dev  feat/demo-change--x "base 不是 main"          sh -c 'mkdir -p src && echo a > src/a.ts'
 
+# run 只看 exit code。但一個案例可能因為**別的**防禦而紅，那樣斷言就指不到
+# 被測的東西（這個 repo 抓過六種這類形狀，見 docs/DECISIONS.md）。
+# 新加的三條防禦都要能被別的東西搶先擋掉，所以它們用這一支：連訊息一起驗。
+run_msg() { # run_msg <期望exit> <base> <分支> <說明> <訊息片段> <造檔案的指令...>
+  local want="$1" base="$2" br="$3" desc="$4" needle="$5"; shift 5
+  N=$((N+1))
+  local W="$ROOT/c$N"
+  git clone -q "$BASELINE" "$W" 2>/dev/null
+  echo node_modules >> "$W/.git/info/exclude"
+  ln -s "$REPO/node_modules" "$W/node_modules" 2>/dev/null
+  ( cd "$W" && git config user.email t@t && git config user.name t \
+    && git checkout -qb "$br" && "$@" >/dev/null 2>&1
+    git add -A >/dev/null 2>&1; git commit -qm x >/dev/null 2>&1 )
+  ( cd "$W" && bash "$GATE" "$base" "$br" ) >"$ROOT/c$N.out" 2>&1
+  local got=$?
+  if [ "$got" = "$want" ] && grep -q -- "$needle" "$ROOT/c$N.out"; then
+    printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
+  else
+    if [ "$got" != "$want" ]; then
+      printf '  \033[31m✗\033[0m %-46s 期望=%s 實際=%s\n' "$desc" "$want" "$got"
+    else
+      printf '  \033[31m✗\033[0m %-46s exit 對但訊息不含「%s」\n' "$desc" "$needle"
+    fi
+    bump_fail; sed 's/^/      /' "$ROOT/c$N.out" | head -6
+  fi
+}
+
 echo "── spec/ ──"
 run 0 main spec/demo-change "只動自己的 change"          sh -c 'echo "" >> openspec/changes/demo-change/proposal.md'
 run 0 main spec/demo-change "可以加 ADR"                 sh -c 'mkdir -p docs/adr && echo "# ADR" > docs/adr/0001-x.md'
 run 1 main spec/demo-change "夾帶產品程式碼"              sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main spec/demo-change "動別人的 change"             sh -c 'mkdir -p openspec/changes/other && echo x > openspec/changes/other/proposal.md'
+
+# **進度區塊是機器產生的，而它的內容由 change 的狀態決定** —— 加一個 change
+# 就會讓它過期，所以 spec/ 與 archive/ 必須能重產它，否則流程鎖死
+# （實測：PR #62 就是這樣紅的）。但邊界要精確：只准動 marker 之間。
+run 0 main spec/demo-change "可以重產 docs/WBS.md 的進度區塊" \
+  sh -c 'python3 - <<EOF
+import io
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("舊的區塊內容","新算出來的區塊內容"))
+EOF'
+run 1 main spec/demo-change "不准動區塊以外的 WBS" \
+  sh -c 'printf "| APP-C02 | 偷加的項目 |\n" >> docs/WBS.md'
+run 1 main spec/demo-change "marker 壞掉時不放行" \
+  sh -c 'python3 - <<EOF
+import io
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("<!-- progress:end -->",""))
+EOF'
+run 0 main archive/demo-change "archive 也可以重產進度區塊" \
+  sh -c 'python3 - <<EOF
+import io, os, shutil
+os.makedirs("openspec/changes/archive/2026-01-01-demo-change", exist_ok=True)
+shutil.copytree("openspec/changes/demo-change", "openspec/changes/archive/2026-01-01-demo-change", dirs_exist_ok=True)
+shutil.rmtree("openspec/changes/demo-change")
+p="docs/WBS.md"; t=io.open(p,encoding="utf-8").read()
+io.open(p,"w",encoding="utf-8").write(t.replace("舊的區塊內容","封存之後的區塊內容"))
+EOF' 
+# 兩組 marker：`.index()` 只會找到第一組，於是「區塊是哪一段」沒有唯一答案。
+# 少了這一條，把「各恰好一個」的檢查拿掉不會有測試變紅（實測存活）。
+run 1 main spec/demo-change "WBS 有兩組 marker 時不放行" \
+  sh -c 'printf "\n<!-- progress:start x -->\n第二組\n<!-- progress:end -->\n" >> docs/WBS.md'
+
+# 把 docs/WBS.md 整個刪掉也不是「只動區塊」。
+# 少了這一條，「讀不到檔案就放行」不會有測試變紅（實測存活）。
+run 1 main spec/demo-change "把 docs/WBS.md 刪掉不放行" \
+  sh -c 'rm docs/WBS.md'
+
 run 1 main spec/Bad--Id     "id 格式不合"                 sh -c 'echo x > z.md'
 run 1 main spec/nonexistent "id 在 changes/ 下不存在"     sh -c 'mkdir -p docs/adr && echo x > docs/adr/0002-y.md'
+
+# run 自己的陽性對照。
+#
+# `run` 撐著 71 條裡的 59 條，而它原本沒有任何東西在驗它還活著 ——
+# 把 `[ "$got" = "$want" ]` 改成 `true`，整套仍然 71/71 全綠（實測）。
+# 這跟 run_msg 那條是同一種病，只是它涵蓋的面積大得多。
+#
+# 這裡故意給一個**一定會失敗**的期望（合法的 chore 小改，卻期望 exit=1），
+# 斷言 run 判它紅。在子 shell 裡跑，計數不會被污染。
+# 先驗**計數**還活著。只看訊息的話，`bump_fail` 被改成 `+0` 時
+# 訊息照樣印 —— 2026-09-07 審查實測，那個突變在只看訊息的版本下 72/72 存活。
+# （同一個錯我在 test-progress-check.sh 修過一次，這支漏了。）
+_fail_before=$FAIL
+run 1 main chore/selftest-count "自測（不計入）" sh -c 'echo "一行" >> README.md' >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  printf '  \033[32m✓\033[0m %-46s\n' "run 自測：失敗真的會被計進 \$FAIL"; PASS=$((PASS+1))
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %-46s\n' "run 自測：失敗沒有被計進 \$FAIL —— 綠燈是假的"
+fi
+# 不要再加 N —— 上面那次 `run` 自己已經加過了。加了的話總數會比
+# PASS+FAIL 多一，而「總數對不上」等於這份數字沒人在看。
+
+run_selftest_output="$(
+  PASS=0; FAIL=0; N=800
+  run 1 main chore/selftest-should-pass "自測（不計入）" sh -c 'echo "一行" >> README.md' 2>&1
+)"
+N=$((N+1))
+case "$run_selftest_output" in
+  *"期望=1 實際=0"*)
+    printf '  \033[32m✓\033[0m %-46s\n' "run 自測：exit 不符時判紅"; PASS=$((PASS+1)) ;;
+  *)
+    printf '  \033[31m✗\033[0m %-46s\n' "run 自測：exit 不符時判紅"
+    printf '      實際輸出：%s\n' "$run_selftest_output"; bump_fail ;;
+esac
+
+# run_msg 自己的陽性對照。
+#
+# 它是這一批新測試唯一的斷言強度來源 —— 如果它壞掉（比方 grep 的引號寫錯導致
+# 永遠 match），那四條負向測試會全部變成只看 exit code，而那正是它們要防的事。
+# 「工具說綠」跟「工具還活著」是兩件事：這裡故意餵一個**絕不會出現**的訊息，
+# 斷言 run_msg 判它紅。在子 shell 裡跑，計數不會被污染。
+selftest_output="$(
+  PASS=0; FAIL=0; N=900
+  run_msg 1 main spec/fresh-change "自測（不計入）" "這串字絕不會出現在任何輸出裡" \
+    sh -c 'mkdir -p openspec/changes/fresh-change
+           printf "schema: spec-driven\nskip_specs: true\n" > openspec/changes/fresh-change/.openspec.yaml
+           printf "## Why\nx\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md' 2>&1
+)"
+N=$((N+1))
+case "$selftest_output" in
+  *"exit 對但訊息不含"*)
+    printf '  \033[32m✓\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"; PASS=$((PASS+1)) ;;
+  *)
+    printf '  \033[31m✗\033[0m %-46s\n' "run_msg 自測：exit 對但訊息不符時判紅"
+    printf '      實際輸出：%s\n' "$selftest_output"; bump_fail ;;
+esac
+
+# ── openspec status 的 fail-closed 分支 ─────────────────────────────────────
+#
+# 規格身分那一關去問 `openspec status --change <id> --json`。它的失敗路徑
+# （沒有輸出／不是 JSON／找不到 specs 那一項／status 是沒見過的值）
+# **正常 fixture 永遠走不到** —— 而走不到的分支沒有測試就是空話。
+# 2026-09-07 實測：把那四條各拿掉一條，整套仍然全綠（4 個突變全存活）。
+#
+# 所以用一支假的 npx 餵那四種回應。它只攔 `openspec status`，其餘原樣轉給真的
+# npx —— 攔太多的話這幾條測到的就不是被測的那一關。
+STUB="$ROOT/stub-bin"
+mkdir -p "$STUB"
+REAL_NPX="$(command -v npx)"
+cat > "$STUB/npx" <<STUBEOF
+#!/usr/bin/env bash
+if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "openspec" ] && [ "\$2" = "status" ]; then
+  case "\$STATUS_MODE" in
+    empty)   exit 0 ;;
+    badjson) printf 'not-json\\n'; exit 0 ;;
+    missing) printf '%s\\n' '{"artifacts":[]}'; exit 0 ;;
+    unknown) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"future"}]}'; exit 0 ;;
+    blocked) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"blocked"}]}'; exit 0 ;;
+    dupspecs) printf '%s\\n' '{"artifacts":[{"id":"specs","status":"done"},{"id":"specs","status":"skipped"}]}'; exit 0 ;;
+    exit7)   printf '%s\\n' '{"artifacts":[{"id":"specs","status":"done"}]}'; exit 7 ;;
+  esac
+fi
+exec "$REAL_NPX" "\$@"
+STUBEOF
+chmod +x "$STUB/npx"
+
+run_status() { # run_status <期望exit> <STATUS_MODE> <說明> <訊息片段>
+  local want="$1" mode="$2" desc="$3" needle="$4"
+  N=$((N+1))
+  local W="$ROOT/c$N"
+  git clone -q "$BASELINE" "$W" 2>/dev/null
+  echo node_modules >> "$W/.git/info/exclude"
+  ln -s "$REPO/node_modules" "$W/node_modules" 2>/dev/null
+  # 造一份**完全正常**的新規格：這樣被擋下來的唯一理由就是 status 那一關。
+  ( cd "$W" && git config user.email t@t && git config user.name t \
+    && git checkout -qb spec/fresh-change \
+    && mkdir -p openspec/changes/fresh-change/specs/demo \
+    && printf 'schema: spec-driven\n' > openspec/changes/fresh-change/.openspec.yaml \
+    && printf '## Why\nx\n\n## What Changes\n- a\n\n## Non-goals\n- 無\n' > openspec/changes/fresh-change/proposal.md \
+    && printf '## ADDED Requirements\n\n### Requirement: R\n系統 SHALL 做事，並在不合法時回錯誤。\n\n#### Scenario: [FR-01-S01] a\n- **WHEN** a\n- **THEN** b\n' > openspec/changes/fresh-change/specs/demo/spec.md
+    git add -A >/dev/null 2>&1; git commit -qm x >/dev/null 2>&1 )
+  ( cd "$W" && PATH="$STUB:$PATH" STATUS_MODE="$mode" bash "$GATE" main spec/fresh-change ) >"$ROOT/c$N.out" 2>&1
+  local got=$?
+  if [ "$got" = "$want" ] && grep -q -- "$needle" "$ROOT/c$N.out"; then
+    printf '  \033[32m✓\033[0m %-46s exit=%s\n' "$desc" "$got"; PASS=$((PASS+1))
+  else
+    printf '  \033[31m✗\033[0m %-46s 期望=%s／含「%s」，實際 exit=%s\n' "$desc" "$want" "$needle" "$got"
+    bump_fail; sed 's/^/      /' "$ROOT/c$N.out" | head -5
+  fi
+}
+
+echo "── openspec status 讀不到就拒（fail-closed）──"
+# run_status 自己的陽性對照（判準：每個 oracle 都要走過一次失敗路徑）。
+_fail_before=$FAIL
+run_status 1 "" "自測（不計入）" "這串字絕不會出現在任何輸出裡" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  printf '  \033[32m✓\033[0m %-46s\n' "run_status 自測：訊息不符時判紅"; PASS=$((PASS+1))
+else
+  FAIL=$((_fail_before + 1))
+  printf '  \033[31m✗\033[0m %-46s\n' "run_status 自測：訊息不符時沒有判紅"
+fi
+
+run_status 1 empty   "status 沒有輸出 → 拒"        "沒有輸出"
+run_status 1 badjson "status 不是合法 JSON → 拒"   "不是合法 JSON"
+run_status 1 missing "artifacts 裡沒有 specs → 拒" "找不到 \`specs\` 這一項"
+run_status 1 unknown "status 是沒見過的值 → 拒"    "只接受 \`done\`"
+# 陽性對照：同一個 fixture、不攔 status 的話要綠。
+# 沒有它的話，上面四條可能只是「假 npx 把什麼都弄壞了」。
+run_status 1 blocked  "status = blocked → 拒"         "被擋住"
+# 合法 JSON ＋ 非零退出碼。`|| true` 會吞掉 rc，實測整支閘門回 rc=0。
+run_status 1 exit7    "status 印了合法 JSON 但 exit 7 → 拒" "以 exit 7 結束"
+# artifacts 裡兩筆 specs。取第一筆就 break 的話會挑到 done 而放行。
+run_status 1 dupspecs "artifacts 裡有兩筆 specs → 拒"  "有 2 筆"
+run_status 0 ""      "不攔 status 時同一份規格要過"  "spec 階段"
+
+echo "── 規格豁免封堵（新 change，main 上沒有它的 Scenario ID）──"
+# 用 fresh-change 而不是 demo-change：demo-change 的 Scenario ID 已經在 main 上，
+# 這幾個 fixture 會被「刪掉 main 上的 Scenario」那條防禦先擋掉，
+# 於是 exit=1 是真的、但擋它的不是我們要測的防禦。訊息斷言會抓出這種情況。
+run_msg 1 main spec/fresh-change "skip_specs 旗標一律拒" "不提供規格豁免旗標" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "schema: spec-driven\nskip_specs: true\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+# flow style 是第一版的實際繞法（regex 綁行首）：CLI 認、我們的 regex 不認。
+run_msg 1 main spec/fresh-change "skip_specs 用 flow style 寫也要拒" "不提供規格豁免旗標" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "{schema: spec-driven, skip_specs: true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n用 flow style 藏旗標。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+# 第 1 條（子字串比對）刻意不涵蓋完整 YAML key 語意 —— Unicode escape
+# `"skip\u005fspecs"` 它抓不到。這一條驗**邊界仍然成立**：被第 2 條擋下來，
+# 而且吐的是第 2 條的訊息（不是第 1 條的），證明擋它的是檔案系統檢查。
+run_msg 1 main spec/fresh-change "旗標用 Unicode escape 藏，仍被邊界擋住" "沒有 delta spec" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "{\"schema\": \"spec-driven\", \"skip\\u005fspecs\": true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n藏旗標。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+run_msg 1 main spec/fresh-change "沒有 delta spec 不得走 spec/" "status = ready" \
+  sh -c 'mkdir -p openspec/changes/fresh-change
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n沒有規格變更。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md'
+
+# 這個案例 OpenSpec 的 status 是 done（它看得到那個檔），所以擋它的是
+# `openspec validate --strict` 本身。斷言指向它的訊息才是因果正確的 ——
+# 指向我們的訊息會變成「exit 對但擋它的不是被測的那條」。
+run_msg 1 main spec/fresh-change "specs/ 在但一條 Scenario 都沒有" "must include at least one scenario" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/demo
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n有目錄沒內容。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 空殼\n系統 SHALL 做某件事。\n" > openspec/changes/fresh-change/specs/demo/spec.md'
+
+# Codex R5 找到的完整繞過：OpenSpec 的 discovery 忽略 dot-directory，
+# 而閘門原本自己用 rglob 掃 specs/ —— 兩邊對「存在規格」的定義漂掉。
+# 旗標用 Unicode escape 藏（第 1 條看不到）＋ Scenario 放在 .hidden/ 裡，
+# 舊版整支閘門回 rc=0。現在改成問 OpenSpec，它會說 specs 是 skipped。
+run_msg 1 main spec/fresh-change "Scenario 藏在 dot-directory 裡不算規格" "沒有 delta spec" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/.hidden
+         printf "{\"schema\": \"spec-driven\", \"skip\\u005fspecs\": true}\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n藏在 dot-directory。\n\n## What Changes\n- 無\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 幌子\n系統 SHALL 做某事，並在不合法時回錯誤。\n\n#### Scenario: [FRESH-01-S01] 正常\n- **WHEN** a\n- **THEN** b\n" > openspec/changes/fresh-change/specs/.hidden/spec.md'
+
+# 陽性對照：一份正常的新規格要綠，否則上面三條可能只是「所有新 change 都被擋」。
+run 0 main spec/fresh-change "正常的新規格照樣過" \
+  sh -c 'mkdir -p openspec/changes/fresh-change/specs/demo
+         printf "schema: spec-driven\n" > openspec/changes/fresh-change/.openspec.yaml
+         printf "## Why\n新功能。\n\n## What Changes\n- 加一條\n\n## Non-goals\n- 無\n" > openspec/changes/fresh-change/proposal.md
+         printf "## ADDED Requirements\n\n### Requirement: 新需求\n系統 SHALL 提供新行為，並在輸入不合法時回錯誤。\n\n#### Scenario: [FRESH-01-S01] 正常路徑\n- **WHEN** 觸發\n- **THEN** 成功\n\n#### Scenario: [FRESH-01-S02] 不合法\n- **WHEN** 輸入不合法\n- **THEN** 回錯誤\n" > openspec/changes/fresh-change/specs/demo/spec.md'
 
 echo "── feat/ fix/ ──"
 run 0 main feat/demo-change--slice "change 已在 main"     sh -c 'mkdir -p src && echo a > src/a.ts'
@@ -126,6 +394,11 @@ run 0 main governance/setup-doc   "改 SETUP-GITHUB.md"       sh -c 'echo "x" >>
 # 「其他測試全過」不能證明這兩條走得通。
 run 0 main governance/wbs         "改 docs/WBS.md"           sh -c 'mkdir -p docs && echo "x" >> docs/WBS.md'
 run 0 main governance/roadmap     "改 docs/ROADMAP.md"       sh -c 'mkdir -p docs && echo "x" >> docs/ROADMAP.md'
+# prompts/ 是規則面：它們是給人與 LLM 的操作規則，而且 test-prompts.sh 是一支
+# 真的合約測試。改了提示鏈就是改了流程。
+# （實測：把驗證方式寫進 prompts/05 的那個 PR 被擋在「夾帶產品程式碼或規格」，
+#  而它一行程式碼都沒動。）
+run 0 main governance/prompts     "改 prompts/"              sh -c 'mkdir -p prompts && echo "x" >> prompts/05-verify.md'
 run 1 main governance/sneak-docs  "夾帶 docs/ 底下別的檔案"    sh -c 'mkdir -p docs && echo "x" > docs/RANDOM.md'
 run 1 main governance/sneak-code "夾帶產品程式碼"           sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main governance/sneak-spec "動 changes/"            sh -c 'echo "x" >> openspec/changes/demo-change/proposal.md'
@@ -200,5 +473,12 @@ run 1 main hotfix       "沒有前綴" sh -c 'echo x > z.md'
 
 echo
 echo "通過 ${PASS} / 失敗 ${FAIL} / 共 ${N}"
-echo "測試目錄：$ROOT"
+# 成功就清掉工作目錄，失敗才留現場。這一支每次留一份完整的 repo clone
+# （約 70MB）—— 跑幾十次就會塞爆使用者自己的碟。理由見
+# `test-progress-check.sh` 開頭那段（實測 9.6G）。
+if [ "$FAIL" = 0 ]; then
+  cd "$(dirname "${BASH_SOURCE[0]}")" && rm -rf "${ROOT}"
+else
+  echo "測試目錄留著給你看：${ROOT}"
+fi
 [ "$FAIL" = 0 ]

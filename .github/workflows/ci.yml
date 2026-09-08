@@ -131,6 +131,15 @@ jobs:
       - name: Workflow contract tests
         run: bash .github/scripts/test-ci-workflow.sh
 
+      # 提示檔自己的合約測試：文件教的操作，閘門收不收得下。
+      # 它會照 prompts/02 的 shell 區塊真的開一次分支，再拿去問閘門 ——
+      # 「教錯分支前綴」這種錯之前活了很久，因為沒有東西在讀提示檔。
+      - name: Prompts contract tests
+        run: bash .github/scripts/test-prompts.sh
+
+      - name: Scenario coverage gate tests
+        run: bash .github/scripts/test-scenario-coverage.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——
@@ -170,6 +179,13 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # **每一條 Scenario 都要有一個真的跑過而且通過的測試指著它。**
+      # 零份現況 spec 的時候它安全地回 0 —— 剛複製的模板不會因此紅。
+      # **從第一天就接上**，否則第一次 archive 會卡在一個沒有任何合法 PR
+      # 能修好的死結（archive/ 不准碰 .github/）。
+      - name: Scenario coverage
+        run: bash .github/scripts/check-scenario-coverage.sh
 
       - name: Build
         run: npm run build

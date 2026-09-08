@@ -30,18 +30,39 @@ SCRIPT="$ROOT/.github/scripts/progress.sh"
 # 的話，同一個 repo 跑兩次（例如手動跑跟背景跑撞在一起）會互相改對方的
 # fixture，跑出一堆假紅燈 —— 實測踩過，而且第一時間會以為是被測的程式壞了。
 #
-# 不需要清掉它。**不是因為殘留沒有影響** —— 在裡面多放一份提到不存在
-# 的 ID 的文件，綠燈那幾條會紅（實測 67 過 10 失敗）。是因為殘留的違規
-# 跟 fixture 的狀態無關（殘留檔不會被 edit 動到），所以它只會讓**綠燈**
-# 測試變紅、不會讓**紅燈**測試變綠 —— 遮不住回歸，而且整套是紅的。
+# 殘留**不會遮住回歸**：在裡面多放一份提到不存在的 ID 的文件，綠燈那幾條
+# 會紅（實測 67 過 10 失敗）—— 殘留的違規跟 fixture 的狀態無關（殘留檔不會
+# 被 edit 動到），所以它只會讓**綠燈**測試變紅、不會讓**紅燈**測試變綠。
+#
+# **但正確不等於可以不清。** 2026-09-07 實證：這四支測試各自「跑一次留一
+# 個」，跑了幾百次之後 `$TMPDIR` 累積到 9.6G，把同一台機器上另一個工具的
+# host 弄到起不來。**「跑一次留一個」等於把清理責任推給每一個使用者。**
+# 所以下面的收尾是：**成功就清掉，失敗才留現場**（失敗時要看的就是它）。
 W="${TMPDIR:-/tmp}/progress-check-test.$(basename "$ROOT").$$"
 
 PASS=0
 FAIL=0
 
+# 失敗登記**只有這一個入口**。
+#
+# 2026-09-07 實測：原本 $FAIL 分散在十幾處各自加一，而自測只走得到其中兩處 ——
+# 逐個弄啞（+1 改 +0），十三處存活，整套照樣報全過。
+# 「自測通過」在那種形狀下只覆蓋了自測剛好走過的那幾條路徑。
+#
+# 收成一個入口之後，弄啞它 → 每一條斷言的紅燈同時消失 → 自測必然抓到。
+# 這不是遞迴自證，是把要信任的表面從十幾個縮到一個，再對那一個做陽性對照。
+bump_fail() { FAIL=$((FAIL + 1)); }
+
 # 一份最小但合法的工作分解表。每個案例都從它出發，只壞一個地方 ——
 # 這樣紅燈的原因就只可能是那一個地方。
 baseline() {
+  # **每個案例都從乾淨的 OpenSpec 狀態出發。** 這裡以前只重寫 WBS，
+  # `openspec/changes/` 留著上一個案例造的 change —— 於是「一個封存、
+  # 一個還在做」那條案例吃到了前一條留下的封存目錄，量到的是別人的狀態。
+  # 實測：那條斷言預期「規格已合併」，拿到「已封存」，而**被測的程式是對的**。
+  # 一支專門在抓 fail-open 的腳本，自己的 fixture 先漏了。
+  # `.git` 同理 —— 遠端分支也是狀態的輸入，留著就會漏到下一個案例。
+  rm -rf "$W/openspec" "$W/.git"
   mkdir -p "$W/docs"
   cat > "$W/docs/WBS.md" <<'WBS'
 # 測試用的工作分解
@@ -115,12 +136,12 @@ run_absent() {
   out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   if printf '%s' "$out" | grep -q "$needle"; then
     echo "✗ ${desc} —— 訊息裡不該出現「${needle}」，但它出現了"
     echo "$out" | sed 's/^/      /' | head -20
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   echo "✓ $desc"
   PASS=$((PASS + 1))
@@ -133,12 +154,12 @@ run() {
   out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   if [ -n "$needle" ] && ! printf '%s' "$out" | grep -q "$needle"; then
     echo "✗ ${desc} —— 退出碼對了，但訊息裡沒有「${needle}」"
     echo "$out" | sed 's/^/      /' | head -20
-    FAIL=$((FAIL + 1)); return
+    bump_fail; return
   fi
   echo "✓ $desc"
   PASS=$((PASS + 1))
@@ -152,6 +173,56 @@ run() {
 # --json 的 violations 必須跟 --check 看到的是同一份。**一個永遠空的欄位
 # 比沒有這個欄位更糟** —— 讀的人會以為自己檢查過了。原本治理不變量整段
 # 排在 JSON 輸出之後，所以 --json 對任何違規都印 `"violations": []`。
+# run_all_has <說明> <輸出裡要有的字>
+#
+# 這三條原本是頂層的內聯 if/else，各自寫自己的 bump_fail —— 於是**沒有任何
+# 東西在驗它們的失敗路徑**（2026-09-07 實測：各自把 bump_fail 換成 `:`，
+# 三處全部存活）。收成共用 helper 之後，下面的陽性對照一次蓋住三條。
+#
+# 判準（外部審查訂的）：每個**共用** assertion oracle 都要走過一次失敗路徑。
+# 一次性的內聯斷言不符合那個形狀 —— 能收就收成共用的。
+run_all_has() {
+  local desc="$1" needle="$2"
+  if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "$needle"; then
+    echo "✓ $desc"; PASS=$((PASS + 1)); return
+  fi
+  echo "✗ ${desc} —— --all 的輸出裡沒有「${needle}」"
+  bump_fail
+}
+
+# run_all_absent <說明> <不該出現的字>：--all 的輸出裡**不可以**有這個
+#
+# `run_all_has` 的反面。有些缺陷的形狀是**多印了東西**，不是少印 ——
+# 例如把兩個 change 其中一個的進度條印在項目那一列上（`+1 1/2`），
+# 那個分數看起來像整個項目的進度，其實只是其中一個 change 的。
+run_all_absent() {
+  local desc="$1" needle="$2"
+  if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "$needle"; then
+    echo "✗ ${desc} —— --all 的輸出裡不該有「${needle}」，但它出現了"
+    bump_fail; return
+  fi
+  echo "✓ $desc"; PASS=$((PASS + 1))
+}
+
+# run_json_top <說明> <頂層鍵> <期望值（字串比對）>：--json 的頂層欄位
+#
+# `run_field_has` 只看 `items[]`。有些事實不屬於任何一個項目 ——
+# 例如「這一次遠端 refs 有沒有抓到」，那是**整份資料的可信度**，
+# 下游（網頁、Excel、往後的 WBS 區塊）要靠它決定要不要信分支推出來的狀態。
+run_json_top() {
+  local desc="$1" key="$2" want="$3" out
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("yes" if str(d.get(sys.argv[1])) == sys.argv[2] else "no:" + str(d.get(sys.argv[1])))' "$key" "$want")"
+  if [ "$out" = yes ]; then
+    echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    echo "✗ ${desc} —— --json 的 ${key} 期望「${want}」，實際 ${out#no:}"
+    bump_fail
+  fi
+}
+
 run_json_has() {
   local desc="$1" out n
   out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null)"
@@ -160,7 +231,7 @@ run_json_has() {
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— --check 有違規，但 --json 的 violations 是空的"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -183,7 +254,7 @@ run_setup() {
     fi
     echo "✗ ${desc} —— 輸出裡不該有「${needle}」，但它出現了"
   fi
-  FAIL=$((FAIL + 1))
+  bump_fail
 }
 
 # run_json_parses <說明>：--json 還是合法 JSON（待辦清單不准污染它）
@@ -194,7 +265,7 @@ run_json_parses() {
   if [ "$out" = ok ]; then
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
-    echo "✗ ${desc} —— --json 不是合法 JSON"; FAIL=$((FAIL + 1))
+    echo "✗ ${desc} —— --json 不是合法 JSON"; bump_fail
   fi
 }
 
@@ -208,6 +279,123 @@ mkchange() {
     mkdir -p "$W/openspec/changes/$c"
     printf '# %s\n' "$c" > "$W/openspec/changes/$c/proposal.md"
     printf -- '- [x] 一\n- [ ] 二\n' > "$W/openspec/changes/$c/tasks.md"
+  done
+}
+
+# mkmarkers [start 行] [end 行]：把進度區塊的 marker 加進 fixture 的 WBS
+mkmarkers() {
+  {
+    printf '\n'
+    printf '%s\n' "${1:-<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->}"
+    printf '%s\n' "${2:-<!-- progress:end -->}"
+  } >> "$W/docs/WBS.md"
+}
+
+# mkmarkers_top：marker 放在檔案最前面
+#
+# `mkmarkers` 是附加在最後面，於是「區塊之前」佔了整份文件、「區塊之後」
+# 幾乎是空的。要驗「指紋雜湊的是整份、不是前半」就得反過來擺。
+mkmarkers_top() {
+  python3 - "$W/docs/WBS.md" <<'TOP'
+import io, sys
+p = sys.argv[1]
+t = io.open(p, encoding="utf-8").read().split("\n")
+t.insert(1, "<!-- progress:start 這一段由 `progress.sh --render` 產生，不要手改 -->")
+t.insert(2, "<!-- progress:end -->")
+io.open(p, "w", encoding="utf-8").write("\n".join(t))
+TOP
+}
+
+# render：在 fixture 上跑 --render，回傳它的退出碼
+render() { (cd "$W" && bash "$SCRIPT" --render >/dev/null 2>&1); }
+
+# run_block_has / run_block_absent <說明> <字串>：區塊裡有沒有這個字
+run_block() {
+  local mode="$1" desc="$2" needle="$3" body
+  body="$(python3 - "$W/docs/WBS.md" <<'EOF'
+import io, sys
+t = io.open(sys.argv[1], encoding="utf-8").read()
+a = t.find("<!-- progress:start")
+b = t.find("<!-- progress:end -->")
+print(t[a:b] if a >= 0 and b > a else "")
+EOF
+)"
+  if [ "$mode" = have ]; then
+    case "$body" in *"$needle"*) echo "✓ $desc"; PASS=$((PASS + 1)); return ;; esac
+    echo "✗ ${desc} —— 區塊裡沒有「${needle}」"
+  else
+    case "$body" in *"$needle"*) ;; *) echo "✓ $desc"; PASS=$((PASS + 1)); return ;; esac
+    echo "✗ ${desc} —— 區塊裡不該有「${needle}」，但它出現了"
+  fi
+  bump_fail
+}
+
+# mkevid <涵蓋證據那一格的內容> [表頭第八欄的字]：追加一張**八欄**的表
+#
+# 第八欄是選填的（只有需要的那張表加），所以 fixture 要能造出「同一份 WBS
+# 裡有七欄的表、也有八欄的表」—— 兩種寬度並存正是這個設計的重點，
+# 也是最容易寫壞的地方。
+mkevid() {
+  local h="${2:-涵蓋證據}"
+  {
+    printf '\n## EVD 證據\n\n'
+    printf '| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 | %s |\n' "$h"
+    printf '|---|---|---|---|---|---|---|---|\n'
+    printf '| EVD-A01 | 有證據的項目 | 做事 | W1 | 3 | | | %s |\n' "$1"
+  } >> "$W/docs/WBS.md"
+}
+
+# mkcommit：在 fixture 的 git 歷史裡造一個 commit，印出它的完整 SHA
+mkcommit() {
+  git -C "$W" init -q 2>/dev/null
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+  GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m evid 2>/dev/null
+  git -C "$W" rev-parse HEAD
+}
+
+# mkorigin <ok|broken>：給 fixture 一個 origin
+#
+# `ok` 造一份本機 bare repo 當 origin（fetch 會成功，**不打網路**）；
+# `broken` 指向一個不存在的路徑（fetch 必然失敗）。
+# 沒有這個的話「遠端不新鮮」的警告只有一種情況測得到，
+# 而「永遠都警告」跟「該警告時才警告」在那種測法下長得一樣。
+mkorigin() {
+  git -C "$W" init -q 2>/dev/null
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+  GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m x 2>/dev/null
+  if [ "$1" = ok ]; then
+    git init -q --bare "$W/.origin.git"
+    git -C "$W" remote add origin "$W/.origin.git" 2>/dev/null
+    git -C "$W" push -q origin HEAD 2>/dev/null
+  else
+    git -C "$W" remote add origin "$W/.no-such-origin.git" 2>/dev/null
+  fi
+}
+
+# mkremote <遠端分支名>...：在 fixture 裡造一個遠端分支
+#
+# 狀態的輸入有三個來源：change 目錄、tasks.md 的勾、**遠端分支**。
+# 前兩個造得出來、第三個以前造不出來 —— 於是所有「看分支」的判斷
+# 都沒有測試看得到。實測：把分支集合改成只看第一個 change，全綠。
+mkremote() {
+  local b
+  git -C "$W" init -q 2>/dev/null
+  git -C "$W" commit -q --allow-empty -m x --author "t <t@t.invalid>" 2>/dev/null \
+    || GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+       GIT_COMMITTER_EMAIL=t@t.invalid git -C "$W" commit -q --allow-empty -m x
+  for b in "$@"; do
+    git -C "$W" update-ref "refs/remotes/origin/$b" HEAD
+  done
+}
+
+# mkarchived <change-id>...：已封存的 change（目錄名帶日期前綴）
+mkarchived() {
+  local c d
+  for c in "$@"; do
+    d="$W/openspec/changes/archive/2026-01-01-$c"
+    mkdir -p "$d"
+    printf '# %s\n' "$c" > "$d/proposal.md"
+    printf -- '- [x] 一\n- [x] 二\n' > "$d/tasks.md"
   done
 }
 
@@ -227,7 +415,7 @@ print("yes" if i and sys.argv[3] in str(i[0].get(sys.argv[2], "")) else "no")' "
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${item} 的 ${field} 裡沒有「${want}」"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -246,7 +434,7 @@ print("yes" if any(i["id"] == sys.argv[1] for i in d["items"]) else "no")' "$bad
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${bad} 被當成真的工作項目讀進來了"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -267,7 +455,7 @@ print("yes" if i and sys.argv[2] in i[0]["blockers"] else "no")' "$item" "$want"
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— ${item} 的 blockers 裡沒有 ${want}"
-    FAIL=$((FAIL + 1))
+    bump_fail
   fi
 }
 
@@ -295,6 +483,75 @@ echo
 
 # ── 正向：乾淨的表格必須是綠的 ────────────────────────────────────
 baseline
+# ── run 自己的陽性對照 ──────────────────────────────────────────────────────
+#
+# 這支撐著 149 條斷言，而**它自己一直沒有讀者**。2026-09-07 自查實測：
+# 把 exit code 比對、訊息比對、或 FAIL 計數任一條弄啞，整套照樣報 149/149。
+#
+#   if [ "$rc" != "$want" ]  →  if false          存活
+#   if [ -n "$needle" ] && ! grep …  →  if false  存活
+#   bump_fail  →  FAIL=$((FAIL + 0))     存活
+#
+# 「工具說綠」跟「工具還活著」是兩件事。這裡在乾淨狀態下故意給錯的期望，
+# 斷言 run 判它紅。子 shell 隔離計數。
+selftest() { # selftest <說明> <期望輸出片段> <run 的參數...>
+  local desc="$1" want_msg="$2"; shift 2
+  local out
+  out="$( PASS=0; FAIL=0; "$@" 2>&1 )"
+  case "$out" in
+    *"$want_msg"*) echo "✓ $desc"; PASS=$((PASS + 1)) ;;
+    *) echo "✗ ${desc} —— 期望輸出含「${want_msg}」，實際：${out}"; bump_fail ;;
+  esac
+}
+# 先驗**計數**還活著。上面那個 selftest 看的是 run 印出來的訊息，
+# 而「FAIL 沒有加一」的時候訊息照樣印 —— 實測 fail-blind 突變因此存活。
+# 所以這裡不看訊息，直接看 $FAIL 有沒有真的加一，然後撤銷。
+_fail_before=$FAIL
+run 1 "自測（不計入）" "" >/dev/null 2>&1
+if [ "$FAIL" -eq "$((_fail_before + 1))" ]; then
+  FAIL=$_fail_before
+  echo "✓ run 自測：失敗真的會被計進 \$FAIL"
+  PASS=$((PASS + 1))
+else
+  FAIL=$((_fail_before + 1))
+  echo "✗ run 自測：失敗沒有被計進 \$FAIL —— 這支測試的綠燈是假的"
+fi
+
+# **每一個** assertion helper 都要走過一次失敗路徑。
+#
+# 2026-09-07 實測：收成單一 bump_fail 之後，弄啞那個入口會被抓到；
+# 但把個別 helper 裡的 `bump_fail` 換成 `:`，十三處裡十二處仍然存活。
+# 也就是「集中登記」只讓**入口**有了讀者，**每個 helper 自己**還是沒有。
+# 判準（外部審查訂的）是「每個共用 oracle 至少被故意走一次失敗路徑」，
+# 所以下面每一支都給一個一定失敗的輸入。
+selftest_count() { # selftest_count <說明> <helper 與參數...>
+  local desc="$1"; shift
+  local before=$FAIL
+  "$@" >/dev/null 2>&1
+  if [ "$FAIL" -eq "$((before + 1))" ]; then
+    FAIL=$before; echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    FAIL=$((before + 1)); echo "✗ ${desc} —— 它沒有把失敗計進 \$FAIL"
+  fi
+}
+selftest_count "run_all_has 自測"      run_all_has      "自測（不計入）" "這串字絕不會出現在 --all 的輸出裡"
+selftest_count "run_all_absent 自測"   run_all_absent   "自測（不計入）" "WBS 共"
+selftest_count "run_json_top 自測"     run_json_top     "自測（不計入）" "remote_fresh" "不可能的值"
+selftest_count "run_json_has 自測"     run_json_has     "自測（不計入）" "這個_key_絕不存在"
+selftest_count "run_setup 自測"        run_setup        "自測（不計入）" "have" "這串字絕不會出現在輸出裡"
+selftest_count "run_field_has 自測"    run_field_has    "自測（不計入）" "NO-SUCH-ITEM" "state" "不可能的值"
+selftest_count "run_no_item 自測"      run_no_item      "自測（不計入）" "APP-C01"
+selftest_count "run_blockers_has 自測" run_blockers_has "自測（不計入）" "APP-C01" "NO-SUCH-BLOCKER"
+
+selftest "run 自測：退出碼不符時判紅" "期望退出碼 1，實際 0" \
+         run 1 "自測（不計入）" ""
+selftest "run 自測：退出碼對但訊息不符時判紅" "訊息裡沒有" \
+         run 0 "自測（不計入）" "這串字絕不會出現在任何輸出裡"
+# 「不在自己手上」在乾淨 fixture 的 --check 輸出裡一定會出現，
+# 所以 run_absent 拿它當「不該出現的字」必須判紅。
+selftest "run_absent 自測：不該出現的字出現時判紅" "不該出現" \
+         run_absent 0 "自測（不計入）" "不在自己手上"
+
 run 0 "乾淨的表格：綠燈" ""
 
 # ── 標記 ──────────────────────────────────────────────────────────
@@ -351,13 +608,7 @@ run 1 "ID 被加粗（會被當成續行）：紅" "不是合法的工作項目 
 # 要真的去看輸出裡有沒有它。
 baseline
 edit "| APP-C01 | 應用骨架 |" " | APP-C01 | 應用骨架 |"
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
-  echo "✓ 表格列前面有空白：那一列還看得見"
-  PASS=$((PASS + 1))
-else
-  echo "✗ 表格列前面有空白：那一列從輸出裡消失了"
-  FAIL=$((FAIL + 1))
-fi
+run_all_has "表格列前面有空白：那一列還看得見" "APP-C01"
 
 baseline
 edit "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | |" \
@@ -608,13 +859,342 @@ run_field_has "同一個 ID 的每一個 change 都要進 --json" "APP-C01" "cha
 # 突變體證明過：只斷言 `--json`，`change_for` 退回只取第一個照樣全過。
 baseline
 mkchange app-c01-api app-c01-ui
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "+1"; then
-  echo "✓ 同一個 ID 開了兩個 change：列上看得出來"
-  PASS=$((PASS + 1))
+run_all_has "同一個 ID 開了兩個 change：列上看得出來" "+1"
+
+# **change 清單要排序，不要靠字典的插入順序。** `changes` 是先塞 active
+# 再塞 archived，所以「第一個」剛好永遠是 active 的那個 —— 聚合與「只看第一個」
+# 在那種資料上同解，差別觀察不到。排序之後順序跟狀態無關。
+baseline
+mkchange app-c01-ui
+mkarchived app-c01-api
+run_field_has "change 清單依 ID 排序（不是字典插入順序）" "APP-C01" "changes" "'app-c01-api', 'app-c01-ui'"
+
+# **看得見不等於算得對。** 上面兩條都綠的時候，狀態仍然是錯的：
+#
+#   APP-C01  兩個 change 都已封存   有分支   app-c01-api +1
+#
+# 根因是 `change_for()` 回傳 `"app-c01-api +1"` 這個**顯示字串**，
+# 下游拿它去 `changes.get(cid, {})` —— 那個鍵永遠不存在，於是
+# `c = {}`、`br = set()`，四個判斷全不成立，掉進 `else` 報「有分支」。
+# **一個項目只要有兩個 change，就永遠算不出「已封存」。**
+#
+# 上面那兩條測的是「有沒有被看見」，這一條測的是「算得對不對」——
+# 兩者都要，少了這一條，把聚合改回 `hits[0]` 或改回混用回傳值都不會紅。
+baseline
+mkarchived app-c01-api app-c01-ui
+run_field_has "兩個 change 都封存了就是已封存（不是有分支）" "APP-C01" "state" "已封存"
+
+# 反面：只要有一個沒封存，就**不是**已封存 —— 還有東西在動，那才是要被看見的。
+# 沒有這一條的話，「全部封存」的判斷被改成「任一封存」不會紅。
+baseline
+mkarchived app-c01-api
+mkchange app-c01-ui
+run_field_has "一個封存、一個還在做：不算已封存" "APP-C01" "state" "規格已合併"
+
+# **多個 change 不印進度條。** `x/y` 只可能是其中一個 change 的分數，
+# 擺在項目那一列上會被讀成整個項目的進度 —— 那是一個看起來很具體的謊。
+# 這一條是突變逼出來的：把聚合改回 `changes.get(cids[0])`，狀態全部照樣對
+# （字典裡 active 一定排在 archived 前面，所以「取第一個」跟聚合同解），
+# **161 條全綠**；差別只在那一列多出 `+1 1/2`。少了這一條，取第一個存活。
+baseline
+mkchange app-c01-api app-c01-ui
+run_all_absent "兩個 change 時不印其中一個的進度條" "+1 1/2"
+
+# **分支也要聚合。** 兩個 change 裡只有**第二個**有實作分支時，
+# 項目就是「實作中」—— 只看第一個的話會少報成「規格已合併」。
+# 這一條也是突變逼出來的：分支集合改成 `branches.get(cids[0])`，
+# 在沒有遠端分支的 fixture 上完全看不出來，163 條全綠。
+baseline
+mkchange app-c01-api app-c01-ui
+mkremote feat/app-c01-ui--slice
+run_field_has "第二個 change 有實作分支：項目就是實作中" "APP-C01" "state" "實作中"
+
+# ── 遠端 refs 不新鮮的時候要說 ────────────────────────────────────
+#
+# 原本這裡是 `git fetch -q origin 2>/dev/null || true`。fetch 失敗時腳本
+# 拿**上一次**的 refs 繼續算，畫面上是一個看起來很正常、其實是幾天前的
+# 狀態，沒有任何跡象 —— 那正是這支腳本自己在抓的「解析不出來就靜靜跳過」。
+#
+# 三條缺一不可：抓不到要說、抓得到不准說、`--json` 要標記。
+# 少了「抓得到不准說」，把警告改成無條件印照樣全綠。
+baseline
+mkorigin broken
+run_all_has "fetch 失敗要講出來" "遠端狀態可能是舊的"
+run_all_has "而且要講清楚哪些狀態不能信" "是從遠端分支推的"
+
+baseline
+mkorigin broken
+run_json_top "fetch 失敗時 --json 標記 remote_fresh=False" "remote_fresh" "False"
+
+# **陽性對照。** origin 正常時不可以印那個警告，`remote_fresh` 要是 True。
+baseline
+mkorigin ok
+run_all_absent "origin 正常時不印遠端警告" "遠端狀態可能是舊的"
+run_json_top "origin 正常時 remote_fresh=True" "remote_fresh" "True"
+
+# 第三種理由：有 repo 但沒有 origin（`baseline` 最後會 `git init`，所以單獨
+# 跑就是這個狀態）。**理由不能一律說「fetch 失敗」** —— 沒有 origin 跟抓不到
+# 是兩件事：前者要去設 remote，後者要去看網路或權限。訊息指錯方向等於沒有訊息。
+baseline
+run_all_has "有 repo 但沒有 origin 也算不新鮮（理由不同）" "沒有設定 origin"
+
+# ── 涵蓋證據（第八欄）───────────────────────────────────────────────
+#
+# 解的是這個盲區：一項工作**做完了，但沒有跟它同名的 change**，於是永遠
+# 算不出狀態。實例是 `FE-O10 CI 補齊` —— 它有自己的 PR，但改 `.github/`
+# 只能走 `governance/`，而 `governance/` 不准碰 `openspec/`。
+# **規則互斥造成的結構性盲區，不是誰忘了開 change。**
+
+# 認得的兩種寫法要真的生效（陽性對照 —— 少了它，「一律報錯」也會全綠）
+baseline
+mkchange evd-a01-x
+mkevid "change:evd-a01-x"
+run 0 "涵蓋證據指到存在的 change：綠" ""
+run_field_has "而且狀態真的用了它" "EVD-A01" "state" "規格已合併"
+
+baseline
+SHA="$(mkcommit)"
+mkevid "commit:$SHA"
+run 0 "涵蓋證據指到已合併的 commit：綠" ""
+run_field_has "狀態是「已完成」而不是「已封存」" "EVD-A01" "state" "已完成"
+
+# （**借用「已封存」會讓兩種強度不同的結論長得一樣** —— commit 證據只證明
+# 「那個 commit 存在而且已合併」，沒有證明語意上做完了。這一點由上面那條
+# `run_field_has "已完成"` 鎖住：把狀態改成「已封存」它就紅。
+# 原本另外寫了一條「--all 的輸出裡不准出現『已封存』」，那是錯的斷言 ——
+# 遠端不新鮮的警告本文裡就有「已封存」三個字，它抓的是那個。）
+
+# 指到不存在的東西要紅
+baseline
+mkevid "change:no-such-change"
+run 1 "涵蓋證據指到不存在的 change 要紅" "都沒有它"
+
+baseline
+mkcommit >/dev/null
+mkevid "commit:0000000000000000000000000000000000000000"
+run 1 "涵蓋證據指到不存在的 commit 要紅" "在本機找不到"
+
+# **「找不到」跟「還沒合併」要分開講** —— 前者可能只是還沒 fetch，
+# 後者是證據真的還沒進來。講錯會叫人去查一個根本不存在的問題。
+baseline
+mkcommit >/dev/null
+# `commit-tree` 也要身分（runner 上沒有全域 git config）。
+# **而且不可以把錯誤吞掉** —— 原本寫 `2>/dev/null`，於是它在 CI 上失敗、
+# SHA2 是空字串、`commit:` 後面沒東西，測到的變成「寫法不合文法」而不是
+# 「不在 HEAD 歷史裡」。fixture 自己 fail-open，本機看不到（實測：CI 才紅）。
+# **把身分來源縮到只剩明寫的那一份。**
+#
+# 這個修正原本只在「runner 剛好沒有身分」的機器上測得到 —— 拿掉下面那幾個
+# 環境變數，在有全域 git config 的機器上照樣 207/207 全過（外部審查實測）。
+#
+#   GIT_CONFIG_GLOBAL=/dev/null   不讀 ~/.gitconfig
+#   GIT_CONFIG_NOSYSTEM=1          不讀 /etc/gitconfig
+#   -c user.useConfigOnly=true     不准從 hostname／使用者名稱推導
+#
+# 三個一起，identity 就**只能**來自那四個環境變數；拿掉它們在任何機器上
+# 都必然紅。
+SHA2="$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t \
+        GIT_COMMITTER_EMAIL=t@t.invalid \
+        git -c user.useConfigOnly=true -C "$W" commit-tree "$(git -C "$W" write-tree)" -m orphan)"
+[ -n "$SHA2" ] || { echo "✗ 測試腳本自己壞了：commit-tree 沒有產生 SHA"; bump_fail; }
+mkevid "commit:$SHA2"
+run 1 "commit 存在但不在 HEAD 歷史裡要紅" "不在目前 HEAD 的歷史裡"
+
+# 寫法不合文法要紅。**短 SHA 不算** —— 它會隨著 repo 長大而變得不唯一。
+baseline
+mkevid "commit:abc1234"
+run 1 "短 SHA 不算證據" "不是認得的寫法"
+
+baseline
+mkevid "https://github.com/x/y/pull/30"
+run 1 "貼連結不算證據" "不是認得的寫法"
+
+baseline
+mkchange evd-a01-x
+mkevid "change:evd-a01-x change:evd-a01-x"
+run 1 "同一個證據寫兩次要紅" "寫了不只一次"
+
+# **表頭的第八欄只能是「涵蓋證據」。** 加在別的位置或加第九欄，
+# 底下每一列的意思都會跟著移位，而畫面上還是一張正常的表。
+baseline
+mkevid "" "備註"
+run 1 "第八欄表頭不是「涵蓋證據」要紅" "只能是「涵蓋證據」"
+
+# 證據非空時**不回退到命名推導**：兩種來源同時生效的話，
+# 「這個狀態是從哪裡來的」就沒有單一答案了。
+baseline
+mkchange evd-a01 evd-a01-other
+mkevid "change:evd-a01"
+run_field_has "證據非空就只認證據，不再混用命名推導" "EVD-A01" "evidence_changes" "evd-a01"
+run_all_absent "命名推導的第二個 change 不准偷偷加進來" "+1"
+
+
+# ── docs/WBS.md 的進度區塊 ────────────────────────────────────────
+#
+# **人只會打開 docs/WBS.md。** 進度以前只存在終端機輸出與不進版控的
+# `docs/wbs.html` —— 在 GitHub 上打開那份表，看不到任何完成資訊。
+
+# 沒有 marker 就是沒開這個功能，`--check` 不能因此紅（它是選填的）；
+# 但 `--render` 要講清楚怎麼開，不能默默什麼都不做。
+baseline
+run 0 "沒有 marker 時 --check 不紅（這個功能是選填的）" ""
+baseline
+if render; then echo "✗ 沒有 marker 時 --render 要失敗並教人怎麼開"; bump_fail
+else echo "✓ 沒有 marker 時 --render 失敗並教人怎麼開"; PASS=$((PASS + 1)); fi
+
+# 產生之後要綠，而且區塊裡真的有東西
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+run 0 "產生之後 --check 綠" ""
+run_block have "區塊列出有進度的項目" "| APP-C01 | 規格已合併 |"
+run_block have "區塊帶來源指紋" "來源指紋"
+
+# ★ **這一條是用來殺 identity renderer 的。**
+#
+# 「重產之後沒有 diff」只驗了**產出有沒有存檔**，沒驗**產出有沒有反映真實
+# 狀態**。把 renderer 改成「把現有內容原樣吐回去」，那種檢查永遠是綠的。
+# 這一條改的是**來源**（多開一個 change），區塊故意不重產 —— 正確的
+# renderer 會算出不一樣的東西所以紅；identity renderer 算出一模一樣的東西，
+# 於是**這條測試不會紅，測試套件自己就抓到了**。
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+mkchange app-p03-y
+run 1 "來源變了但區塊沒重產：--check 要紅" "跟現在的狀態對不上"
+
+# 重產之後就綠了 —— 沒有這條的話，「永遠報對不上」也會讓上一條通過。
+render
+run 0 "重產之後 --check 綠" ""
+
+# ── 耐久狀態自己也要被鎖住 ────────────────────────────────────────
+#
+# 上面那些斷言驗的是**終端機那一欄**（`_state_of`），而區塊寫的是
+# `_durable_of` —— 兩個是分開算的。外部審查實測：把耐久狀態的「全部封存」
+# 改成「任一封存」、或把聚合改成只看第一個 change，198 條全綠。
+
+# 一個封存、一個還在做：**區塊裡不可以是「已封存」**。
+baseline
+mkarchived app-c01-api
+mkchange app-c01-ui
+mkmarkers
+render
+run_block absent "混合狀態不准在區塊裡變成已封存" "| APP-C01 | 已封存 |"
+run_block have "混合狀態在區塊裡是規格已合併" "| APP-C01 | 規格已合併 |"
+
+# 兩個都封存：區塊裡才是「已封存」（陽性對照 —— 少了它，
+# 把耐久狀態一律算成「規格已合併」也會讓上面那條過）。
+baseline
+mkarchived app-c01-api app-c01-ui
+mkmarkers
+render
+run_block have "兩個都封存時區塊裡是已封存" "| APP-C01 | 已封存 |"
+
+# **依狀態排序，不依 ID。** 讀的人問的是「哪些做完了」——
+# 按 ID 排的話那幾項會被外部缺口埋在中間。
+#
+# fixture 要能分辨兩種排法：`DEP-G01` 的 ID 排在最後、狀態（已封存）排在最前，
+# `APP-O10`（常態）反過來。按 ID 排 → APP-O10 在前；按狀態排 → DEP-G01 在前。
+baseline
+mkarchived dep-g01-x
+mkmarkers
+render
+if python3 - "$W/docs/WBS.md" <<'ORDER'
+import io, sys
+t = io.open(sys.argv[1], encoding="utf-8").read()
+b = t[t.index("<!-- progress:start"):t.index("<!-- progress:end -->")]
+rows = [l.split("|")[1].strip() for l in b.splitlines()
+        if l.startswith("| ") and "|---" not in l and not l.startswith("| 項目")]
+sys.exit(0 if rows[:2] == ["DEP-G01", "APP-O10"] else 1)
+ORDER
+then echo "✓ 區塊依狀態排序，不依 ID"; PASS=$((PASS + 1))
+else echo "✗ 區塊沒有依狀態排序（已封存的 DEP-G01 要排在常態的 APP-O10 前面）"; bump_fail; fi
+
+# **兩種證據並列時兩個都要留。** `--json` 兩個都有，而區塊原本只印 commit，
+# change 從「依據」欄整個消失 —— 而區塊是大部分人唯一會看的地方。
+baseline
+mkchange evd-a01-x
+SHA3="$(mkcommit)"
+mkevid "change:evd-a01-x commit:$SHA3"
+mkmarkers
+render
+run_block have "並列證據：change 要出現在區塊裡" "evd-a01-x"
+run_block have "並列證據：commit 也要出現在區塊裡" "${SHA3:0:12}"
+
+# **指紋要雜湊整份 WBS，不是只有區塊前面那一段。** 把 marker 放在最前面，
+# 於是整份文件都在「區塊之後」；改最後面那一列，只雜湊前半的話指紋不會動。
+baseline
+mkmarkers_top
+render
+E1="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+# **等長的替換。** 改變長度的話，只雜湊前半的突變也會因為中點位移而變 ——
+# 那樣殺死它的是長度、不是位置，測不到「有沒有看整份」。
+edit "APP-O10 | 文件維護" "APP-O10 | 文件保養"
+render
+E2="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+if [ -n "$E1" ] && [ "$E1" != "$E2" ]; then
+  echo "✓ 區塊後面的內容變了，指紋也要變"; PASS=$((PASS + 1))
 else
-  echo "✗ 同一個 ID 開了兩個 change：列上只看到一個"
-  FAIL=$((FAIL + 1))
+  echo "✗ 區塊後面的內容變了，指紋卻沒變（${E1} → ${E2}）"; bump_fail
 fi
+
+# **從遠端分支推的狀態不准進版控。** 分支開了或刪了、repo 沒有新 commit，
+# 寫進去的東西當下就過期。
+baseline
+mkchange app-c01-x
+mkremote feat/app-c01-x--slice
+mkmarkers
+render
+run_block absent "區塊裡不准有「實作中」" "| APP-C01 | 實作中 |"
+run_block have "同一項在區塊裡是耐久狀態「規格已合併」" "| APP-C01 | 規格已合併 |"
+
+# marker 壞掉不可以用猜的 —— 那些情況下「區塊是哪一段」沒有唯一答案。
+baseline
+mkmarkers "<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->" "沒有結束 marker"
+run 1 "只有 start 沒有 end 要紅" "marker 壞了"
+
+baseline
+mkmarkers "<!-- progress:end -->" "<!-- progress:start 這一段由 \`progress.sh --render\` 產生，不要手改 -->"
+run 1 "順序反了要紅" "marker 壞了"
+
+# **貼成兩組也要紅。** 只驗「至少各有一個」的話，`.index()` 會找到第一組、
+# 裁掉它，留下第二組 —— 整份文件的結構就壞了，而且沒有任何訊息。
+# （Gemini 3.1 Pro 預測、實測存活的突變：把 `!= 1` 改成 `== 0` 之後全綠。）
+baseline
+mkmarkers
+mkmarkers
+run 1 "貼成兩組 marker 要紅" "marker 壞了"
+
+# 區塊**不複製**名稱、週次、點數 —— 複製過來的東西會跟上面那張表漂，
+# 而且每個 PR 都動到那幾欄，衝突面積會大到沒有人願意維護它。
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+run_block absent "區塊不複製項目名稱" "應用骨架"
+
+# **沒有進度的項目不列出來** —— 161 項全列進去，區塊會比表本身還長，
+# 而且「未開始」是預設值，列出來不帶任何資訊。
+run_block absent "未開始的項目不列出來" "| APP-P03 |"
+
+# 指紋要跟著輸入動。**沒有這一條，把指紋算成常數不會有人發現。**
+baseline
+mkchange app-c01-x
+mkmarkers
+render
+D1="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+edit "APP-C01 | 應用骨架" "APP-C01 | 應用骨架改名"
+render
+D2="$(grep -o '來源指紋 `[0-9a-f]*`' "$W/docs/WBS.md")"
+if [ -n "$D1" ] && [ "$D1" != "$D2" ]; then
+  echo "✓ WBS 內容變了，來源指紋跟著變"; PASS=$((PASS + 1))
+else
+  echo "✗ WBS 內容變了，來源指紋卻沒變（${D1} → ${D2}）"; bump_fail
+fi
+
 
 # 讀阻塞類型表要跟工作分解表**用同一份切列**（`split_row`）。
 # 分開寫的話，含 `\|` 的類型詞在兩邊會被切成不一樣的東西 ——
@@ -821,13 +1401,7 @@ run 1 "工作項目列欄數不足：紅" "欄"
 # 這一類實測過：把表頭的 ID 加粗，122 項掉到 19 項，而 --check 照樣是 0。
 baseline
 edit "| ID | 項目 |" "| **ID** | 項目 |"
-if (cd "$W" && bash "$SCRIPT" --all 2>&1) | grep -q "APP-C01"; then
-  echo "✓ 表頭的 ID 被加粗：照樣認得出來"
-  PASS=$((PASS + 1))
-else
-  echo "✗ 表頭的 ID 被加粗：整張表消失了"
-  FAIL=$((FAIL + 1))
-fi
+run_all_has "表頭的 ID 被加粗：照樣認得出來" "APP-C01"
 
 baseline
 edit "| ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |" "| ID | 項目 | 工作 | 週 |"
@@ -1174,6 +1748,8 @@ run_blockers_has "阻塞欄的範圍中間真的進了 blockers" "APP-P03" "DEP-
 echo
 if [ "$FAIL" -gt 0 ]; then
   echo "✗ $PASS 過、$FAIL 失敗"
+  echo "測試目錄留著給你看：$W"
   exit 1
 fi
+rm -rf "$W"
 echo "✓ $PASS/$PASS 全過"

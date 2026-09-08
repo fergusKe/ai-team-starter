@@ -167,21 +167,78 @@ git 預設做 rename 偵測，而 `--name-only` 對 rename **只顯示新路徑*
 而那正是路徑白名單失敗的同一個問題。`chore/` 分類做的是同一件事，
 但它的上界是**大小**（不看內容性質），而且不得碰 `openspec/` 與 `.github/`。
 
-**⚠️ 已知缺口（2026-09-07 外部審查實測）：這條政策目前沒有機器在執行。**
-OpenSpec CLI 自己收 `skip_specs: true` —— 一個只有 proposal、沒有任何
-Requirement／Scenario 的 change，`openspec validate --strict` 回 valid；
-而 `check-pr-branch.sh` 在 specs 目錄不存在時直接跳過 Scenario ID 檢查。
-兩者合起來的後果是具體的：**那份 proposal 合併進 main 之後，就能滿足
-`feat/` 的「規格已在 main 上」存在檢查，讓沒有規格的東西走進沒有 bytes
-上界的實作通道** —— 「無規格變更只能走有大小上界的通道」這項機器保證失效。
+**這條政策原本沒有機器在執行（2026-09-07 外部審查實測，同日堵掉）。**
 
-還是要人批准，所以不是自動繞過 review。但**只改文件不會改變這個結果**，
-所以 `SETUP-GITHUB.md` 那句警告不算修好，它只是讓缺口被看見。
+洞是這樣的：OpenSpec CLI 自己收 `skip_specs` —— `skip_specs: true` ＋ 只有
+proposal、沒有任何 Requirement／Scenario 的 change，`openspec validate --strict`
+回 valid rc=0；而 `check-pr-branch.sh` 的 Scenario ID 檢查在 specs/ 不存在時直接
+放行，註解還寫著「交給 validate 管」。**兩層各自以為對方在管。**
 
-堵它的範圍很小（`spec/` 不接受 `skip_specs` 為真、沒有實際 delta 的 change
-不得通過），但要配負向測試，而負向 fixture 必須用**main 上沒有舊 Scenario ID
-的新 change**，否則會被「不准刪 Scenario ID」那條防禦擋掉 —— 那樣測到的
-不是這條防禦。**這是獨立的一輪，不要跟 CI 接線混在同一個 PR。**
+後果是具體的：那份 proposal 合併進 main 之後就滿足了 `feat/` 的「規格已在 main 上」
+存在檢查，讓沒有規格的東西走進**沒有 bytes 上界**的實作通道 ——
+「無規格變更只走有大小上界的通道」這項機器保證整個失效。
+
+**堵法**：`spec/` 加三條政策檢查。兩個設計決定值得記：
+
+**一、邊界是「問 OpenSpec 自己」，不是「我們也判一次有沒有規格」。**
+
+閘門**不再自己判**「`specs/` 在不在、裡面有沒有 `#### Scenario:`」，
+改成讀 `openspec status --change <id> --json`，要求 `specs` artifact 的
+status 是 `done`。1.11.0 的型別明列**四個**值：
+
+| 值 | 意思 |
+|---|---|
+| `done` | **output glob 找到檔案** —— 注意這**不等於「規格有效」** |
+| `ready` | 還沒寫（沒有 specs/，也沒設旗標） |
+| `skipped` | 被旗標豁免，或檔案放在 discovery 看不到的位置 |
+| `blocked` | 依賴的 artifact 還沒完成（例如連 proposal 都沒有） |
+
+`done` 的精確語意值得記一次：它只說「glob 找到輸出」。實測放一個
+`specs/demo/notes.md`（完全不是 delta spec）也會是 `done`。
+**內容有效性是後面 `openspec validate --strict` 在判的**，這兩關各管一半，
+不要把 `done` 讀成「規格寫好了」。
+
+**為什麼改**：第一版自己判，被打出一條**完整的安全繞過**（外部審查實測）：
+
+```
+.openspec.yaml         {"schema":"spec-driven","skip\u005fspecs":true}
+specs/.hidden/spec.md  一條格式完全正確的 Scenario
+```
+
+OpenSpec 的 discovery **忽略 dot-directory**，所以它認為沒有 spec、於是接受
+`skip_specs`；而我們的 `rglob("*.md")` **把 dot-directory 算進來**，所以
+「`specs/` 有 Scenario」也成立。兩邊對「存在規格」的定義漂掉，整支閘門回 rc=0。
+
+**這正是〈同一件事寫在兩個地方一定會漂〉—— 我在閘門裡重新實作了一次
+OpenSpec 的 discovery，而且實作錯了。** 解法不是把 discovery 抄得更像
+（`.md` 檔名、capability 目錄層數、要不要跳過 dot-file⋯⋯抄得再像，
+OpenSpec 改版還是會漂），是**去問它**。
+
+`skip_specs` 那條子字串比對留著，但降級成**早期訊息**，作用是先給出本 repo
+的訊息而不是 CLI 那句「set `skip_specs: true`」。它不宣稱涵蓋完整 YAML key
+語意 —— 手刻的每一種都是「解析 YAML 的一個子集」，同一天實測連破兩次：
+行首 regex 被 flow style 繞過、全文子字串被 Unicode escape 繞過。
+漏掉的寫法由 status 檢查接住，那一條沒有解析器可以騙。
+
+**代價**：多一次 `npx openspec status` 呼叫，而且綁死了它的 JSON 形狀。
+所以 fail-closed 寫得很死：沒有輸出、JSON 壞掉、找不到 `specs` 那一項、
+status 是沒見過的值 —— **一律拒**。OpenSpec 換版改輸出形狀時，閘門會紅，
+不會安靜放行。
+
+**二、三條檢查排在 `npx openspec validate` 之前。** 兩個理由：
+
+- CLI 遇到「沒有 delta」時，錯誤訊息會說 **「set `"skip_specs: true"` in the
+  change's `.openspec.yaml` instead」** —— 它在推薦這個 repo 明文禁止的東西。
+  排在後面的話，使用者先看到的是那句錯誤的建議。
+- 更重要的：**放在後面它們永遠跑不到。** 第一版就是放在後面，四條負向測試裡有
+  兩條當場紅了 —— 不是因為防禦壞掉，是因為 `validate` 先擋，斷言指不到被測的東西。
+  跑不到的防禦沒辦法被測試鎖住，那就是〈一條恆真的測試比沒有測試更糟〉。
+  **要嘛可達，要嘛不要留。**
+
+那四條測試用的是 `run_msg`（連**專屬錯誤訊息**一起斷言，不是只看 exit code），
+fixture 一律用 **main 上不存在的新 change** —— 用既有的 `demo-change` 會被
+「不准刪／改 main 上的 Scenario ID」那條先擋掉，exit=1 是真的但擋它的不是這條。
+突變電池 4 個 0 存活（含「把整段移回 validate 之後」那個）。
 
 ---
 

@@ -6,6 +6,7 @@
 #     bash .github/scripts/progress.sh --week W1
 #     bash .github/scripts/progress.sh --blocked  # 不在自己手上的，以及誰依賴它
 #     bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束
+#     bash .github/scripts/progress.sh --render   # 更新 docs/WBS.md 的進度區塊
 #
 # **這份是算出來的，不是寫出來的。** 沒有任何人維護它。
 #
@@ -106,12 +107,14 @@ SHOW_ALL=0
 ONLY_BLOCKED=0
 CHECK=0
 JSON=0
+RENDER=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)     SHOW_ALL=1 ;;
     --blocked) ONLY_BLOCKED=1 ;;
     --check)   CHECK=1 ;;
     --json)    JSON=1 ;;
+    --render)  RENDER=1 ;;
     --week)    shift; ONLY_WEEK="${1:-}" ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
@@ -119,16 +122,38 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-git fetch -q origin 2>/dev/null || true
+# **fetch 失敗不可以靜靜吞掉。** 遠端分支是狀態的三個來源之一 ——
+# 「規格審查中」與「實作中」完全靠它。fetch 失敗時腳本會拿上一次的 refs
+# 繼續算，於是畫面上是一個**看起來很正常、其實是幾天前**的狀態，而且沒有
+# 任何跡象。原本這裡寫 `|| true`，那正是這支腳本自己在抓的
+# 「解析不出來就靜靜跳過」。
+#
+# 但**不中止** —— 沒有網路是常態（飛機上、離線的 CI job），而 WBS 的文法
+# 檢查跟遠端一點關係也沒有。所以：照跑，但把「遠端不新鮮」講出來，並且在
+# `--json` 裡標記，讓吃這份資料的工具自己決定要不要信。
+REMOTE_FRESH=1
+REMOTE_WHY=""
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  REMOTE_FRESH=0; REMOTE_WHY="這裡不是 git repo"
+elif ! git remote get-url origin >/dev/null 2>&1; then
+  REMOTE_FRESH=0; REMOTE_WHY="沒有設定 origin"
+elif ! git fetch -q origin 2>/dev/null; then
+  REMOTE_FRESH=0; REMOTE_WHY="git fetch origin 失敗（離線？沒有權限？）"
+fi
 
-SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" python3 - <<'PY'
-import os, re, subprocess, pathlib, collections, unicodedata
+SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" \
+RENDER="$RENDER" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
+import os, re, sys, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
 ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 JSON = os.environ.get("JSON") == "1"
+RENDER = os.environ.get("RENDER") == "1"
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
+# 遠端 refs 是不是這一次抓下來的。**不新鮮的時候要說**，見上面 shell 那段。
+REMOTE_FRESH = os.environ.get("REMOTE_FRESH") == "1"
+REMOTE_WHY = os.environ.get("REMOTE_WHY") or ""
 
 G, Y, R, D, B, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
 
@@ -727,6 +752,20 @@ if wbs_path.exists():
             in_table = len(cells) >= 5
             if in_table:
                 ncols = len(cells)
+            # **前七欄的位置是固定的，第八欄只能是「涵蓋證據」。**
+            # 這一欄是選填的（只有需要的那張表加），所以不能靠位置猜 ——
+            # 加在別的位置、或加了第九欄，底下每一列的意思都會跟著移位，
+            # 而畫面上還是一張正常的表。
+            if in_table and len(cells) >= 8:
+                _h8 = plain(cells[7])
+                if _h8 != "涵蓋證據":
+                    violations.append(
+                        f"docs/WBS.md 第 {lineno} 行：工作分解表的第 8 欄表頭是"
+                        f"「{_h8}」，只能是「涵蓋證據」")
+                if len(cells) > 8:
+                    violations.append(
+                        f"docs/WBS.md 第 {lineno} 行：工作分解表最多 8 欄，"
+                        f"這張表有 {len(cells)} 欄")
             found_table = found_table or in_table
             cur = None
             continue
@@ -760,6 +799,12 @@ if wbs_path.exists():
         # 第六、七欄是選填的。舊的五欄表格照樣讀得動。
         blocked = cells[5].strip() if len(cells) > 5 else ""
         mark = cells[6].strip() if len(cells) > 6 else ""
+        # 第八欄「涵蓋證據」也是選填的。它解的是這個盲區：
+        # 一項工作**做完了，但沒有跟它同名的 change**，於是永遠算不出狀態。
+        # 實例：`FE-O10 CI 補齊` 有自己的 PR，但改 `.github/` 只能走
+        # `governance/`，而 `governance/` 不准碰 `openspec/` —— 規則互斥造成
+        # 的結構性盲區，不是誰忘了開 change。
+        evid = cells[7].strip() if len(cells) > 7 else ""
         is_id_row = bool(re.fullmatch(ID_RE, wid))   # 跟引用掃描同一份文法
         # 第一欄有東西、卻不是合法 ID —— 例如 `FE-P3` 少打一個 0 ——
         # 原本會被當成上一個項目的續行，把內容默默併過去。**要報。**
@@ -775,7 +820,7 @@ if wbs_path.exists():
             wbs[wid] = {"name": name, "weeks": set(), "pts": 0,
                         "blocked": "", "mark": "", "blockers": set(),
                         "deadline": None, "fallback": False, "rows": [],
-                        "detail": []}
+                        "detail": [], "evidence": ""}
             order.append(wid)
         if cur is None:
             # 表格的第一筆資料列沒有 ID —— 漏貼或誤刪都很平常，
@@ -833,6 +878,16 @@ if wbs_path.exists():
                 wbs[cur]["fallback"] = True
             else:
                 violations.append(f"{cur}：`【沒答案就】` 後面沒有寫出實質的處置")
+        # **涵蓋證據只寫在項目的第一列。** 寫在續行的話，讀的人會以為它只涵蓋
+        # 那一列的工作，而機器是把它套在整個項目上 —— 兩種讀法不一樣，
+        # 而且沒有任何跡象。與其挑一種，不如不准。
+        if evid:
+            if not is_id_row:
+                violations.append(
+                    f"{cur}（docs/WBS.md 第 {lineno} 行）：涵蓋證據要寫在項目的"
+                    f"第一列（有 ID 的那一列），不能寫在續行")
+            else:
+                wbs[cur]["evidence"] = evid
         if pts.isdigit():
             wbs[cur]["pts"] += int(pts)
         # 每一列的阻塞都要收 —— 一個項目底下常常只有某幾列被擋住
@@ -1028,7 +1083,10 @@ def changes_for(wid):
     這條規則沒有人講過，是 `[0]` 順手訂下的。
     """
     pre = wid.lower()
-    return [c for c in changes if c == pre or c.startswith(pre + "-")]
+    # **排序 —— 字典的插入順序（先 active 後 archived）不該影響任何判斷。**
+    # 不排的話，「第一個」剛好永遠是 active 的那個，於是「聚合」跟「只看第一個」
+    # 在這份資料上同解，兩者的差別觀察不到（外部審查的存活突變之一）。
+    return sorted(c for c in changes if c == pre or c.startswith(pre + "-"))
 
 
 def setup_todo():
@@ -1071,17 +1129,129 @@ def setup_todo():
     return todo
 
 
-def change_for(wid):
-    """列上顯示哪一個。**多個的時候要看得出來有多個。**
+EVID_CHANGE = re.compile(r"^change:([a-z0-9]+(?:-[a-z0-9]+)*)$")
+EVID_COMMIT = re.compile(r"^commit:([0-9a-f]{40})$")
+
+
+def _commit_state(sha):
+    """這個 commit 在不在**這份 tree 的歷史**裡。
+
+    回傳 `ok` / `missing`（本機沒有這個物件）/ `not-ancestor`（有這個物件，
+    但它不在 HEAD 的祖先鏈上 —— 例如還在別人的分支上沒有合併）。
+
+    **`missing` 跟 `not-ancestor` 不可以混為一談。** 前者可能只是遠端不新鮮
+    （淺 clone、還沒 fetch），後者是「這個證據真的還沒進來」。
+    講錯的話，會叫人去查一個根本不存在的問題。
+    """
+    try:
+        r = subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"],
+                           capture_output=True)
+        if r.returncode != 0:
+            return "missing"
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+                           capture_output=True)
+        return "ok" if r.returncode == 0 else "not-ancestor"
+    except Exception:
+        return "missing"
+
+
+def parse_evidence(wid, raw):
+    """把「涵蓋證據」那一格拆成 `change:` 與 `commit:` 兩種指標。
+
+    回傳 `(change_ids, commits, errors)`。
+
+    **這一欄非空的時候，它就是完整的對應** —— 不再偷偷混用
+    `FE-O10 → fe-o10-*` 的命名推導。兩種來源同時生效的話，
+    「這個狀態是從哪裡來的」就沒有單一答案了。
+
+    機器能證明的只有「證據存在、而且已經合併」。**它證明不了那個 commit
+    在語意上真的完成了這一項** —— 那一格仍然要人讀 diff。
+    """
+    ids, shas, errs, seen = [], [], [], set()
+    for part in re.split(r"[\s、,，]+", raw.strip()):
+        if not part:
+            continue
+        if part in seen:
+            errs.append(f"{wid}：涵蓋證據的 `{part}` 寫了不只一次")
+            continue
+        seen.add(part)
+        m = EVID_CHANGE.match(part)
+        if m:
+            cid = m.group(1)
+            if cid not in changes:
+                errs.append(f"{wid}：涵蓋證據指到 `{cid}`，"
+                            f"但 openspec/changes/ 與 archive/ 裡都沒有它")
+            else:
+                ids.append(cid)
+            continue
+        m = EVID_COMMIT.match(part)
+        if m:
+            sha = m.group(1)
+            st = _commit_state(sha)
+            if st == "missing":
+                errs.append(f"{wid}：涵蓋證據的 commit `{sha[:12]}` "
+                            f"在本機找不到（還沒 fetch？淺 clone？）")
+            elif st == "not-ancestor":
+                errs.append(f"{wid}：涵蓋證據的 commit `{sha[:12]}` "
+                            f"不在目前 HEAD 的歷史裡 —— 還沒合併的東西不算證據")
+            else:
+                shas.append(sha)
+            continue
+        errs.append(f"{wid}：涵蓋證據的 `{part}` 不是認得的寫法"
+                    f"（只有 `change:<change-id>` 與 `commit:<40 位完整 SHA>`；"
+                    f"短 SHA 不算 —— 它會隨著 repo 長大而變得不唯一）")
+    return ids, shas, errs
+
+
+# 每一項的證據**只解析一次**，錯誤在這裡一次收完 ——
+# 解析兩次就有兩種結果的可能，那正是這支腳本到處在防的事。
+_evid = {}
+for _w in order:
+    _raw = wbs[_w].get("evidence", "")
+    if _raw:
+        _i, _s, _e = parse_evidence(_w, _raw)
+        violations.extend(_e)
+        _evid[_w] = (_i, _s)
+    else:
+        _evid[_w] = ([], [])
+
+
+def change_ids_for(wid):
+    """狀態計算要用的**清單**（可能是空的）。顯示用的字串在 `change_label()`。
 
     只回 `hits[0]` 的話，第二個 change 既不在列上、也不在孤兒清單、
     也不在 `--json` 裡 —— 它從整個輸出消失。以前是錯訊號（被當成孤兒），
     改成 `changes_for` 之後變成**沒有訊號**，那更糟。
+
+    **這裡曾經回傳顯示字串，那是一個沉默的 bug。** 2026-09-07 實測：
+    原本多個 change 時回傳 `f"{hits[0]} +{n}"`，而下游拿它去
+    `changes.get(cid, {})` —— 那個鍵永遠不存在，於是 `c = {}`、`br = set()`，
+    四個判斷全不成立，掉進 `else` 報「有分支」。
+
+        FE-W04  有兩個 change（兩個都已封存）  有分支  fe-w04-physics +1
+
+    **一個項目只要有兩個 change，就永遠算不出「已封存」。**
+    根因不是判斷寫錯，是**顯示字串與查詢鍵共用同一個回傳值** ——
+    所以這裡拆成兩支：算狀態的拿清單，印出來的才做格式化。
     """
+    # **涵蓋證據非空的時候，它就是完整的對應。** 不再回退到命名推導 ——
+    # 兩種來源同時生效的話，「這個狀態是從哪裡來的」就沒有單一答案了。
+    _e_ids, _e_shas = _evid.get(wid, ([], []))
+    if _e_ids or _e_shas:
+        return _e_ids
+    # `changes_for()` 已經排好序了 —— **排序只有一個來源**。這裡再排一次的話，
+    # 兩個排序會互相遮蔽：任一邊被拿掉，另一邊都會把它補回來，於是兩邊都
+    # 「拿掉也不會紅」（實測過，兩個突變各自存活）。
     hits = changes_for(wid)
     if not hits:
-        hits = [c for c in branches if c == wid.lower()
-                or c.startswith(wid.lower() + "-")]
+        # 分支推出來的那一份也要排 —— 它不經過 changes_for。
+        hits = sorted(c for c in branches if c == wid.lower()
+                      or c.startswith(wid.lower() + "-"))
+    return hits
+
+
+def change_label(hits):
+    """列上顯示哪一個。**多個的時候要看得出來有多個。** 只用來印，不要拿去查表。"""
     if not hits:
         return None
     return hits[0] if len(hits) == 1 else f"{hits[0]} +{len(hits) - 1}"
@@ -1094,6 +1264,11 @@ by_group = collections.defaultdict(collections.Counter)
 # 缺口 → 它擋住哪些項目。從各項目的「阻塞」欄反推，沒有人維護。
 blocks = collections.defaultdict(set)
 _state_of = {}
+# 「耐久狀態」：**從這份 tree 重建得出來的那一半。**
+# 「規格審查中」「實作中」「有分支」是從遠端分支推的 —— 分支開了或刪了、
+# repo 沒有新 commit，那個狀態當下就過期。把它寫進版控等於把一個當下的
+# 東西凍成一份紀錄，所以 WBS 的機器區塊只放這一份。
+_durable_of = {}
 for wid in order:
     info = wbs[wid]
     wk = sorted(info["weeks"])
@@ -1120,7 +1295,12 @@ for wid in order:
     mark_word = sorted(exclusive)[0] if exclusive else ""
     blocked = info.get("blocked", "") or "、".join(sorted(info.get("blockers", ())))
 
-    cid = change_for(wid)
+    # `cids` 算狀態，`cid` 只拿來印。**不要把 cid 拿去查任何字典** ——
+    # 多個 change 時它是 `"fe-x01-a +1"` 這種顯示字串，查不到任何東西。
+    cids = change_ids_for(wid)
+    cid = change_label(cids)
+    _e_ids, _e_shas = _evid.get(wid, ([], []))
+    durable = None   # 只有「看了遠端分支」的那一支要覆寫它
 
     # **有週次就是排得動。** 一個項目底下某一列被擋住，不代表整個項目做不了 ——
     # 那樣會把「可以先做一半」藏起來，而那正是最需要被看見的部分。
@@ -1133,34 +1313,60 @@ for wid in order:
     elif mark_word == "Cancelled":
         # 決定不做。**不算未開始** —— 那會讓「還有多少沒做」永遠虛高。
         reason = mark_reason
-        if cid and changes.get(cid, {}).get("state") == "archived":
+        if any(changes.get(c, {}).get("state") == "archived" for c in cids):
             # 標成不做，卻有 change 已經封存了 —— 兩個真實來源打架。
             # **不要挑一個信**，把矛盾攤出來讓人去改。
             state, detail, colour = "矛盾", f"標 Cancelled 但 {cid} 已封存", R
         else:
             state, detail, colour = "已取消", reason, D
-    elif cid is None and not schedulable and (blocked or mark_word in ("Pending", "TBD")):
+    elif not cids and _e_shas:
+        # 有 commit 證據、但沒有對應的 change。**這是規則互斥造成的盲區**
+        # （改 `.github/` 只能走 `governance/`，而 `governance/` 不准碰
+        # `openspec/`），不是誰忘了開 change。
+        #
+        # 狀態叫「已完成」不叫「已封存」—— **機器只證明了那個 commit 存在
+        # 而且已經合併，沒有證明它在語意上真的做完這一項。** 借用 OpenSpec
+        # 的字會讓兩種強度不同的結論長得一樣。
+        _more = f" +{len(_e_shas) - 1}" if len(_e_shas) > 1 else ""
+        state, detail, colour = "已完成", f"commit:{_e_shas[0][:12]}{_more}", G
+    elif not cids and not schedulable and (blocked or mark_word in ("Pending", "TBD")):
         state = "待裁決" if mark_word == "TBD" else "等外部"
         detail, colour = blocked or mark, R
-    elif cid is None:
+    elif not cids:
         state, detail, colour = "未開始", "", D
     else:
-        c = changes.get(cid, {})
-        br = branches.get(cid, set())
-        prog = c.get("prog")
+        # **聚合，不是挑第一個。** 每一個判斷都看全部 change：
+        #   全部封存        → 已封存（少一個沒封存就不是，那還有東西在動）
+        #   任一個有實作分支 → 實作中
+        #   任一個還 active  → 規格已合併
+        # 「一個封存、一個還在做」不是矛盾，是正常的分段交付 —— 它會落在
+        # 「實作中／規格已合併」，因為還有東西在動，那才是要被看見的事。
+        cs = [changes.get(c, {}) for c in cids]
+        brs = set().union(*(branches.get(c, set()) for c in cids))
+        states = [c.get("state") for c in cs]
+        # 進度條只在單一 change 時顯示 —— 多個 change 的 x/y 相加沒有意義。
+        prog = cs[0].get("prog") if len(cs) == 1 else None
         bar = ""
         if prog and prog[1]:
             bar = f"{prog[0]}/{prog[1]}"
-        if c.get("state") == "archived":
+        if states and all(s == "archived" for s in states):
             state, detail, colour = "已封存", f"{cid}", G
-        elif "feat" in br or "fix" in br:
+        elif "feat" in brs or "fix" in brs:
             state, detail, colour = "實作中", f"{cid} {bar}".strip(), Y
-        elif c.get("state") == "active":
+        elif "active" in states:
             state, detail, colour = "規格已合併", f"{cid} {bar}".strip(), Y
-        elif "spec" in br:
+        elif "spec" in brs:
             state, detail, colour = "規格審查中", f"{cid}", Y
         else:
             state, detail, colour = "有分支", f"{cid}", Y
+        # 同一次判斷裡把「不看遠端分支會是什麼」也算出來。
+        # **不要事後從 state 反推** —— 那是同一件事算兩次，遲早會分岔。
+        if states and all(s == "archived" for s in states):
+            durable = "已封存"
+        elif "active" in states:
+            durable = "規格已合併"
+        else:
+            durable = "未開始"
     # Alarm 不是狀態，是警示 —— 疊在算出來的狀態上，不取代它。
     if "Alarm" in marks:
         detail = (detail + " ⚠").strip()
@@ -1176,6 +1382,7 @@ for wid in order:
 
     tally[state] += 1
     _state_of[wid] = state
+    _durable_of[wid] = durable if durable is not None else state
     by_group[re.sub(r"[0-9]+$", "", wid)][state] += 1
     if ONLY_BLOCKED and state not in ("等外部", "待裁決"):
         continue
@@ -1256,6 +1463,15 @@ for wid in order:
                     f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
                     f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
 
+# **遠端不新鮮就講出來，而且要講清楚哪些狀態不能信。**
+# 只印「fetch 失敗」不夠 —— 讀的人不會知道那影響了什麼。
+if not REMOTE_FRESH and not JSON:
+    print()
+    print(f"{Y}⚠ 遠端狀態可能是舊的：{REMOTE_WHY}{X}")
+    print(f"{D}  「規格審查中」與「實作中」是從遠端分支推的，這一次沒抓到新的，"
+          f"用的是上一次的 refs。{X}")
+    print(f"{D}  「已封存」「規格已合併」「未開始」不受影響 —— 那些只看這份 tree。{X}")
+
 _todo = setup_todo()
 if _todo and not JSON and not CHECK:
     print()
@@ -1273,8 +1489,11 @@ if JSON:
     # 網頁與 Excel 曾經各自重算過一次，三邊給出三個答案 ——
     # 那正是這份文件到處在防的「同一件事寫在兩個地方」。
     import json as _json
+    # `remote_fresh` 是給下游用的。`wbs-page.sh` 與往後的 WBS 區塊都要看它 ——
+    # **把從遠端推出來的狀態當成事實寫進版控，是把一個當下的東西凍成一份紀錄。**
     out = {"items": [], "groups": _groups, "affects": {},
-           "milestones": _milestones, "deps": _deps}
+           "milestones": _milestones, "deps": _deps,
+           "remote_fresh": REMOTE_FRESH, "remote_why": REMOTE_WHY}
     _aff = collections.defaultdict(list)
     for wid in order:
         info = wbs[wid]
@@ -1285,11 +1504,19 @@ if JSON:
             "pts": info["pts"], "blockers": sorted(info["blockers"]),
             "blocked": info["blocked"], "marks": sorted(marks), "reason": reason,
             "deadline": info["deadline"], "state": _state_of[wid], "rows": info["detail"],
+            # 涵蓋證據：原文 ＋ 解析結果。**兩個都要** —— 原文是人寫的東西，
+            # 解析結果是機器信的東西，只給後者的話就沒辦法看出兩者對不上。
+            "evidence": info.get("evidence", ""),
+            "evidence_changes": _evid.get(wid, ([], []))[0],
+            "evidence_commits": _evid.get(wid, ([], []))[1],
             # **change 的關聯以前只存在於終端機表格。** `--json` 是網頁與
             # Excel 的唯一資料來源，那邊看不到就等於這件事沒有被算過 ——
             # 而「同一個 ID 開了兩個 change」這種事更是完全看不出來。
             # 這裡放**全部**，不是第一個。
-            "changes": changes_for(wid),
+            # **要跟狀態算出來的那一份是同一份。** 這裡原本是 `changes_for()`：
+            # 有涵蓋證據的項目，狀態是用證據算的，而 `--json` 卻吐命名推導的
+            # 結果 —— 兩個不同的清單，看的人分不出哪一個影響了狀態。
+            "changes": change_ids_for(wid),
         })
         for g in info["blockers"]:
             _aff[g].append(wid)
@@ -1328,6 +1555,135 @@ elif rows:
         pad = 20 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in name)
         print(f"{colour}{wid:<9} {name}{' ' * max(pad,1)}{weeks:<8} {pts:>3}  {state:<12} {detail}{X}")
     print()
+
+# ── docs/WBS.md 的機器區塊 ─────────────────────────────────────────
+#
+# **人只會打開 docs/WBS.md。** 進度以前只存在終端機輸出與不進版控的
+# docs/wbs.html —— 在 GitHub 上打開那份表，看不到任何完成資訊。
+#
+# 這一段把「哪些項目做完了」寫回表裡，但只寫**耐久狀態**：
+# 從這份 tree 重建得出來的那一半。遠端分支推出來的（規格審查中／實作中）
+# 不進來 —— 分支開了或刪了、repo 沒有新 commit，寫進去的東西當下就過期。
+BLOCK_START = "<!-- progress:start 這一段由 `progress.sh --render` 產生，不要手改 -->"
+BLOCK_END = "<!-- progress:end -->"
+
+
+def _digest_of(stripped):
+    """**這個區塊是從哪一份 WBS 原文產生的。不是 commit 的 SHA。**
+
+    不放 commit SHA 的理由：區塊在 commit 裡、SHA 又要放進區塊，
+    自我引用沒有不動點。
+
+    只雜湊「拿掉區塊之後的 WBS 原文」。**change 的狀態刻意不放進來** ——
+    它已經逐項寫在下面那張表裡了，再雜湊一次不會被任何東西觀察到
+    （實測：把 change 那一段從雜湊裡拿掉，198 條測試全綠 —— 它是一個
+    沒有讀者的成分）。這個 repo 自己的規矩是「要嘛可達，要嘛不要留」。
+
+    `tasks.md` 的勾也不放：每打一個勾就換一次指紋的話，這個區塊會變成每個
+    PR 都要重產的東西，而那個勾根本沒有顯示在區塊裡。
+    """
+    import hashlib
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
+
+
+def _strip_block(text):
+    """把既有的區塊拿掉，回傳 `(前段, 後段)`；沒有區塊就回 None。
+
+    **marker 各要恰好一個，而且順序正確。** 少一個、多一個、順序反了都
+    直接失敗 —— 那些情況下「區塊是哪一段」沒有唯一答案，猜一個就是 fail-open。
+    """
+    if text.count(BLOCK_START) != 1 or text.count(BLOCK_END) != 1:
+        return None
+    i = text.index(BLOCK_START)
+    j = text.index(BLOCK_END)
+    if j < i:
+        return None
+    return text[:i], text[j + len(BLOCK_END):]
+
+
+def _render_block(stripped):
+    """區塊的內容。**只放 ID、耐久狀態、依據** —— 名稱、週次、點數不複製。
+
+    複製過來的東西會跟上面那張表漂；而且每個 PR 都動到那幾欄，
+    衝突面積會大到沒有人願意維護它。
+    """
+    lines = [BLOCK_START, "",
+             "### 目前做到哪裡（機器產生）", "",
+             "**沒有列出來的項目就是「未開始」。**"
+             "「規格審查中」「實作中」不在這裡 —— 那兩個是從遠端分支推的，"
+             "不是這份 tree 重建得出來的，寫進版控當下就會過期。"
+             "要看那兩個狀態跑 `bash .github/scripts/progress.sh`。", "",
+             # **第一欄不可以叫 `ID`。** 這個區塊住在 docs/WBS.md 裡面，
+             # 而 WBS 的解析器認的表頭就是「第一欄是 ID、下一行是分隔線」——
+             # 叫 `ID` 的話它會被當成另一張工作分解表，然後因為只有三欄而報錯。
+             # （實測：`--check` 紅在「第 40 行是工作分解表的表頭，但只有 3 欄」。
+             # 產生出來的東西要能通過這份文件自己的文法，那也是驗收的一部分。）
+             "| 項目 | 狀態 | 依據 |", "|---|---|---|"]
+    # **依狀態排，不依 ID 排。** 讀的人問的是「哪些做完了」——
+    # 按 ID 排的話那幾項會被外部缺口埋在中間。同狀態內再按 ID，
+    # 所以順序仍然是決定性的（diff 才不會亂跳）。
+    _rank = {"已封存": 0, "已完成": 1, "規格已合併": 2, "常態": 3,
+             "矛盾": 4, "待裁決": 5, "等外部": 6, "已取消": 7}
+    n = 0
+    for wid in sorted(order, key=lambda w: (_rank.get(_durable_of.get(w, ""), 9), w)):
+        st = _durable_of.get(wid, "")
+        if st in ("", "未開始"):
+            continue
+        # **兩種證據並列時兩個都要留。** 原本 `if _s:` 一成立就只印 commit，
+        # change 從「依據」欄整個消失 —— 而 AGENTS.md 明寫可以並列，`--json`
+        # 也兩個都留著。**顯示層掉資料跟資料層掉資料一樣糟**，因為區塊就是
+        # 大部分人唯一會看的地方。（外部審查實測。）
+        _i, _s = _evid.get(wid, ([], []))
+        _why = ["`" + x + "`" for x in (_i or change_ids_for(wid))]
+        _why += ["`" + x[:12] + "`" for x in _s]
+        why = "、".join(_why) or "—"
+        lines.append(f"| {wid} | {st} | {why} |")
+        n += 1
+    tal = collections.Counter(_durable_of[w] for w in order)
+    lines += ["",
+              "共 " + str(len(order)) + " 項："
+              + "、".join(f"{k} {v}" for k, v in sorted(tal.items(), key=lambda kv: -kv[1])),
+              "",
+              "來源指紋 `" + _digest_of(stripped) + "`"
+              "（這一段是從哪一份 WBS 原文產生的。不放 commit SHA —— "
+              "區塊在 commit 裡、SHA 又放進區塊的話，自我引用沒有不動點）",
+              "", BLOCK_END]
+    return "\n".join(lines)
+
+
+if RENDER or CHECK:
+    _wp = pathlib.Path("docs/WBS.md")
+    _txt = _wp.read_text(encoding="utf-8") if _wp.is_file() else None
+    if _txt is None:
+        if RENDER:
+            print("✗ 沒有 docs/WBS.md，沒有東西可以產生", file=sys.stderr)
+            raise SystemExit(1)
+    elif BLOCK_START not in _txt and BLOCK_END not in _txt:
+        # 兩個 marker 都沒有 —— 這個功能是選填的，沒開就是沒開。
+        if RENDER:
+            print("✗ docs/WBS.md 裡沒有這兩行，先手動加一次（放在你希望"
+                  "進度出現的位置）：", file=sys.stderr)
+            print("    " + BLOCK_START, file=sys.stderr)
+            print("    " + BLOCK_END, file=sys.stderr)
+            raise SystemExit(1)
+    else:
+        _parts = _strip_block(_txt)
+        if _parts is None:
+            violations.append(
+                "docs/WBS.md 的 progress marker 壞了："
+                "`progress:start` 與 `progress:end` 要各恰好一個、而且 start 在前")
+            if RENDER:
+                print(violations[-1], file=sys.stderr)
+                raise SystemExit(1)
+        else:
+            _want = _parts[0] + _render_block(_parts[0] + _parts[1]) + _parts[1]
+            if RENDER:
+                _wp.write_text(_want, encoding="utf-8")
+                print("✓ 已更新 docs/WBS.md 的進度區塊")
+            elif _want != _txt:
+                violations.append(
+                    "docs/WBS.md 的進度區塊跟現在的狀態對不上 —— "
+                    "跑 `bash .github/scripts/progress.sh --render` 再 commit")
 
 if violations:
     print()
