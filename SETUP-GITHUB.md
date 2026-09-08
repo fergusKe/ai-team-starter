@@ -128,7 +128,8 @@ mv .github/CODEOWNERS.example .github/CODEOWNERS
 一份快照 `.github/repo-settings.json`，設完用 `check-ruleset.sh` 對一次。
 
 ```bash
-gh api -X PATCH repos/OWNER/REPO -F delete_branch_on_merge=true
+gh api -X PATCH repos/OWNER/REPO \
+  -F delete_branch_on_merge=true -F allow_merge_commit=false -F allow_rebase_merge=false
 gh api -X PUT  repos/OWNER/REPO/actions/permissions/workflow \
   -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
 
@@ -137,21 +138,46 @@ bash .github/scripts/check-ruleset.sh      # 兩份快照一起對，要全部 �
 
 | 設定 | 值 | 為什麼 |
 |---|---|---|
-| `delete_branch_on_merge` | `true` | 見下面 |
+| `delete_branch_on_merge` | `true` | 見〈分支不會自己消失〉 |
+| `allow_merge_commit` | `false` | 見〈只准 squash〉 |
+| `allow_rebase_merge` | `false` | 同上 |
+| `allow_squash_merge` | `true` | 同上 |
+| `squash_merge_commit_title` | `COMMIT_OR_PR_TITLE` | 單一 commit 的 PR 直接沿用那個 commit 的標題 |
+| `squash_merge_commit_message` | `COMMIT_MESSAGES` | 多個 commit 的 PR 會把每一段訊息都留下來（實測過） |
 | Actions `default_workflow_permissions` | `read` | workflow 拿到的 `GITHUB_TOKEN` 預設唯讀。要寫入的 job 自己在 `permissions:` 裡明寫，範圍才看得見 |
 | Actions `can_approve_pull_request_reviews` | `false` | 不讓 workflow 自己 approve PR —— 那會讓 review 這一層形同虛設 |
 
-**合併後自動刪分支為什麼要特別講**：這裡的 PR **習慣上**走 squash 合併，而
+### 只准 squash
+
+合併方式**鎖成只有 squash**，兩層都鎖：上表的三個 `allow_*` 讓另外兩顆按鈕
+消失，`ruleset.json` 的 `allowed_merge_methods: ["squash"]` 才是真的擋著的那
+一層（repo 設定只是藏按鈕，ruleset 才對受保護分支有效力）。
+
+**為什麼**：這套流程把說明寫在 commit 訊息裡 —— 為什麼這樣改、放棄了什麼、
+實測數字。squash 之後**一個 PR 對應 `main` 上一個 commit**，`git log --oneline`
+本身就是可讀的變更史。走 merge commit 的話，中間會夾雜 `tmp`、`修錯字` 這種
+過程 commit，那些既不獨立可建置也不獨立可測試。
+
+**代價講清楚**：失去 PR 內部的 commit 粒度，`git bisect` 只能定位到 PR 而不是
+PR 裡的某一步。這套流程本來就把 PR 切得小（`chore/` 有 20000 bytes 上界、實作
+用 `feat/<id>--<slice>` 分片），所以定位到 PR 通常夠用。**只有在團隊刻意維持
+「每個內部 commit 都可獨立建置與測試」的時候，保留粒度才划算** —— 不是的話，
+保留下來的是雜訊不是精度。
+
+沒有任何閘門受影響（查過）：`check-pr-branch.sh` 看的是 `origin/main...HEAD`，
+那是**合併之前**在 PR 分支上算的；`progress.sh` 從分支與目錄推狀態；archive 比
+的是逐檔 blob。三種合併方式改變的是 commit 拓撲，不是合併後的檔案內容。
+
+### 分支不會自己消失
+
 squash 產生的是一個全新的 commit —— 原分支的 tip 不是 `main` 的祖先，於是本機
 刪分支的指令**永遠**判定「還沒合併」而拒絕動手，必須改用強制刪除。實際發生
 過：21 個已經合併的分支堆在本機，一般的刪除一個都不肯做，只能逐一確認內容真
 的在 main 上之後強制刪掉。
 
-> **注意**：模板附的 `ruleset.json` 把 `allowed_merge_methods` 設成
-> `["merge", "squash", "rebase"]` —— **三種都開，squash 只是約定不是規則**。
-> 要讓它變成規則就改成 `["squash"]` 再重新套用；不改的話，上面那段「squash
-> 之後刪不掉」只在別人也走 squash 的時候成立。**兩種都可以，但要選一個** ——
-> 文件宣稱 A、設定是 B，是這套東西最常見的失效方式。
+> **squash 的另一個地雷**：不要在已經合併過的分支上繼續開發。git 看不出那些
+> 改動已經進 main，下一個 PR 會把它們整批再送一次。上面的
+> `delete_branch_on_merge` 就是在防這件事 —— 分支合併後就消失，沒得重用。
 
 三層各自要處理，缺一層就會堆：
 
