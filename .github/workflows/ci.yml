@@ -61,7 +61,7 @@ jobs:
       # 直接插進 `run:`。Actions 是**文字替換**，而 git 收 `chore/$(...)` 這種
       # 分支名（`git check-ref-format` rc=0）—— 直接插值的話那段會在
       # 閘門拿到參數之前就被 shell 執行。這是 GitHub 官方點名的 script injection。
-      # `.github/scripts/test-ci-workflow.sh` 在驗這件事，改這一步之前先跑它。
+      # 下面的 Workflow lint（actionlint）在驗這件事。
       - name: Branch
         if: github.event_name == 'pull_request'
         env:
@@ -126,10 +126,31 @@ jobs:
       - name: Branch gate tests
         run: bash .github/scripts/test-check-pr-branch.sh
 
-      # workflow 自己的合約測試：分支名有沒有原樣傳進閘門。
-      # 這一關驗的不是腳本，是**這份 YAML** —— 把 env 中介變數改回直接插值就會紅。
-      - name: Workflow contract tests
-        run: bash .github/scripts/test-ci-workflow.sh
+      # workflow 自己的靜態檢查。
+      #
+      # 這一步取代了 `.github/scripts/test-ci-workflow.sh`（350 行手寫 YAML
+      # parser）。那支存在的理由是一條規則 ——「`${{ }}` 不可以直接插進
+      # `run:`」—— 而那正是 actionlint 的 `expression` 規則，它還會指出欄位
+      # 位置。**現成的靜態檢查器做得到的事，不要自己寫一份。**
+      #
+      # **版本固定 + checksum 驗證。** 不用第三方 action，也不吃 latest ——
+      # 一個會自己變的檢查器，紅綠會在沒有人改任何東西的時候翻面。
+      # 升級方式：改下面兩個常數，跑一次確認。
+      #
+      # 換掉之後少了什麼（記在 docs/DECISIONS.md）：actionlint 不管
+      # `continue-on-error`、不管 job 層的 `if:`／`defaults:`、也不管
+      # 「四個品質步驟的 run 是不是剛好那一句」。那三類改靠 PR review。
+      - name: Workflow lint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color
 
       # 提示檔自己的合約測試：文件教的操作，閘門收不收得下。
       # 它會照 prompts/02 的 shell 區塊真的開一次分支，再拿去問閘門 ——
@@ -137,7 +158,9 @@ jobs:
       - name: Prompts contract tests
         run: bash .github/scripts/test-prompts.sh
 
-      - name: Scenario coverage gate tests
+      # `check-scenario-coverage.sh` 是**報告不是閘門**，所以它自己不在 CI 上；
+      # 但那支報告會被人拿來做判斷，所以它的測試留著 —— 報錯的尺比沒有尺更糟。
+      - name: Scenario report tests
         run: bash .github/scripts/test-scenario-coverage.sh
 
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
@@ -179,13 +202,6 @@ jobs:
 
       - name: Test
         run: npm test
-
-      # **每一條 Scenario 都要有一個真的跑過而且通過的測試指著它。**
-      # 零份現況 spec 的時候它安全地回 0 —— 剛複製的模板不會因此紅。
-      # **從第一天就接上**，否則第一次 archive 會卡在一個沒有任何合法 PR
-      # 能修好的死結（archive/ 不准碰 .github/）。
-      - name: Scenario coverage
-        run: bash .github/scripts/check-scenario-coverage.sh
 
       - name: Build
         run: npm run build
