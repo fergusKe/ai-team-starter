@@ -1,0 +1,15 @@
+{
+  "_what": "repo 層級設定的快照。分支保護（branch ruleset）在 .github/ruleset.json，這一份是 repo 自己的設定。",
+  "_why": "這些設定只存在於 GitHub 的網頁上，不在版控裡。沒有快照的話，它們是「只有設過的人知道」的東西 —— 新專案從模板複製走，不會知道要設，而且沒有任何東西會提醒。",
+  "_how": "bash .github/scripts/check-ruleset.sh 會把這兩份快照跟 GitHub 上實際生效的設定比對。子集檢查：只驗這裡宣告的欄位。",
+  "_apply": "gh api -X PATCH repos/OWNER/REPO -F delete_branch_on_merge=true ；Actions 那兩項見 SETUP-GITHUB.md。",
+
+  "repo": {
+    "delete_branch_on_merge": true
+  },
+
+  "actions_workflow_permissions": {
+    "default_workflow_permissions": "read",
+    "can_approve_pull_request_reviews": false
+  }
+}

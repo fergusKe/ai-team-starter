@@ -505,8 +505,9 @@ org ruleset + Team/Enterprise 方案，這個 org 是 free。
 
 | 檔案 | 是什麼 |
 |---|---|
-| `.github/ruleset.json` | 實際設定的快照，就是 API payload 本身 |
-| `.github/scripts/check-ruleset.sh` | 把線上設定抓下來跟快照比對，不一致就列出差在哪 |
+| `.github/ruleset.json` | **分支保護**的快照，就是 API payload 本身 |
+| `.github/repo-settings.json` | **repo 層級設定**的快照（合併後刪分支、Actions 權限）。那些只存在於 GitHub 的網頁上 |
+| `.github/scripts/check-ruleset.sh` | 把線上設定抓下來跟這兩份比對，不一致就列出差在哪 |
 
 ```bash
 bash .github/scripts/check-ruleset.sh

@@ -122,22 +122,36 @@ mv .github/CODEOWNERS.example .github/CODEOWNERS
 
 `job` 的 `name: ci` 就是 required check 的名稱，改名要同步改下面的 ruleset。
 
-## 4. 合併後自動刪分支（不設的話會堆到沒人管得動）
+## 4. repo 層級設定（**這些只存在於 GitHub 的網頁上**）
 
-Settings → General → Pull Requests → ☑ **Automatically delete head branches**
-
-或者：
+分支保護在下一節，這一節是 repo 自己的設定。它們不在版控裡 —— 所以模板附了
+一份快照 `.github/repo-settings.json`，設完用 `check-ruleset.sh` 對一次。
 
 ```bash
 gh api -X PATCH repos/OWNER/REPO -F delete_branch_on_merge=true
-gh api repos/OWNER/REPO -q .delete_branch_on_merge      # 要看到 true
+gh api -X PUT  repos/OWNER/REPO/actions/permissions/workflow \
+  -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
+
+bash .github/scripts/check-ruleset.sh      # 兩份快照一起對，要全部 ✓
 ```
 
-**為什麼要特別講**：這裡的 PR 全部走 **squash 合併**，而 squash 產生的是一個
-全新的 commit —— 原分支的 tip 不是 `main` 的祖先，於是本機刪分支的指令
-**永遠**判定「還沒合併」而拒絕動手，必須改用強制刪除。實際發生過：21 個已經
-合併的分支堆在本機，一般的刪除一個都不肯做，只能逐一確認內容真的在 main 上
-之後強制刪掉。
+| 設定 | 值 | 為什麼 |
+|---|---|---|
+| `delete_branch_on_merge` | `true` | 見下面 |
+| Actions `default_workflow_permissions` | `read` | workflow 拿到的 `GITHUB_TOKEN` 預設唯讀。要寫入的 job 自己在 `permissions:` 裡明寫，範圍才看得見 |
+| Actions `can_approve_pull_request_reviews` | `false` | 不讓 workflow 自己 approve PR —— 那會讓 review 這一層形同虛設 |
+
+**合併後自動刪分支為什麼要特別講**：這裡的 PR **習慣上**走 squash 合併，而
+squash 產生的是一個全新的 commit —— 原分支的 tip 不是 `main` 的祖先，於是本機
+刪分支的指令**永遠**判定「還沒合併」而拒絕動手，必須改用強制刪除。實際發生
+過：21 個已經合併的分支堆在本機，一般的刪除一個都不肯做，只能逐一確認內容真
+的在 main 上之後強制刪掉。
+
+> **注意**：模板附的 `ruleset.json` 把 `allowed_merge_methods` 設成
+> `["merge", "squash", "rebase"]` —— **三種都開，squash 只是約定不是規則**。
+> 要讓它變成規則就改成 `["squash"]` 再重新套用；不改的話，上面那段「squash
+> 之後刪不掉」只在別人也走 squash 的時候成立。**兩種都可以，但要選一個** ——
+> 文件宣稱 A、設定是 B，是這套東西最常見的失效方式。
 
 三層各自要處理，缺一層就會堆：
 
