@@ -41,6 +41,20 @@ npm run lint && npm run typecheck && npm test && npm run build
 archive PR 之後再跑一次**，把新出現的缺口一起處置掉 —— 沒有任何閘門會替你
 記得這件事。
 
+### 合併的時候順手把分支收掉
+
+```bash
+git worktree remove <那個 worktree>          # 有用 worktree 才需要
+gh pr merge <PR> --squash --delete-branch
+```
+
+`--delete-branch` **遠端與本機一起刪**。少了它，本機那個分支之後就很難刪 ——
+squash 合併產生的是一個全新的 commit，原分支的 tip 不是 `main` 的祖先，於是
+git 永遠判定「還沒合併」而拒絕刪除，只能一個個確認內容真的在 main 上之後強制
+刪掉（實際發生過，一次堆了 21 個）。
+
+worktree 佔著分支的時候 `--delete-branch` 會失敗，所以順序是先移除 worktree。
+
 全部通過、PR 合併之後：
 
 ```
