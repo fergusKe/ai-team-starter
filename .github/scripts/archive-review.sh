@@ -20,6 +20,10 @@
 # 模型與執行檔走環境變數：ARCHIVE_REVIEW_CODEX（模型）、ARCHIVE_REVIEW_CODEX_BIN（預設 codex）、
 # ARCHIVE_REVIEW_GEMINI（模型）、ARCHIVE_REVIEW_GEMINI_BIN（預設 agy）、ARCHIVE_REVIEW_TIMEOUT（秒）。
 # 哪個 CLI 不在就**明說跳過**並記進帳本；少一個模型的 change 不算雙模型樣本。
+#
+# 信任邊界：帳本與回答檔都在本機、gitignore、負責人自己可以改。這套守的是**誤操作與模型的半成品**
+# （移走重跑、沒答完、結論跟明細對不上、判定套到別的發現上），**不防惡意竄改** —— 一個人合併的專案，
+# 竄改自己的試驗量尺沒有對手。升阻塞的決定仍由人看 --report 與檔案下，不是腳本自動升。
 set -euo pipefail
 
 # ── 升阻塞的條件（唯一定義處；改這裡，report 會印出來） ──────────────────────────────────────────
@@ -47,7 +51,7 @@ answered() { # answered <rc> <file> [round]
   [ "$1" = 0 ] && [ -s "$2" ] || { echo false; return; }
   if [ "${3:-1}" = 2 ]; then
     local n; n=$(r2_expected); [ "$n" -gt 0 ] || { echo true; return; }
-    local i=1; while [ "$i" -le "$n" ]; do grep -Eq "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)" "$2" || { echo false; return; }; i=$((i+1)); done; echo true
+    local i=1; while [ "$i" -le "$n" ]; do [ "$(grep -Ec "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)" "$2")" = 1 ] || { echo false; return; }; i=$((i+1)); done; echo true   # 每一號恰好一次：重複、矛盾都不算
   else
     local c; c="$(grep -m1 "^結論[：:]" "$2" | grep -oE '[0-9]+' | tr '\n' ' ')"
     [ "$c" = "$(count "$2" 需修正) $(count "$2" 可接受風險) $(count "$2" 誤報候選) " ] && echo true || echo false
@@ -73,28 +77,33 @@ def r1_ok(txt):   # 結論那一行的三個數字＝明細的標籤數
     if txt is None: return False
     m1 = re.search(r"(?m)^結論[：:].*$", txt)
     return bool(m1) and [int(x) for x in re.findall(r"\d+", m1.group(0))] == list(tags(txt).values())
-def r2_line(txt, n): return re.search(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)" % n, txt)
-def r2_ok(txt, n):  # 1..n 每一號都有答
-    return txt is not None and (n == 0 or all(r2_line(txt, k) for k in range(1, n + 1)))
+def r2_lines(txt, n): return re.findall(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)" % n, txt)
+def r2_line(txt, n): m2 = r2_lines(txt, n); return m2[0] if len(m2) == 1 else None
+def r2_ok(txt, n):  # 1..n 每一號**恰好一次**：缺號、重複、矛盾都不算
+    return txt is not None and (n == 0 or all(len(r2_lines(txt, k)) == 1 for k in range(1, n + 1)))
 rev = [r for r in rows if r.get("kind") == "review"]
 led = {}                                              # (id, round, model) → 最早 ok 的 row；之後的重跑不算
 for r in rev:
     if r.get("ok", True): led.setdefault((r["id"], r["round"], r["model"]), r)   # 舊 row 沒有 ok 欄：當時只有回答了才會寫 row
-broken, r1 = [], {}                                   # r1[id][model] = (row, tags)
-for (i, rnd, m), r in led.items():
-    if rnd != 1: continue
-    txt = read(i, m, 1)
-    if r1_ok(txt): r1.setdefault(i, {})[m] = (r, tags(txt))
-    else: broken.append(f"{i}/{m}")
+# 樣本先照**帳本**凍結（最早 N 個兩個模型都有 ok row 的 change），再驗每一份檔案；壞了就不能下結論，**不遞補**——
+# 遞補等於讓後面的 change 換掉前面的樣本。
 seen = list(dict.fromkeys(r["id"] for r in rev if r["round"] == 1))
-done = {i: max(r1[i][m][0]["ts"] for m in ("codex", "gemini")) for i in seen if {"codex", "gemini"} <= set(r1.get(i, {}))}
+done = {i: max(led[(i, 1, m)]["ts"] for m in ("codex", "gemini")) for i in seen if all((i, 1, m) in led for m in ("codex", "gemini"))}
 both = sorted(done, key=done.get)                      # 樣本順序＝兩個模型都答齊的時間，補跑沒回答的那個不會插隊
 half = [i for i in seen if i not in done]
 cohort = both[:N]
+r1, broken = {}, []                                   # r1[id][model] = (row, tags)；broken = 樣本裡帳本說答過、檔案卻不成立的
+for i in cohort:
+    for m in ("codex", "gemini"):
+        txt = read(i, m, 1)
+        if r1_ok(txt): r1.setdefault(i, {})[m] = (led[(i, 1, m)], tags(txt))
+        else: broken.append(f"{i}/{m}")
 print(f"條件：最早 {N} 個雙模型樣本內 已修 ≥{MINV}、誤報率 ≤{MAXFP}%、等待 P90 ≤{MAXP90} 秒")
 print(f"雙模型樣本：{len(both)} 個（樣本取前 {N}：{', '.join(cohort) or '—'}）；只有一個模型回答、不算樣本的：{len(half)} 個（{', '.join(half) or '—'}）")
-if broken: print(f"帳本說答過、檔案卻不在或不完整（不算）：{', '.join(sorted(set(broken)))}")
 if not cohort: print("還沒有任何雙模型樣本"); sys.exit(0)
+if broken:
+    print(f"樣本裡帳本說答過、檔案卻不在或不完整：{', '.join(broken)}")
+    print(f"結論：不能下結論：{len(broken)} 份樣本的第一輪回答檔不成立（樣本不遞補）"); sys.exit(0)
 def p90(xs):
     xs = sorted(xs); return xs[max(0, math.ceil(0.9 * len(xs)) - 1)]
 nf = {i: {m: r1[i][m][1]["需修正"] for m in ("codex", "gemini")} for i in cohort}
@@ -111,7 +120,7 @@ def fixed_ok(j):
     txt = read(i, m, 2)
     if not r2_ok(txt, n): return False
     g = j["finding"] + (nf[i]["codex"] if m == "gemini" else 0)
-    ln = r2_line(txt, g); return bool(ln) and ln.group(1) == "已修"
+    return r2_line(txt, g) == "已修"
 ok = sum(1 for j in judg if j["verdict"] == "已修" and fixed_ok(j))
 bad_fixed = [f"{j['id']}/{j['model']}#{j['finding']}" for j in judg if j["verdict"] == "已修" and not fixed_ok(j)]
 ok_norere = sum(1 for j in judg if j["verdict"] == "已驗證")
@@ -153,8 +162,10 @@ if [ "${1:-}" = "--judge" ]; then
     G=$3; if [ "$2" = gemini ]; then C=$(count "$DIR/r1/codex.md" 需修正); G=$(( ${C:-0} + $3 )); fi   # grep -c 找不到時 exit 1，不能 `|| echo 0`
     grep -Eq "^[[:space:]]*${G}[.)][[:space:]]*已修" "$DIR/r2/$2.md" 2>/dev/null || { echo "✗ 要標「已修」，$2 的第二輪回答（$DIR/r2/$2.md）要有「${G}. 已修」這一行 —— 它說未修就只能標「已驗證」" >&2; exit 2; }
   fi
+  # 判定綁的是「算數的第一輪回答」：帳本 ok 且檔案完整。半成品先判、重跑蓋掉之後舊判定會套到別的發現上。
+  has_answer "$2" 1 || { echo "✗ $2 的第一輪還不算數（帳本沒有 ok 的 row、或 $DIR/r1/$2.md 不在／不完整）—— 沒有東西可判" >&2; exit 2; }
   # 只能判真的存在的那一條，而且一條只判一次 —— 不然精確率是編出來的。
-  N=$(grep -Ec "${TAG}\[需修正\]" "$DIR/r1/$2.md" 2>/dev/null || true)
+  N=$(count "$DIR/r1/$2.md" 需修正)
   [ "$3" -ge 1 ] 2>/dev/null && [ "$3" -le "${N:-0}" ] || { echo "✗ $2 第一輪只有 ${N:-0} 條需修正，沒有第 $3 條" >&2; exit 2; }
   ! grep -q "\"kind\": \"judge\", \"id\": \"$ID\", \"model\": \"$2\", \"finding\": $3," "$LEDGER" 2>/dev/null || { echo "✗ $ID $2 第 $3 條已經判過了" >&2; exit 2; }
   ledger "$(python3 -c 'import json,sys;print(json.dumps({"kind":"judge","id":sys.argv[1],"model":sys.argv[2],"finding":int(sys.argv[3]),"verdict":sys.argv[4],"note":" ".join(sys.argv[5:])},ensure_ascii=False))' "$ID" "$2" "$3" "$4" "${@:5}")"

@@ -81,7 +81,9 @@ out="$(report)"; echo "$out" | grep -q "app-c11-x" && bad "第 11 個 change 不
 expect_grep "還沒判定 1" "需修正沒判定 → 報告數得出來" report
 # 結論說 1 條、明細沒有 → 這份回答不算數（report 排除、has_answer 也不算）
 printf '結論：需修正 1 條／可接受風險 0 條／誤報候選 0 條\n' > .local/archive-review/app-c9-x/r1/codex.md
-expect_grep "檔案卻不在或不完整（不算）：app-c9-x/codex" "第一輪結論數字跟明細對不上 → report 不算" report
+expect_grep "檔案卻不在或不完整：app-c9-x/codex" "第一輪結論數字跟明細對不上 → report 點名" report
+expect_grep "不能下結論.*樣本不遞補" "樣本裡有一份不成立 → 不下結論、不遞補" report
+out="$(report)"; echo "$out" | grep -q "app-c11-x" && bad "不遞補：第 11 個不能補進來" || ok "不遞補：第 11 個不能補進來"
 r1md app-c9-x codex 0
 # 同一把尺在腳本本體：帳本說答過、檔案結論說 2 條但明細 1 條 → 不完整 → 拒絕（不是「都答過了」）
 mkdir -p openspec/changes/app-c8-x; echo "# p" > openspec/changes/app-c8-x/proposal.md; git add -A && git commit -qm spec8
@@ -95,6 +97,15 @@ expect_grep "app-c10-x）" "補跑不插隊：樣本仍是 c1–c10" report
 out="$(report)"; echo "$out" | grep -q "app-half-x）" && bad "補跑不插隊：app-half-x 不在樣本裡" || ok "補跑不插隊：app-half-x 不在樣本裡"
 
 echo "── archive-review：--judge 與升阻塞 ──"
+r1md app-half-x gemini 1   # 帳本裡 app-half-x/gemini 第一次是 ok=false（後來補答才 ok）——先確認判定綁的是算數的那份
+python3 - <<'ZZPY'
+import json,pathlib
+p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+rows=[r for r in rows if not (r.get("kind")=="review" and r["id"]=="app-half-x" and r["model"]=="gemini" and r.get("ok"))]
+p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
+ZZPY
+expect_rc 2 "--judge 第一輪帳本只有 ok=false（半成品）→ 不能判" $AR app-half-x --judge gemini 1 誤報
+row app-half-x gemini 1 10 0 true "$(ts 3 0)"
 # app-c1-x：codex 第一輪 1 條（helper 產的檔對得上帳本）
 expect_rc 2 "--judge 第 2 條不存在被擋"                       $AR app-c1-x --judge codex 2 誤報
 expect_rc 2 "--judge 沒回審不能標「已修」"                     $AR app-c1-x --judge codex 1 已修
@@ -113,6 +124,8 @@ expect_rc 2 "--judge 第二輪帳本 ok=false（半成品）→ 不能標「已�
 row app-c2-x codex 2 10 0 true "$(ts 4 1)"; row app-c2-x gemini 2 10 0 true "$(ts 4 1)"
 cp .local/archive-review/app-c2-x/r2/codex.md "$W/c2-codex-r2.bak"; printf '1. 已修\n2. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
 expect_rc 2 "--judge 第二輪只答了 1、2 號（三條要答完）→ 不算數、不能標已修" $AR app-c2-x --judge codex 2 已修
+printf '2. 已修\n1. 已修\n2. 未修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+expect_rc 2 "--judge 第二輪同一號出現兩次（矛盾）→ 不算數、不能標已修" $AR app-c2-x --judge codex 2 已修
 cp "$W/c2-codex-r2.bak" .local/archive-review/app-c2-x/r2/codex.md
 expect_rc 2 "--judge 第二輪說「未修」的不能標「已修」"           $AR app-c2-x --judge codex 1 已修
 expect_rc 0 "--judge 第二輪說「已修」的可以標「已修」"           $AR app-c2-x --judge codex 2 已修
@@ -147,6 +160,10 @@ ZZPY
 expect_grep "不能下結論" "判定改了、第二輪檔案還說未修 → 不能下結論" report
 printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md; cp .local/archive-review/app-c2-x/r2/codex.md .local/archive-review/app-c2-x/r2/gemini.md
 expect_grep "條件全部成立" "全部已修、有證據、樣本滿、等待在門檻內 → 成立" report
+# 第二輪某一號重複出現（矛盾），即使不是被判的那一號 → 那份回答不完整 → 不能下結論
+printf '1. 已修\n2. 已修\n3. 已修\n3. 未修\n' > .local/archive-review/app-c2-x/r2/codex.md
+expect_grep "不能下結論" "第二輪同一號出現兩次 → report 不算那份回答" report
+printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
 # 判定寫進帳本之後，把第二輪檔案截短 → report 要退回不能下結論（證據是檔案，不是帳本）
 printf '1. 已修\n' > .local/archive-review/app-c1-x/r2/codex.md; printf '' > .local/archive-review/app-c2-x/r2/codex.md
 expect_grep "不能下結論" "判定後第二輪檔案被截短 → 不能下結論" report
