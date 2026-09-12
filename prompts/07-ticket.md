@@ -103,3 +103,15 @@ node .github/scripts/llm-team/ticket.mjs publish \
   1. `coordinatorTurns`（統整者花費的回合數；統整者自身 token 通常無法由腳本取得，回合數為最佳代理指標）。
   2. 寫手 `output_tokens`。
   3. 寫手修正輪數（rounds）。
+
+---
+
+## 五、跟模板對帳
+
+衍生專案定期對帳模板，更新不宣稱自動同步，升級由人決定：
+```bash
+node .github/scripts/llm-team/setup.mjs --sync-check <starterRoot>
+```
+- 對帳符號：`=`（逐字相同）、`≠`（漂移）、`−`（本專案缺）、`+`（模板缺）。
+- `config.json` 刻意不在母體中（專案專屬配置，不對帳）。
+- 全同 exit 0，有漂移 exit 1（只報告不覆蓋，升級由人手動複製）。

@@ -2,6 +2,7 @@
 // ─────────────────── agy / llm-team 設定對帳（fail-closed） ───────────────────
 // 用法：
 //   node .github/scripts/llm-team/setup.mjs --check
+//   node .github/scripts/llm-team/setup.mjs --sync-check <starterRoot>
 //
 // 🔴 為什麼只對帳、不自動改使用者的 settings.json：
 //   1. settings.json 是使用者的全域設定，可能包含其他專案設定或敏感資訊。
@@ -10,6 +11,8 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
+import { parseArgs } from 'node:util'
 import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
@@ -20,20 +23,111 @@ import {
   git,
 } from './lib.mjs'
 
+export const SYNC_FILES = [
+  '.github/scripts/llm-team/lib.mjs',
+  '.github/scripts/llm-team/write.mjs',
+  '.github/scripts/llm-team/council.mjs',
+  '.github/scripts/llm-team/ticket.mjs',
+  '.github/scripts/llm-team/setup.mjs',
+  '.github/scripts/llm-team/llm-team.test.mjs',
+  '.github/scripts/llm-team/ticket.test.mjs',
+  '.github/scripts/test-llm-team.sh',
+  'prompts/07-ticket.md',
+  '.claude/skills/llm-team/SKILL.md',
+  '.github/scripts/llm-team/VERSION',
+]
+
+export function syncCheck(repoRoot, starterArg, deps = {}) {
+  const cwd = deps.cwd || process.cwd()
+  const starterRoot = path.resolve(cwd, starterArg)
+  const starterVersionPath = path.join(starterRoot, '.github', 'scripts', 'llm-team', 'VERSION')
+
+  if (!fs.existsSync(starterRoot) || !fs.existsSync(starterVersionPath)) {
+    console.error(`🔴 starterRoot 不存在或缺少 .github/scripts/llm-team/VERSION：${starterRoot}`)
+    return 2
+  }
+
+  let driftCount = 0
+  const syncFiles = deps.syncFiles || SYNC_FILES
+
+  for (const relPath of syncFiles) {
+    const localPath = path.join(repoRoot, relPath)
+    const starterPath = path.join(starterRoot, relPath)
+
+    const localExists = fs.existsSync(localPath)
+    const starterExists = fs.existsSync(starterPath)
+
+    if (localExists && starterExists) {
+      const localBuf = fs.readFileSync(localPath)
+      const starterBuf = fs.readFileSync(starterPath)
+      if (localBuf.equals(starterBuf)) {
+        console.log(`= ${relPath}`)
+      } else {
+        driftCount++
+        const localHash = crypto.createHash('sha256').update(localBuf).digest('hex').slice(0, 8)
+        const starterHash = crypto.createHash('sha256').update(starterBuf).digest('hex').slice(0, 8)
+        console.log(`≠ ${relPath}（本專案 ${localHash} ／ 模板 ${starterHash}）`)
+      }
+    } else if (!localExists && starterExists) {
+      driftCount++
+      console.log(`− ${relPath}（本專案沒有）`)
+    } else if (localExists && !starterExists) {
+      driftCount++
+      console.log(`+ ${relPath}（模板已無此檔）`)
+    } else {
+      driftCount++
+      console.log(`+ ${relPath}（模板已無此檔）`)
+    }
+  }
+
+  const localVersionPath = path.join(repoRoot, '.github', 'scripts', 'llm-team', 'VERSION')
+  const localVersion = fs.existsSync(localVersionPath) ? fs.readFileSync(localVersionPath, 'utf8').trim() : '（無）'
+  const starterVersion = fs.readFileSync(starterVersionPath, 'utf8').trim()
+
+  console.log(`VERSION：本專案 ${localVersion} ／ 模板 ${starterVersion}`)
+  console.log(`漂移 ${driftCount} 檔`)
+  if (driftCount > 0) {
+    console.log('要升級：手動逐字複製上面 ≠／− 的檔，config.json 不動')
+  }
+
+  return driftCount === 0 ? 0 : 1
+}
+
 export function main(argv, deps = {}) {
-  const isCheck = argv.includes('--check')
-  if (!isCheck || argv.length !== 1) {
-    console.error('用法：node .github/scripts/llm-team/setup.mjs --check')
+  let parsed
+  try {
+    parsed = parseArgs({
+      args: argv,
+      options: {
+        check: { type: 'boolean' },
+        'sync-check': { type: 'string' },
+      },
+      allowPositionals: false,
+    })
+  } catch {
+    console.error('用法：\n  node .github/scripts/llm-team/setup.mjs --check\n  node .github/scripts/llm-team/setup.mjs --sync-check <starterRoot>')
+    return 2
+  }
+
+  const isCheck = Boolean(parsed.values.check)
+  const syncStarter = parsed.values['sync-check']
+
+  if ((!isCheck && !syncStarter) || (isCheck && syncStarter)) {
+    console.error('用法：\n  node .github/scripts/llm-team/setup.mjs --check\n  node .github/scripts/llm-team/setup.mjs --sync-check <starterRoot>')
     return 2
   }
 
   const gitFn = deps.git || git
   let repoRoot
   try {
-    repoRoot = deps.repoRoot || path.resolve(gitFn(process.cwd(), ['rev-parse', '--show-toplevel']))
+    repoRoot = deps.repoRoot || path.resolve(gitFn(deps.cwd || process.cwd(), ['rev-parse', '--show-toplevel']))
   } catch (e) {
     console.error(`🔴 無法取得 repoRoot：${e.message}`)
     return 2
+  }
+
+  if (syncStarter) {
+    return syncCheck(repoRoot, syncStarter, deps)
   }
 
   const loadCfg = deps.loadConfig || loadConfig
