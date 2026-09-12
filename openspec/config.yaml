@@ -70,6 +70,14 @@ rules:
       **回去重開 spec PR 讓人重新批准**，不要就地改。
     - 用什麼 log 套件不用寫；資料放哪、認證怎麼做要寫。
     - 重大決策同時在 `docs/adr/` 留一份 ADR，因為 change 會被 archive，ADR 不會。
+    - |
+      每條決策一個標題：`## D1｜標題`（`##` 或 `###` 都可以，分隔符用 `｜`）。
+      `bash .github/scripts/arch-view.sh --decisions` 會跨所有 change 把它們列出來。
+      實作之後補的心得寫成 `### D1 補記：…`，會掛在原決策底下。
+      取代之前某條決策時明寫 `- **Supersedes**: <change-id>/D<n>`（change-id 不含日期前綴）——
+      **沒寫就不推斷**：兩條講同一件事的決策，除非明說，否則機器當它們不相關。
+    - 是**系統之間的邊界**（誰能 import 誰、訊息只能走哪條路、高頻資料放哪）的決策，
+      ADR 要多標 `邊界狀態` 與 `證據`，規則見 `docs/adr/README.md`。
 
   tasks:
     - 每條任務要對應到 specs 裡的某一條 Requirement。對不上的任務就是範圍蔓延。

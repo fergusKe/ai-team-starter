@@ -292,6 +292,36 @@ bash .github/scripts/check-scenario-coverage.sh
 delta 一起掃的話會鎖死流程：`spec/` 分支依設計不能加測試，第一個 spec PR 就
 會紅（實測過）。
 
+### 架構視圖（**推導出來的，不是維護出來的**）
+
+```bash
+bash .github/scripts/arch-view.sh                  # 邊界狀態、capability 引用圖、對不上的
+bash .github/scripts/arch-view.sh --decisions 驗證  # 跨所有 change 搜設計決策
+bash .github/scripts/arch-view.sh --html --open    # 同一份資料的網頁版（不進版控）
+```
+
+**沒有一份手寫的「全部架構」文件，這是刻意的。** 衍生專案的 `docs/ROADMAP.md` 曾經有兩張
+總覽表，WBS 重排後沒跟著改，頂端加了警告也沒用，最後是刪掉不是修好 —— 手寫的總覽沒有機器
+對它，就會漂。所以架構的三個來源各自留在原地，這支把它們**讀出來**：
+
+| 來源 | 讀出什麼 | 它**不是**什麼 |
+|---|---|---|
+| `docs/adr/*.md` 的 `邊界狀態`／`證據` | 系統之間的邊界，以及**誰在擋** | — |
+| `openspec/specs/*/spec.md` 的反引號 | capability **引用圖**（誰提到誰） | runtime 依賴圖。程式碼可以依賴而規格沒提 |
+| `openspec/changes/**/design.md` 的 `## D<n>` | 全部設計決策，搜尋用 | 架構摘要。大多是局部實作選擇 |
+
+接續一個 change 之前先看它的鄰域（`prompts/04-implement.md`）。**「亂掉」的實際形狀**是在
+衍生專案量出來的：三個系統邊界在實作中決定、寫在 spec 的 Purpose 裡、沒有 ADR；271 條決策
+埋在 49 份帶日期前綴的 design.md 裡；`config.yaml` 寫「重大決策要留 ADR」而引用 ADR 的只有
+5 處。規則沒人執行，因為沒有東西讓「沒執行」看得見。
+
+**不是閘門，不在 CI 上。** 它的測試在 CI 上（`test-arch-view.sh`，報錯的尺比沒有尺更糟）。
+退出碼 1 = 有對不上的（懸空引用、解析不出的決策標題、`Supersedes` 指到不存在的、
+ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）；2 = 量不到 —— **剛複製的模板
+就是 2**，因為還沒有任何現況 spec，這是正常的。
+它**抓不到**的：兩條決策語意衝突但沒寫 `Supersedes`（不推斷，人審）；證據測試其實是
+`test.skip`（路徑存在只代表有交卷）。
+
 ### CI 的 workflow 檢查
 
 ```yaml
