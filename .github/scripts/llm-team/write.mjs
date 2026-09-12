@@ -8,6 +8,7 @@
 // 紅就把測試輸出餵回 agy（--continue）再一輪；到 --max-rounds 仍紅 ⇒ exit 3 回統整者。
 //
 // 🔴 2026-09-13 三方（agy opus-4-6／Gemini 3.1 Pro／codex sol）共識的機械保護，一條都不准拿掉：
+//   G0 installCommand 必須成功（exit 0）——否則寫手一輪都不准啟動。
 //   G1 worktree 分支不是 main、乾淨（開跑前）——否則不准動手。
 //   G2 settings.json 的 allow regex 與 lib.mjs 同源（漂移 ⇒ 寫手第一個指令就死）。
 //   G3 stdout 的 result.response 非空且 denied_actions 空——否則判 FAIL（exit 0 是假的）。
@@ -138,6 +139,13 @@ export function main(argv, deps = {}) {
     return 2
   }
 
+  const baseEntry = {
+    schemaVersion: 1,
+    project,
+    ticket,
+    tool: 'agy-write',
+  }
+
   // installCommand
   let installExit = null
   if (config.installCommand && config.installCommand.trim()) {
@@ -153,21 +161,16 @@ export function main(argv, deps = {}) {
     const ins = runInstall(config.installCommand, worktree)
     installExit = ins.exit
     if (installExit !== 0) {
-      console.error(`🔴 installCommand 失敗（exit=${installExit}）：${ins.out || ''}`)
+      ledgerAppend(ledger, { ...baseEntry, installExit, verdict: 'FAIL_install' })
+      console.error(`🔴 G0：installCommand 失敗（exit=${installExit}）：${ins.out || ''}`)
+      return 2
     }
+    baseEntry.installExit = installExit
   }
 
   fs.mkdirSync(outDir, { recursive: true })
   const baseline = gitFn(worktree, ['rev-parse', 'HEAD'])
   let feedback = ''
-
-  const baseEntry = {
-    schemaVersion: 1,
-    project,
-    ticket,
-    tool: 'agy-write',
-    ...(installExit !== null ? { installExit } : {}),
-  }
 
   let toolErrorRetries = 0
   for (let round = 1; round <= maxRounds; round++) {

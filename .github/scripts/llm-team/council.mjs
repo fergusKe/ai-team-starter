@@ -43,7 +43,8 @@ export function buildReviewQuestions(riskDomains = []) {
   ].join('\n')
 }
 
-export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel = 'gemini-3.8-flash-high', riskDomains = [] }) {
+export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, riskDomains = [] }) {
+  if (!writerModel) throw new Error('buildReviewPrompt 需要 writerModel（來自 config.models.writer）')
   return [
     `你是本 repo 的複審者（${tier === 'block' ? 'block 級' : '一般票'}）。作者是另一個模型（${writerModel}），你沒有它的對話脈絡，只看下面的 brief 與 diff。`,
     '',
@@ -146,6 +147,11 @@ export function main(argv, deps = {}) {
     })
     if (tier === 'block' || a.codex) members.push(['codex', models.codex])
   } else return usage()
+
+  if (members.length === 0) {
+    console.error('🔴 沒有任何複審者（config.models.reviewers 空且未加 --codex）')
+    return 2
+  }
 
   fs.writeFileSync(path.join(outDir, 'prompt.md'), prompt)
   const rows = []

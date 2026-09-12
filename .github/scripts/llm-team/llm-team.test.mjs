@@ -24,6 +24,7 @@ import {
   outOfScope,
   assertSettingsAllowRegex,
   resolveAgyBin,
+  runCodex,
   parseArgs,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
@@ -356,6 +357,78 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
     assert.match(ledger, /"installExit":0/)
   })
 
+  test('T1：installCommand: "exit 7"（用 deps.runInstall 注入）⇒ main() 回 2、deps.runAgy 未被呼叫、台帳記 FAIL_install 且 installExit: 7', () => {
+    const repo = makeRepo({ installCommand: 'exit 7' })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(repo.dir, '.agy-write')
+
+    let agyCalls = 0
+    const deps = {
+      assertSettings: () => true,
+      runInstall: (cmd, cwd) => ({ exit: 7, out: 'boom' }),
+      runAgy: () => {
+        agyCalls++
+        return { exit: 0, stdout: '', stderr: '', denied: [], result: { response: 'ok' }, steps: [] }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = writeMain(
+        ['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `main() 回傳應為 2，實際得到 ${code}`)
+    assert.equal(agyCalls, 0, `deps.runAgy 呼叫次數應為 0，實際呼叫了 ${agyCalls} 次`)
+    assert.match(errs.join('\n'), /🔴 G0：installCommand 失敗（exit=7）/, `stderr 應點名 G0 與 exit=7，實際：${errs.join('\n')}`)
+    const ledgerPath = path.join(outDir, 'ledger.ndjson')
+    assert.ok(fs.existsSync(ledgerPath), `台帳檔案應存在：${ledgerPath}`)
+    const lines = fs.readFileSync(ledgerPath, 'utf8').trim().split('\n')
+    const lastEntry = JSON.parse(lines[lines.length - 1])
+    assert.equal(lastEntry.verdict, 'FAIL_install', `台帳最後一筆 verdict 應為 FAIL_install，實際為 ${lastEntry.verdict}`)
+    assert.equal(lastEntry.installExit, 7, `台帳最後一筆 installExit 應為 7，實際為 ${lastEntry.installExit}`)
+  })
+
+  test('T2 陽性對照：同一組 deps 但 installCommand: "" ⇒ runAgy 被呼叫', () => {
+    const repo = makeRepo({ installCommand: '' })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(repo.dir, '.agy-write')
+
+    let agyCalls = 0
+    const deps = {
+      assertSettings: () => true,
+      runInstall: (cmd, cwd) => ({ exit: 7, out: 'boom' }),
+      runAgy: () => {
+        agyCalls++
+        return { exit: 0, stdout: '', stderr: '', denied: [], result: { response: 'ok' }, steps: [] }
+      },
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = writeMain(
+        ['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `installCommand 為空時 main() 應回傳 0，實際得到 ${code}`)
+    assert.ok(agyCalls > 0, `deps.runAgy 應被呼叫，實際呼叫次數為 ${agyCalls}`)
+  })
+
   function runWriteReal(repo, mode, extra = [], envOverride = {}) {
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, '新增 add.test.mjs 測 add(2,3)===5')
@@ -396,7 +469,7 @@ describe('council.mjs：複審與三方會議', () => {
     assert.equal(parseVerdicts('').overall, null)
   })
   test('buildReviewPrompt：Q4 骨架在 riskDomains: [] 時不含「租戶」字樣，只剩固定尾句', () => {
-    const p = buildReviewPrompt({ brief: 'BRIEF', diff: '+x', tier: 'block', diffStat: '1 file', riskDomains: [] })
+    const p = buildReviewPrompt({ brief: 'BRIEF', diff: '+x', tier: 'block', diffStat: '1 file', writerModel: 'test-writer', riskDomains: [] })
     assert.match(p, /BRIEF/)
     assert.match(p, /block 級/)
     assert.match(p, /Q6/)
@@ -469,6 +542,46 @@ describe('council.mjs：複審與三方會議', () => {
   test('resolveAgyBin：AGY_BIN 覆寫優先', () => {
     assert.equal(resolveAgyBin({ AGY_BIN: '/x/agy' }), '/x/agy')
   })
+
+  test('T3：reviewers: [] 且未帶 --codex ⇒ council main() 回 2、deps.runOne 未被呼叫、stdout 不含「簽」', () => {
+    const repo = makeRepo({ models: { writer: 'w', reviewers: [], codex: 'c' } })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    let runOneCalls = 0
+    const deps = {
+      runOne: () => {
+        runOneCalls++
+        return { name: 'fake', model: 'fake', exit: 0, ms: 10, empty: false, denied: [], text: '整份：簽' }
+      },
+    }
+
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `reviewers: [] 時 main() 應回傳 2，實際得到 ${code}`)
+    assert.equal(runOneCalls, 0, `deps.runOne 呼叫次數應為 0，實際呼叫了 ${runOneCalls} 次`)
+    const allOut = outs.join('\n')
+    assert.ok(!allOut.includes('簽'), `stdout 不應含「簽」，實際輸出：${allOut}`)
+    const allErr = errs.join('\n')
+    assert.match(allErr, /🔴 沒有任何複審者（config\.models\.reviewers 空且未加 --codex）/, `stderr 應提示沒有複審者，實際：${allErr}`)
+  })
 })
 
 describe('parseArgs', () => {
@@ -502,3 +615,26 @@ describe('lastStepIsToolError：agy 無頭第 4 坑（工具參數錯 ⇒ 整輪
     assert.equal(lastStepIsToolError(undefined), false)
   })
 })
+
+describe('T4：model 與 writerModel 必填檢查（避免特定模型硬編碼）', () => {
+  test('runCodex({ prompt: "x" }) 缺 model ⇒ throw 且訊息含 config.models.codex', () => {
+    assert.throws(
+      () => runCodex({ prompt: 'x' }),
+      (err) => {
+        assert.match(err.message, /runCodex 需要 model（來自 config\.models\.codex）/, `錯誤訊息應含 config.models.codex，實際得到：${err.message}`)
+        return true
+      }
+    )
+  })
+
+  test('buildReviewPrompt({...}) 缺 writerModel ⇒ throw', () => {
+    assert.throws(
+      () => buildReviewPrompt({ brief: 'b', diff: 'd', tier: 'standard', diffStat: 's' }),
+      (err) => {
+        assert.match(err.message, /writerModel/, `錯誤訊息應指出缺 writerModel，實際得到：${err.message}`)
+        return true
+      }
+    )
+  })
+})
+

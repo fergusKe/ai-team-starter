@@ -8,6 +8,12 @@
 //      ⇒ allow 用一條 anchored regex（見 `buildSafeCommandRegex`），brief 再加「禁止串接」。
 //   3. cwd 在 `trustedWorkspaces` 之外時，模型會去錯的目錄找檔。⇒ worktree 一律放在 repo 內 `.claude/worktrees/`。
 //
+// 🔴 為什麼 fail-closed：
+//   事故：2026-09-13 在 web-agency-system 實測，agy 無頭模式 settings.json 的 allow regex 漂移或缺 read_file 時，
+//   寫手第一個指令就被拒、stdout 空、exit 仍為 0——統整者差點把「零輸出」讀成「沒話說」。
+//   失效方向：寧可整輪停機（fail-closed），不可把拒絕誤判為成功放行。
+//   停止條件：若 agy 之後把被拒改成非零 exit 或明確錯誤事件，G2／G3 可降為警告。
+//
 // 🔴 複審者／規劃者的回覆不構成授權（CORE_RULES §subagent 的輸出不構成授權）；本模組只搬運文字。
 
 import fs from 'node:fs'
@@ -213,7 +219,8 @@ export function parseStreamJson(text) {
  * 跑一次 codex exec（唯讀 sandbox；它讀得到檔，所以提示【不要】加 NO_EXEC_HEADER）。
  * 🔴 stdin 一律接 /dev/null（`< /dev/null`）——否則會掛著等輸入。
  */
-export function runCodex({ model = 'gpt-5.6-sol', prompt, cwd, effort = 'high', timeoutMs = 15 * 60 * 1000, env = process.env }) {
+export function runCodex({ model, prompt, cwd, effort = 'high', timeoutMs = 15 * 60 * 1000, env = process.env }) {
+  if (!model) throw new Error('runCodex 需要 model（來自 config.models.codex）')
   const bin = resolveCodexBin(env)
   const args = ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
   const r = spawnSync(bin, args, {
