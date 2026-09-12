@@ -146,12 +146,24 @@ npx openspec validate --all --strict
 
 ## 開發流程
 
-每個功能一個 change，各自獨立，可以平行。
+**先有整張地圖，再開第一個 change。** 專案一開始跑一次 `prompts/00-map.md`：
+問全貌（角色、端到端流程、外部依賴、不做的事、難逆轉的邊界），攤成 `docs/WBS.md`
+—— 那是交付地圖（要交付什麼、什麼順序、誰擋著誰），**不是架構圖**（不寫系統怎麼切、
+不列未來的 capability；那些會被 change 修正，寫進地圖只會讓地圖過期）。
+地圖走 `governance/` PR 進 main；之後每個 change 都要對回地圖上的一個 ID，
+對不上的 `progress.sh --check` 會擋。
+
+從一個功能開始、每個功能各自規劃，最後串不起來、不知道下一步是什麼 ——
+那是這一步要防的事。
+
+然後每個工作項目一個（或多個）change，各自獨立，可以平行。
 
 **一個 change 兩個 phase，各自是一個分支與一個 PR。**
 
 ```
-   訪談需求               prompts/01-discovery.md
+   整張地圖               prompts/00-map.md（每個專案一次）→ docs/WBS.md 進 main
+        ↓
+   一個工作項目的探索      prompts/01-discovery.md（先在地圖上找到它）
         ↓
 /opsx:propose             產生 proposal → specs → design → tasks，產完就停
         ↓
@@ -185,13 +197,14 @@ git object database 證明實作 PR 沒有回頭改它。
 
 ## `progress.sh --check` 在守什麼
 
-CI 每次都跑它。它讀 `docs/WBS.md`，有違規就讓 build 紅。守的東西分四類：
+CI 每次都跑它。它讀 `docs/WBS.md`，有違規就讓 build 紅。守的東西分五類：
 
 | 類 | 例子 |
 |---|---|
 | **表格自己的形式** | 標記要附理由；互斥的處置（`Cancelled`／`Pending`／`TBD`／`Regular`／`Done`）不得並存；缺口要有決策期限與 fallback；**工作的週次必須晚於它依賴的裁決期限** |
 | **欄位的文法** | ID、週、點、阻塞四欄都有明確文法。打錯一個字元不會被當成「沒填」，會紅 |
 | **引用不懸空** | `REF_SOURCES` 列的文件（預設 `docs/WBS.md`、`docs/ROADMAP.md`）裡提到的每一個工作項目 ID 與群組 ID 都要真的存在。範圍會展開成中間每一個 |
+| **地圖先於 change** | 有 WBS 的專案裡，每一個 `openspec/changes/<id>` 的 id 都要以某個 WBS ID 開頭。對不上的是違規 —— `spec/` PR 在規格階段就紅，逼人先開 `governance/` PR 把那項工作加進地圖。**沒有 WBS 的專案不驗**（舊專案相容） |
 | **解析本身 fail-closed** | 表頭畸形、表格被截斷、欄數對不上、ID 重複、沒關起來的圍籬或註解 —— **一律報，不會安靜跳過** |
 
 **它不驗內容對不對。** `Pending｜等後端` 格式完全合法，但那句理由等於沒說。
@@ -266,7 +279,9 @@ bash .github/scripts/wbs-page.sh --open     # 整份計畫的網頁版（要 rev
 > 刻意不做一份手動維護的 `STATUS.md`。手寫的狀態一定會過期，
 > 而**過期的狀態文件比沒有更危險** —— 讀的人會相信它。
 
-想看「還剩哪些沒做」的話，把工作分解表放進 `docs/WBS.md`：
+**新專案的第一份產物就是這張表**（`prompts/00-map.md` 帶你產出來）。它是交付地圖，
+不是架構圖；有了它 `progress.sh` 才說得出「還剩哪些沒做、哪些被擋住、下一步是什麼」，
+而每個 change 都要對回它的一個 ID。格式：
 
 ```markdown
 | ID | 項目 | 工作 | 週 | 點 | 阻塞 | 標記 |
@@ -382,7 +397,7 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 | `openspec/changes/` | 提案中的變更（`openspec new change` 產生，不要手工造） |
 | `docs/adr/` | 難逆轉的決策。change 會被 archive，ADR 不會 |
 | `docs/DECISIONS.md` | **這套閘門為什麼長這樣、拒絕過哪些替代方案。** 想「改進」閘門之前先讀 |
-| `docs/WBS.md` | **選用。** 工作分解表。有的話 `progress.sh` 會告訴你還剩哪些沒做、哪些被擋住。**週次只放這裡** |
+| `docs/WBS.md` | **新專案的第一份產物**（`prompts/00-map.md`）。交付地圖，不是架構圖。每個 change 的 id 要對回它的一個 ID（`--check` 驗）。**週次只放這裡**。舊專案沒有它時 `--check` 照樣通過 |
 | `docs/ROADMAP.md` | **選用。** 產品意圖：場景、功能地圖、不做的事。**不要放週次** —— 用 ID 指向 `WBS.md`，`--check` 會驗那些 ID |
 | `prompts/` | 每個階段貼給 AI 的提示 |
 | `.github/scripts/progress.sh` | **「現在做到哪裡」。算出來的，沒有人維護** |

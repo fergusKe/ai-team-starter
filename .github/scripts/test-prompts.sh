@@ -237,6 +237,44 @@ if [ -n "$BR" ]; then
     || bad "閘門接受 02 教出來的分支（rc=0）" "rc=${GRC}：$(head -3 "$W/gate.out" | tr '\n' ' ')"
 fi
 
+# ── T7：00 教的 WBS 範例，progress.sh --check 收得下 ─────────────────────
+#
+# `prompts/00-map.md` 給了一段 ```markdown 的 WBS 範例，新專案的第一份地圖會照它寫。
+# 那張表有文法（`--check` 是解析器），範例自己不過的話，第一個照做的人就紅在
+# 「我照文件寫的」——跟 T1 是同一種病。反向對照：把週欄的 en dash 改成 ASCII，
+# 要紅；不紅表示這條測試測的不是 --check。
+P00="$ROOT/prompts/00-map.md"
+PROG="$ROOT/.github/scripts/progress.sh"
+if [ -f "$P00" ] && [ -f "$PROG" ]; then
+  mkdir -p "$W/map/docs"
+  python3 - "$P00" "$W/map/docs/WBS.md" <<'EX'
+import sys, re
+t = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"(?ms)^```markdown\n(.*?)^```[ \t]*$", t)
+if not m: sys.exit("NO_MARKDOWN_BLOCK")
+open(sys.argv[2], "w", encoding="utf-8").write("# 測試\n\n" + m.group(1))
+EX
+  if [ $? = 0 ]; then
+    ( cd "$W/map" && git init -q 2>/dev/null; bash "$PROG" --check ) >"$W/map.out" 2>&1
+    MRC=$?
+    [ "$MRC" = "0" ] \
+      && ok "00 的 WBS 範例過得了 progress.sh --check" \
+      || bad "00 的 WBS 範例過得了 progress.sh --check" "rc=${MRC}：$(grep -m2 '✗\|：' "$W/map.out" | tr '\n' ' ')"
+    python3 - "$W/map/docs/WBS.md" <<'EX'
+import sys, io
+p = sys.argv[1]; t = io.open(p, encoding="utf-8").read()
+assert "決策≤W1" in t
+io.open(p, "w", encoding="utf-8").write(t.replace("| W1 | 3 |", "| w1 | 3 |", 1))
+EX
+    ( cd "$W/map" && bash "$PROG" --check ) >/dev/null 2>&1
+    [ $? = "1" ] \
+      && ok "反向對照：範例壞一個字元，--check 真的紅" \
+      || bad "反向對照：範例壞一個字元，--check 真的紅" "沒紅 —— 這條測試沒有在測 --check"
+  else
+    bad "prompts/00 抽不到 \`\`\`markdown 區塊"
+  fi
+fi
+
 echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS+FAIL))"
 # 成功就清掉，失敗才留現場 —— 理由見 `test-progress-check.sh` 開頭那段。

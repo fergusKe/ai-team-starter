@@ -13,6 +13,9 @@ Claude Code 進入此 Repository 後：
    `openspec/changes/` 的 `tasks.md` 打勾與遠端分支；
    如果專案有 `docs/WBS.md`，它還會告訴你**還有哪些沒開始**。
 
+   **沒有 `docs/WBS.md` 的新專案：先跑 `prompts/00-map.md` 畫整張地圖，不要從一個功能開始。**
+   每個 change 的 id 都要對回地圖上的一個 ID，對不上的 `--check` 會擋。
+
    **有 `docs/WBS.md` 的話，那張表有文法，`--check` 是一個解析器不是抽查。**
    動它之前先讀 `AGENTS.md`〈改 `docs/WBS.md` 之前：這張表有文法，而且會被驗〉
    —— 四個欄位各自只能寫哪些東西、ID 引用只有哪幾種寫法、範例為什麼要放進

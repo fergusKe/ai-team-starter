@@ -1080,10 +1080,10 @@ def setup_todo():
     todo = []
     if not pathlib.Path("docs/WBS.md").exists():
         todo.append((
-            "還沒有 docs/WBS.md（工作分解表）",
-            "把要做的事拆成一張表放進去。第一欄是工作項目 ID（`XX-Y01`），"
-            "格式見這支腳本開頭的註解，或 AGENTS.md〈改 docs/WBS.md 之前〉。"
-            "沒有它就沒有「還有哪些沒做」的視角，--check 也沒有東西可以驗。"))
+            "還沒有 docs/WBS.md（工作分解表）—— 這個專案還沒有地圖",
+            "先跑 prompts/00-map.md：問全貌，攤成一張表。第一欄是工作項目 ID（`XX-Y01`），"
+            "格式見那份 prompt 的範例，或 AGENTS.md〈改 docs/WBS.md 之前〉。"
+            "沒有它就沒有「還有哪些沒做、下一步是什麼」的視角，每個 change 也對不回任何工作。"))
     elif not BLOCK_TYPES:
         todo.append((
             "docs/WBS.md 裡沒有〈阻塞類型〉表",
@@ -1354,6 +1354,27 @@ for wid in order:
                     f"{wid}（W{start} 那一列）排在 {gap} 的決策期限"
                     f"（決策≤W{dl}）之前或同週 —— 要嘛提前裁決，要嘛把工作往後挪")
 
+# ── 對不上任何 WBS ID 的 change（2026-09-12 起是 violation，不只是紅字）────
+#
+# **為什麼從提示升成違規**：有地圖的專案裡，一個 change 開了、id 對不上任何
+# WBS ID、CI 綠 —— 地圖就這樣靜靜過期（在測試 repo 跑得出來，見
+# `test-progress-check.sh`〈孤兒 change〉）。這正是「想到什麼開發什麼」的形狀：
+# 工作不在地圖上，沒有人知道它擋在誰後面、是不是重複、下一步是什麼。
+# 升嚴之後：`spec/<id>` 的 PR 在**規格階段**就紅，逼人先開 `governance/` PR
+# 把那一列加進 `docs/WBS.md`，再開 spec。地圖先於 change。
+#
+# **沒有 WBS 的時候不做這件事** —— 沒有東西可以對，把每個 change 都說成
+# 「命名錯誤」是錯的訊號；舊專案沒有地圖也不會因此變紅（migration 相容）。
+#
+# 這是 rc 凍結「不得新增 gate」的一個具名例外，理由與範圍記在
+# `docs/DECISIONS.md`〈孤兒 change 是違規〉。**不要拿這個例外當先例**。
+_matched = {c for w in order for c in changes_for(w)}
+orphan = sorted(set(changes) - _matched) if wbs else []
+for _c in orphan:
+    violations.append(
+        f"openspec/changes/{_c}：對不上任何 WBS ID（change id 要以 WBS ID 開頭，小寫）"
+        f"—— 先開 governance/ PR 把這項工作加進 docs/WBS.md，再開 spec")
+
 # **遠端不新鮮就講出來，而且要講清楚哪些狀態不能信。**
 # 只印「fetch 失敗」不夠 —— 讀的人不會知道那影響了什麼。
 if not REMOTE_FRESH and not JSON:
@@ -1613,16 +1634,24 @@ if total:
     if not (SHOW_ALL or ONLY_BLOCKED) and tally.get("未開始"):
         print(f"{D}（{tally['未開始']} 項未開始沒有列出，用 --all 看全部）{X}")
 
-# 對不上 WBS 的 change：命名沒照規矩。
-# **沒有 WBS 的時候不做這件事** —— 沒有東西可以對，
-# 把每個 change 都說成「命名錯誤」是錯的訊號。
-matched = {c for w in order for c in changes_for(w)}
-orphan = sorted(set(changes) - matched) if wbs else []
+# 一個工作項目拆成多個 change —— 這是正常的（WBS ID 是交付意圖，不是架構單元；
+# `FE-O01 資料層` 拆成 `fe-o01-api-contract`／`fe-o01-runtime-config` 是對的）。
+# 但**拆了要看得見**：以前只有 `--json` 帶完整清單，終端機只顯示聚合狀態，
+# 於是「一項變兩個 change」這件事在人會看的地方是隱形的。這一段不擋任何人。
+_split = [(w, changes_for(w)) for w in order if len(changes_for(w)) > 1]
+if _split and not ONLY_BLOCKED:
+    print()
+    print(f"{B}工作拆分{X}{D}（一個 WBS ID 對應多個 change；正常，但要看得見）{X}")
+    for w, cs in _split:
+        print(f"    {w} → {'、'.join(cs)}")
+
+# 對不上 WBS 的 change（上面已經算進 violations；這裡只是把它們列出來）。
 if orphan:
     print()
     print(f"{R}對不上任何 WBS ID 的 change{X}（change id 要以 WBS ID 開頭，小寫）：")
     for c in orphan:
         print(f"    {c}  [{changes[c]['state']}]")
+    print(f"{D}    地圖先於 change：先開 governance/ PR 把這項加進 docs/WBS.md，再開 spec。{X}")
 
 if CHECK and violations:
     raise SystemExit(1)
