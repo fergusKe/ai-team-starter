@@ -310,6 +310,31 @@ bash .github/scripts/check-scenario-coverage.sh
 delta 一起掃的話會鎖死流程：`spec/` 分支依設計不能加測試，第一個 spec PR 就
 會紅（實測過）。
 
+### archive 前的雙模型影子審查（**是影子，不是閘門**）
+
+```bash
+bash .github/scripts/archive-review.sh <change-id>            # tasks.md 全勾之後、/opsx:archive 之前；放背景跑
+bash .github/scripts/archive-review.sh <change-id> --rereview # 修完回審，只准一次
+bash .github/scripts/archive-review.sh --report               # 帳本結算：升阻塞的三個數字
+```
+
+把一個 change 的**全部**（凍結的規格、WBS 那一列、DECISIONS 裡提到它的段落、
+每個 slice 的 diff 與 PR 說明）打成一包，平行送兩個不是寫它的模型，各自獨立審一次。
+兩個模型**彼此不講話**：讀兩份結果、決定信哪一份、動手修的是原本那個 session。
+提示在 `prompts/06-archive-review.md`；結果與帳本在 `.local/`（gitignore）。
+
+**為什麼單位是 change 不是 PR。** 一個人合併、每個 PR 同一個 agent 寫的專案，
+單一 slice 的 PR 看不出跨 slice 的不一致、規格說了但沒有任何 slice 做的缺口；
+而 PR 一天幾十個，change 一天幾個 —— 審 change 才付得起兩個模型的等待。
+
+**為什麼不是閘門。** 它還沒證明自己抓得到東西。標「需修正」的必須指得出規格位置、
+檔案位置與驗證方法，給不出就是「誤報候選」；每一條由人 `--judge`，帳本算出
+精確率與等待時間。**升成阻塞要三個數字同時成立**：10 個 change 內 ≥2 條需修正經
+人工驗證且在 archive 前修好、誤報率 ≤20%、每個 change 的等待 P90 ≤20 分鐘。
+不成立就刪這支、`prompts/06` 與帳本 —— **不留一個大家都會跳過的空殼閘門。**
+
+**回審只准一次。** 第三輪代表這套流程在製造等待；腳本直接拒絕，人工處理。
+
 ### 架構視圖（**推導出來的，不是維護出來的**）
 
 ```bash

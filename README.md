@@ -181,6 +181,8 @@ npx openspec validate --all --strict
         ↓
    CI 綠 + review → 合併
         ↓
+   影子審查                prompts/06-archive-review.md（第二、第三個模型看整個 change；不阻塞）
+        ↓
    archive/<change-id>    delta 同步進 openspec/specs/
 ```
 
