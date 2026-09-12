@@ -45,7 +45,7 @@ TAG='^[[:space:]]*([-*]|[0-9]+[.)])?[[:space:]]*'
 count() { local n; n=$(grep -Ec "${TAG}\[$2\]" "$1" 2>/dev/null); echo "${n:-0}"; }   # 檔案不在也回 0，不回空字串（空字串進算式會炸）
 # 一次審查「算數」的條件：CLI rc=0 而且真的照格式**答完整** ——
 # 第一輪：有結論那一行，而且結論裡的三個數字跟明細裡的標籤數一致（「結論說 3 條、明細沒有」不算數）；
-# 第二輪：上一輪的每一條需修正（r2 bundle 的每個編號）都有一行 `N. 已修／未修／改壞了`（只答一半不算數）。
+# 第二輪：上一輪的每一條需修正（r2 bundle 的每個編號）都有一行 `N. 已修／未修／改壞了別的`（只答一半不算數）。
 # 沒答完整的記 ok=false，report 不算它，補跑會重送。
 r2_expected() { echo $(( $(count "$DIR/r1/codex.md" 需修正) + $(count "$DIR/r1/gemini.md" 需修正) )); }
 answered() { # answered <rc> <file> [round]
@@ -53,8 +53,8 @@ answered() { # answered <rc> <file> [round]
   if [ "${3:-1}" = 2 ]; then
     local n; n=$(r2_expected); [ "$n" -gt 0 ] || { echo true; return; }
     # 每一號恰好一次（重複、矛盾都不算）；狀態詞後面要斷開（「已修但不確定」不是已修）；不准有 1..N 以外的編號行。
-    local i=1; while [ "$i" -le "$n" ]; do [ "$(grep -Ec "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)([[:space:]—:：-]|$)" "$2")" = 1 ] || { echo false; return; }; i=$((i+1)); done
-    [ "$(grep -Ec "^[[:space:]]*[0-9]+[.)][[:space:]]*(已修|未修|改壞了)" "$2")" = "$n" ] || { echo false; return; }; echo true
+    local i=1; while [ "$i" -le "$n" ]; do [ "$(grep -Ec "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了(別的)?)([[:space:]—:：-]|$)" "$2")" = 1 ] || { echo false; return; }; i=$((i+1)); done
+    [ "$(grep -Ec "^[[:space:]]*[0-9]+[.)][[:space:]]*(已修|未修|改壞了(別的)?)" "$2")" = "$n" ] || { echo false; return; }; echo true
   else
     # 結論行是最後一個非空行、格式固定、只能有一行；三個數字＝明細標籤數。
     [ "$(grep -c "^結論[：:]" "$2")" = 1 ] || { echo false; return; }
@@ -64,7 +64,7 @@ answered() { # answered <rc> <file> [round]
   fi
 }
 # 沒有 coreutils timeout（macOS）：自己盯。超過 ARCHIVE_REVIEW_TIMEOUT（預設 1500 秒）就殺，不要讓 wait 等到天亮。
-# 逾時要**殺整棵樹並收割**：只 kill 父行程，子行程會繼續寫回答檔，寫進的是下一次「沿用」會讀到的檔案。
+# 逾時要**殺整棵樹並收割**：只 kill 父行程，子行程會繼續寫回答檔。殺不乾淨的那一小撮由 finish() 的暫存檔隔開。
 killtree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; kill "$1" 2>/dev/null || true; }
 watch() {
   local pid=$1 t=0
@@ -76,6 +76,13 @@ watch() {
     sleep 5; t=$((t+5))
   done
   wait "$pid"
+}
+# 回答先寫進**這一次獨有**的暫存檔，跑完才搬成 <model>.md。殺樹殺不乾淨的孤兒（父先退、後代忽略 TERM 被 reparent）
+# 握著的是暫存檔的 fd，寫不進下一次「沿用」會讀的那份；逾時那份改名留著看，永遠不發布。
+finish() { # finish <model> <rc> <tmp>
+  if [ "$2" = 124 ]; then
+    mv "$3" "$OUT/$1.timeout.md"; echo "（逾時 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒，殺掉了；殘餘輸出在 $OUT/$1.timeout.md，不算回答）" > "$OUT/$1.md"
+  else mv "$3" "$OUT/$1.md"; fi
 }
 
 if [ "${1:-}" = "--report" ]; then
@@ -97,9 +104,9 @@ def r1_ok(txt):   # 結論行只有一行、是最後一個非空行、格式固
     last = [l for l in txt.splitlines() if l.strip()][-1:]
     m1 = re.fullmatch(r"結論[：:]需修正 (\d+) 條／可接受風險 (\d+) 條／誤報候選 (\d+) 條\s*", last[0]) if last else None
     return bool(m1) and [int(x) for x in m1.groups()] == list(tags(txt).values())
-def r2_lines(txt, n): return re.findall(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)(?=[\s—:：-]|$)" % n, txt)
+def r2_lines(txt, n): return re.findall(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了(?:別的)?)(?=[\s—:：-]|$)" % n, txt)
 def r2_line(txt, n): m2 = r2_lines(txt, n); return m2[0] if len(m2) == 1 else None
-def r2_extra(txt, n): return len(re.findall(r"(?m)^\s*\d+[.)]\s*(?:已修|未修|改壞了)", txt)) != n
+def r2_extra(txt, n): return len(re.findall(r"(?m)^\s*\d+[.)]\s*(?:已修|未修|改壞了(?:別的)?)", txt)) != n
 def r2_ok(txt, n):  # 1..n 每一號**恰好一次**：缺號、重複、矛盾、多餘的編號都不算
     return txt is not None and (n == 0 or (all(len(r2_lines(txt, k)) == 1 for k in range(1, n + 1)) and not r2_extra(txt, n)))
 rev = [r for r in rows if r.get("kind") == "review"]
@@ -340,12 +347,13 @@ run_codex() {
   local t0; t0=$(date +%s)
   ! has_answer codex "$ROUND" || { echo "（codex 第 $ROUND 輪已經答過，不重送）"; return; }
   command -v "$CODEX_BIN" >/dev/null || { echo "（跳過 codex：找不到 ${CODEX_BIN}）" | tee "$OUT/codex.md"; row codex "$t0" 127; return; }
+  local tmp; tmp="$(mktemp "$OUT/codex.XXXXXX")"
   if [ "$ROUND" = 2 ] && SESSION="$(python3 -c 'import json,sys;print([json.loads(l) for l in open(sys.argv[1]) if l.strip() and json.loads(l).get("kind")=="review" and json.loads(l)["id"]==sys.argv[2] and json.loads(l)["model"]=="codex" and json.loads(l).get("session")][-1]["session"])' "$LEDGER" "$ID" 2>/dev/null)" && [ -n "$SESSION" ]; then
-    "$CODEX_BIN" exec --skip-git-repo-check resume "$SESSION" - < "$OUT/bundle.md" > "$OUT/codex.md" 2> "$OUT/codex.err" &
+    "$CODEX_BIN" exec --skip-git-repo-check resume "$SESSION" - < "$OUT/bundle.md" > "$tmp" 2> "$OUT/codex.err" &
   else
-    "$CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -m "$CODEX_MODEL" -c model_reasoning_effort="high" - < "$OUT/bundle.md" > "$OUT/codex.md" 2> "$OUT/codex.err" &
+    "$CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -m "$CODEX_MODEL" -c model_reasoning_effort="high" - < "$OUT/bundle.md" > "$tmp" 2> "$OUT/codex.err" &
   fi
-  local rc=0; watch $! || rc=$?
+  local rc=0; watch $! || rc=$?; finish codex "$rc" "$tmp"
   row codex "$t0" "$rc" "$(grep -o 'session id: [0-9a-f-]*' "$OUT/codex.err" | tail -1 | cut -d' ' -f3)"
 }
 run_gemini() {
@@ -355,8 +363,9 @@ run_gemini() {
   { [ "$ROUND" = 2 ] && { echo "## 你上一輪的回答"; cat "$DIR/r1/gemini.md"; echo; }; cat "$OUT/bundle.md"; } > "$OUT/gemini.prompt.md"
   # agy 不吃 stdin，prompt 只能走命令列參數：Linux 單一參數上限 128 KiB，取 120 000 bytes；超過就明說跳過、記帳本（這個 change 進不了雙模型樣本）。
   [ "$(wc -c < "$OUT/gemini.prompt.md" | tr -d ' ')" -lt 120000 ] || { echo "（跳過 gemini：prompt 超過 120 KB，命令列參數塞不下 —— change 太大，人工拆開審）" | tee "$OUT/gemini.md"; row gemini "$t0" 7; return; }
-  "$GEMINI_BIN" --print "$(cat "$OUT/gemini.prompt.md")" --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m > "$OUT/gemini.md" 2> "$OUT/gemini.err" &
-  local rc=0; watch $! || rc=$?
+  local tmp; tmp="$(mktemp "$OUT/gemini.XXXXXX")"
+  "$GEMINI_BIN" --print "$(cat "$OUT/gemini.prompt.md")" --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m > "$tmp" 2> "$OUT/gemini.err" &
+  local rc=0; watch $! || rc=$?; finish gemini "$rc" "$tmp"
   row gemini "$t0" "$rc"
 }
 run_codex & run_gemini & wait

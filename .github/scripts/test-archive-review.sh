@@ -6,7 +6,8 @@
 #   只有一個模型回答的 change 不算樣本；樣本是最早 N 個、第 N+1 個不算；補跑不會插隊；
 #   還有需修正沒判定就不下結論；「已驗證」不算升阻塞的數，「已修」才算，而「已修」要有回審；
 #   帳本說答過、檔案卻不在 → 拒絕重跑；兩個都答過 → 拒絕重跑；補跑沿用第一輪的 bundle 與 main.sha；
-#   「已修」要那個模型第二輪對那一號寫「已修」；任一 PR 的 diff 拿不到 → 整輪不算數。
+#   「已修」要那個模型第二輪對那一號寫「已修」；任一 PR 的 diff 拿不到 → 整輪不算數；
+#   第二輪照 prompts/06 原文答的算答完；逾時殺剩的孤兒寫不進發布的回答檔（第 20 輪）。
 # 判準跟其他幾支一樣：**把對應的守衛拿掉，這支要變紅。**
 #
 # 零依賴：bash + git + 系統 python3。**不打網路、不叫模型**：origin 是 repo 自己，gh 是照 $GH_MODE 回話的替身，
@@ -16,7 +17,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/.github/scripts/archive-review.sh"
 W="$(mktemp -d "${TMPDIR:-/tmp}/archive-review-test.XXXXXXXX")"
-trap 'rm -rf "$W"' EXIT
+trap 'touch "$W/orphan-go"; rm -rf "$W"' EXIT   # 孤兒測試的子行程等這個檔才退，測試中途死掉也不留行程
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; return 0; }
@@ -228,6 +229,8 @@ expect_grep "第二輪證據不成立.*app-c4-x/gemini#1" "第二輪 ok row 不�
 row app-c4-x gemini 2 10 0 true "$(ts 4 2)"
 r1md app-c4-x codex 1; printf '2. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md   # N=2，只答了自己那一號
 expect_grep "第二輪證據不成立.*app-c4-x/gemini#1" "第二輪沒答完（1..N）→ 已修證據不成立" report
+printf '1. 改壞了別的 — 哪裡\n2. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md   # 第 1 號照 prompts/06 原文答
+out="$(report)"; echo "$out" | grep -q "第二輪證據不成立.*app-c4-x/gemini#1" && bad "report 的文法跟腳本一致：「改壞了別的」算答完" || ok "report 的文法跟腳本一致：「改壞了別的」算答完"
 r1md app-c4-x codex 0; printf '1. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md
 
 echo "── archive-review：答過的不重跑、樣本凍結、diff fail-closed ──"
@@ -271,9 +274,36 @@ expect_grep "拿不到 PR #7 的 diff" "第二輪 diff 拿不到 → 這輪不�
 echo ok > "$GH_MODE"
 expect_grep "跳過 codex" "第二輪 diff 失敗過之後還能再跑（不是第三輪）" $AR app-c3-x --rereview
 grep -q "^1\. " .local/archive-review/app-c3-x/r2/bundle.md && ok "第二輪 bundle 把需修正編號" || bad "第二輪 bundle 把需修正編號"
-printf '1. 已修\n' > .local/archive-review/app-c3-x/r2/codex.md; printf '1. 已修\n' > .local/archive-review/app-c3-x/r2/gemini.md
+# 第二輪的回答照 prompts/06 的原文寫（`3. 改壞了別的 — 哪裡`）要算答過 —— 文法跟提示不一致，照提示答的會被判沒答完
+printf '1. 改壞了別的 — 哪裡\n' > .local/archive-review/app-c3-x/r2/codex.md; printf '1. 未修 — 為什麼\n' > .local/archive-review/app-c3-x/r2/gemini.md
 row app-c3-x codex 2 10 0 true "$(ts 6 0)"; row app-c3-x gemini 2 10 0 true "$(ts 6 0)"
-expect_grep "回審只准一次" "兩個都答過第二輪 → 第三輪拒絕" $AR app-c3-x --rereview
+expect_grep "回審只准一次" "兩個都答過第二輪（照 prompt 原文答）→ 第三輪拒絕" $AR app-c3-x --rereview
+printf '1. 改壞了別的東西\n' > .local/archive-review/app-c3-x/r2/codex.md
+expect_grep "不在或不完整" "「改壞了別的東西」不是封閉列舉裡的詞 → codex 第二輪不算完整（帳本說答過 → 拒絕）" $AR app-c3-x --rereview
+
+echo "── archive-review：逾時殺不乾淨的孤兒寫不進回答檔 ──"
+# 父行程被 TERM 就退（watch 不會升級 KILL），子行程忽略 TERM、被 reparent 後還握著 stdout；等測試放行才寫。
+cat > "$W/bin/codex-orphan" <<'ZZ'
+#!/bin/bash
+( trap '' TERM; while [ ! -f "$ORPHAN_GO" ]; do sleep 1; done; echo "結論：需修正 9 條／可接受風險 0 條／誤報候選 0 條" ) &
+sleep 300
+ZZ
+cat > "$W/bin/codex-good" <<'ZZ'
+#!/bin/bash
+cat > /dev/null; echo "結論：需修正 0 條／可接受風險 0 條／誤報候選 0 條"
+ZZ
+chmod +x "$W/bin/codex-orphan" "$W/bin/codex-good"
+mkdir -p openspec/changes/app-c6-x; echo "# p" > openspec/changes/app-c6-x/proposal.md; git add -A && git commit -qm spec6
+export GH_BRANCH="feat/app-c6-x--a" ORPHAN_GO="$W/orphan-go"
+out="$(ARCHIVE_REVIEW_TIMEOUT=1 ARCHIVE_REVIEW_CODEX_BIN="$W/bin/codex-orphan" $AR app-c6-x 2>&1)"
+echo "$out" | grep -q "codex 沒有回答（rc=124" && ok "逾時 → rc=124、這次不算數" || bad "逾時 → rc=124、這次不算數" "$(echo "$out" | tail -2 | tr '\n' ' ')"
+grep -q "逾時" .local/archive-review/app-c6-x/r1/codex.md && ok "逾時後回答檔只寫了「逾時」" || bad "逾時後回答檔只寫了「逾時」"
+expect_grep "需修正 0 條" "重送（好的 CLI）→ 發布的是這一次的回答" bash -c "ARCHIVE_REVIEW_CODEX_BIN=$W/bin/codex-good ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/codex-good $AR app-c6-x >/dev/null 2>&1; cat .local/archive-review/app-c6-x/r1/codex.md"
+grep -q "需修正 0 條" .local/archive-review/app-c6-x/r1/gemini.md && ok "gemini 那條路徑也經過暫存檔發布" || bad "gemini 那條路徑也經過暫存檔發布"
+grep -q '"model": "gemini".*"ok": true' "$L" && ok "gemini 帳本 ok" || bad "gemini 帳本 ok"
+touch "$ORPHAN_GO"; sleep 3
+grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.md && bad "逾時的孤兒寫進了發布的回答檔" || ok "逾時的孤兒寫不進發布的回答檔"
+grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.timeout.md && ok "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）" || bad "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）"
 
 echo
 echo "通過 $PASS / 失敗 $FAIL / 共 $((PASS+FAIL))"
