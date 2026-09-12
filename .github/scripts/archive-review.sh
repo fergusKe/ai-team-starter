@@ -38,12 +38,20 @@ mkdir -p .local/archive-review
 ledger() { python3 -c 'import json,sys,datetime;d=json.loads(sys.argv[1]);d["ts"]=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds");print(json.dumps(d,ensure_ascii=False))' "$1" >> "$LEDGER"; }
 TAG='^[[:space:]]*([-*]|[0-9]+[.)])?[[:space:]]*'
 count() { grep -Ec "${TAG}\[$2\]" "$1" 2>/dev/null || true; }
-# 一次審查「算數」的條件：CLI rc=0 而且真的照格式回答了 —— 第一輪要有結論那一行，第二輪要有逐條的 已修／未修／改壞了別的。
-# 沒回答的記 ok=false，report 不算它。
+# 一次審查「算數」的條件：CLI rc=0 而且真的照格式**答完整** ——
+# 第一輪：有結論那一行，而且結論裡的三個數字跟明細裡的標籤數一致（「結論說 3 條、明細沒有」不算數）；
+# 第二輪：上一輪的每一條需修正（r2 bundle 的每個編號）都有一行 `N. 已修／未修／改壞了`（只答一半不算數）。
+# 沒答完整的記 ok=false，report 不算它，補跑會重送。
+r2_expected() { echo $(( $(count "$DIR/r1/codex.md" 需修正) + $(count "$DIR/r1/gemini.md" 需修正) )); }
 answered() { # answered <rc> <file> [round]
-  [ "$1" = 0 ] || { echo false; return; }
-  if [ "${3:-1}" = 2 ]; then grep -Eq "^[[:space:]]*[0-9]+[.)][[:space:]]*(已修|未修|改壞了)" "$2" && echo true || echo false
-  else grep -q "^結論[：:]" "$2" && echo true || echo false; fi
+  [ "$1" = 0 ] && [ -s "$2" ] || { echo false; return; }
+  if [ "${3:-1}" = 2 ]; then
+    local n; n=$(r2_expected); [ "$n" -gt 0 ] || { echo true; return; }
+    local i=1; while [ "$i" -le "$n" ]; do grep -Eq "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)" "$2" || { echo false; return; }; i=$((i+1)); done; echo true
+  else
+    local c; c="$(grep -m1 "^結論[：:]" "$2" | grep -oE '[0-9]+' | tr '\n' ' ')"
+    [ "$c" = "$(count "$2" 需修正) $(count "$2" 可接受風險) $(count "$2" 誤報候選) " ] && echo true || echo false
+  fi
 }
 # 沒有 coreutils timeout（macOS）：自己盯。超過 ARCHIVE_REVIEW_TIMEOUT（預設 1500 秒）就殺，不要讓 wait 等到天亮。
 watch() { local pid=$1 t=0; while kill -0 "$pid" 2>/dev/null; do [ "$t" -ge "${ARCHIVE_REVIEW_TIMEOUT:-1500}" ] && { kill "$pid" 2>/dev/null; return 124; }; sleep 5; t=$((t+5)); done; wait "$pid"; }
@@ -55,9 +63,22 @@ import json, sys, math
 rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 N, MINV, MAXFP, MAXP90 = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 rev = [r for r in rows if r.get("kind") == "review"]
+import re, os
+def file_ok(i, m, rnd):   # 跟腳本的 answered() 同一把尺：帳本說答過還不夠，檔案要在、要答完整
+    f = f".local/archive-review/{i}/r{rnd}/{m}.md"
+    if not os.path.isfile(f): return False
+    txt = open(f, encoding="utf-8").read()
+    tag = lambda k: len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])?\s*\[%s\]" % k, txt))
+    if rnd == 1:
+        m1 = re.search(r"(?m)^結論[：:].*$", txt)
+        return bool(m1) and [int(x) for x in re.findall(r"\d+", m1.group(0))] == [tag("需修正"), tag("可接受風險"), tag("誤報候選")]
+    return bool(re.search(r"(?m)^\s*\d+[.)]\s*(已修|未修|改壞了)", txt))
+broken = []
 r1ok = {}                                             # id → {model: 最早回答了的第一輪 row}；之後的重跑不算
 for r in rev:
-    if r["round"] == 1 and r.get("ok", True): r1ok.setdefault(r["id"], {}).setdefault(r["model"], r)   # 舊 row 沒有 ok 欄：當時只有回答了才會寫 row
+    if r["round"] == 1 and r.get("ok", True):           # 舊 row 沒有 ok 欄：當時只有回答了才會寫 row
+        if file_ok(r["id"], r["model"], 1): r1ok.setdefault(r["id"], {}).setdefault(r["model"], r)
+        else: broken.append(f"{r['id']}/{r['model']}")
 seen = [r["id"] for r in rev if r["round"] == 1]; seen = list(dict.fromkeys(seen))
 done = {i: max(r1ok[i][m]["ts"] for m in ("codex", "gemini")) for i in seen if {"codex", "gemini"} <= set(r1ok.get(i, {}))}
 both = sorted(done, key=done.get)                      # 樣本順序＝兩個模型都答齊的時間，補跑沒回答的那個不會插隊
@@ -65,6 +86,7 @@ half = [i for i in seen if i not in done]
 cohort = both[:N]
 print(f"條件：最早 {N} 個雙模型樣本內 已修 ≥{MINV}、誤報率 ≤{MAXFP}%、等待 P90 ≤{MAXP90} 秒")
 print(f"雙模型樣本：{len(both)} 個（樣本取前 {N}：{', '.join(cohort) or '—'}）；只有一個模型回答、不算樣本的：{len(half)} 個（{', '.join(half) or '—'}）")
+if broken: print(f"帳本說答過、檔案卻不在或不完整（不算）：{', '.join(sorted(set(broken)))}")
 if not cohort: print("還沒有任何雙模型樣本"); sys.exit(0)
 def p90(xs):
     xs = sorted(xs); return xs[max(0, math.ceil(0.9 * len(xs)) - 1)]
@@ -132,7 +154,8 @@ SPEC_FILES="$(git ls-tree -r --name-only "$MAIN" -- "openspec/changes/$ID" | gre
 # 重跑只補沒答的那個模型（CLI 不在、逾時、diff 拿不到），沿用同一份 bundle；樣本順序以兩個都答齊的時間算，補跑不插隊。
 # 「只准一次」看的是**兩個模型都答過第二輪**，不是 r2/ 目錄存不存在 —— 目錄在失敗時也會留下。
 if [ "${1:-}" = "--rereview" ]; then
-  ROUND=2; [ -s "$DIR/r1/main.sha" ] && { has_answer codex 1 || has_answer gemini 1; } || { echo "✗ 第一輪沒有任何一個模型答過，先跑 bash .github/scripts/archive-review.sh $ID" >&2; exit 2; }
+  # 兩個模型的第一輪都要答完才能回審：第二輪 bundle 列的是兩個模型的需修正，少一個就是回審不完整；補完第一輪又補不進來。
+  ROUND=2; [ -s "$DIR/r1/main.sha" ] && has_answer codex 1 && has_answer gemini 1 || { echo "✗ 兩個模型的第一輪都答完才能回審（先跑 bash .github/scripts/archive-review.sh $ID 補齊）" >&2; exit 2; }
 else
   ROUND=1
 fi

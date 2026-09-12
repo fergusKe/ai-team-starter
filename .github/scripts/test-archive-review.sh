@@ -44,8 +44,10 @@ export PATH="$W/bin:$PATH" ARCHIVE_REVIEW_CODEX_BIN=/nonexistent/codex ARCHIVE_R
 AR="bash .github/scripts/archive-review.sh"
 L=".local/archive-review.jsonl"
 
-row() { # row <id> <model> <round> <seconds> <need_fix> <ok> <ts>
+row() { # row <id> <model> <round> <seconds> <need_fix> <ok> <ts>  —— ok 的 row 順手產生一份對得上的回答檔（已存在就不動）
   printf '{"kind": "review", "id": "%s", "round": %s, "model": "%s", "seconds": %s, "need_fix": %s, "risk": 0, "fp": 0, "ok": %s, "session": "", "ts": "%s"}\n' "$1" "$3" "$2" "$4" "$5" "$6" "$7" >> "$L"
+  [ "$6" = true ] && [ ! -s ".local/archive-review/$1/r$3/$2.md" ] || return 0
+  if [ "$3" = 1 ]; then r1md "$1" "$2" "$5"; else mkdir -p ".local/archive-review/$1/r2"; printf '1. 已修\n2. 已修\n3. 已修\n' > ".local/archive-review/$1/r2/$2.md"; fi
 }
 judge() { printf '{"kind": "judge", "id": "%s", "model": "%s", "finding": %s, "verdict": "%s", "note": "", "ts": "2026-01-02T00:00:00+00:00"}\n' "$1" "$2" "$3" "$4" >> "$L"; }
 ts() { printf '2026-01-01T%02d:%02d:00+00:00' "$1" "$2"; }
@@ -77,6 +79,15 @@ expect_grep "不算樣本的：1 個（app-half-x）" "只有一個模型回答�
 expect_grep "app-c10-x）" "樣本取最早 10 個" report
 out="$(report)"; echo "$out" | grep -q "app-c11-x" && bad "第 11 個 change 不進樣本" "報告提到 app-c11-x" || ok "第 11 個 change 不進樣本"
 expect_grep "還沒判定 1" "需修正沒判定 → 報告數得出來" report
+# 結論說 1 條、明細沒有 → 這份回答不算數（report 排除、has_answer 也不算）
+printf '結論：需修正 1 條／可接受風險 0 條／誤報候選 0 條\n' > .local/archive-review/app-c9-x/r1/codex.md
+expect_grep "檔案卻不在或不完整（不算）：app-c9-x/codex" "第一輪結論數字跟明細對不上 → report 不算" report
+r1md app-c9-x codex 0
+# 同一把尺在腳本本體：帳本說答過、檔案結論說 2 條但明細 1 條 → 不完整 → 拒絕（不是「都答過了」）
+mkdir -p openspec/changes/app-c8-x; echo "# p" > openspec/changes/app-c8-x/proposal.md; git add -A && git commit -qm spec8
+printf '[需修正] x\n結論：需修正 2 條／可接受風險 0 條／誤報候選 0 條\n' > .local/archive-review/app-c8-x/r1/codex.md
+expect_grep "不在或不完整" "第一輪結論數字跟明細對不上 → has_answer 不算、拒絕" $AR app-c8-x
+r1md app-c8-x codex 0
 expect_grep "不能下結論" "需修正沒判定 → 不下結論" report
 # 補跑：app-half-x 的 gemini 後來答了 → 它排到最後，不插隊
 row app-half-x gemini 1 10 0 true "$(ts 3 0)"
@@ -99,6 +110,9 @@ expect_rc 2 "--judge 第二輪檔案在、帳本沒說算數 → 不能標「已
 row app-c2-x codex 2 10 0 false "$(ts 4 0)"
 expect_rc 2 "--judge 第二輪帳本 ok=false（半成品）→ 不能標「已修」" $AR app-c2-x --judge codex 2 已修
 row app-c2-x codex 2 10 0 true "$(ts 4 1)"; row app-c2-x gemini 2 10 0 true "$(ts 4 1)"
+cp .local/archive-review/app-c2-x/r2/codex.md "$W/c2-codex-r2.bak"; printf '1. 已修\n2. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+expect_rc 2 "--judge 第二輪只答了 1、2 號（三條要答完）→ 不算數、不能標已修" $AR app-c2-x --judge codex 2 已修
+cp "$W/c2-codex-r2.bak" .local/archive-review/app-c2-x/r2/codex.md
 expect_rc 2 "--judge 第二輪說「未修」的不能標「已修」"           $AR app-c2-x --judge codex 1 已修
 expect_rc 0 "--judge 第二輪說「已修」的可以標「已修」"           $AR app-c2-x --judge codex 2 已修
 expect_rc 2 "--judge gemini 第 1 條對到第二輪第 3 號（未修）"    $AR app-c2-x --judge gemini 1 已修
@@ -138,6 +152,7 @@ ZZPY
 expect_grep "條件全部成立" "全部已修、樣本滿、等待在門檻內 → 成立" report
 
 echo "── archive-review：答過的不重跑、樣本凍結、diff fail-closed ──"
+python3 -c 'import os;os.remove(".local/archive-review/app-c1-x/r1/gemini.md")'   # helper 產的那份拿掉，模擬有人移走
 expect_grep "不要移走" "帳本說 gemini 答過、r1/gemini.md 不在 → 拒絕" $AR app-c1-x
 r1md app-c1-x gemini 0
 expect_grep "都答過了" "兩個都答過 → 拒絕重跑、指向 --rereview" $AR app-c1-x
@@ -163,6 +178,8 @@ expect_grep "跳過 codex" "帳本 ok=false 的半成品不算答過 → 重送"
 out="$($AR app-c3-x 2>&1)"; echo "$out" | grep -q "codex 第 1 輪已經答過" && bad "半成品不該被當成答過" || ok "半成品不該被當成答過"
 # 第二輪也一樣：diff 失敗留下 r2/ 不能變成「第三輪」；兩個都答過第二輪才是只准一次
 row app-c3-x codex 1 10 1 true "$(ts 5 0)"; r1md app-c3-x codex 1   # 上一步重送把檔案蓋掉了，補回一份算數的
+expect_grep "兩個模型的第一輪都答完才能回審" "只有一個模型答完第一輪 → 不能開第二輪" $AR app-c3-x --rereview
+row app-c3-x gemini 1 10 0 true "$(ts 5 1)"; r1md app-c3-x gemini 0
 echo fail > "$GH_MODE"
 expect_grep "拿不到 PR #7 的 diff" "第二輪 diff 拿不到 → 這輪不算數" $AR app-c3-x --rereview
 echo ok > "$GH_MODE"
