@@ -389,6 +389,31 @@ ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）�
 它**抓不到**的：兩條決策語意衝突但沒寫 `Supersedes`（不推斷，人審）；證據測試其實是
 `test.skip`（路徑存在只代表有交卷）。
 
+### 多模型分工的票流程（**是寫手的自我約束，不是 repo 的門**）
+
+```bash
+node .github/scripts/llm-team/setup.mjs --check              # 對帳 settings.json
+node .github/scripts/llm-team/ticket.mjs run --name <n> ...   # 寫手實作＋雙模型複審
+node .github/scripts/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
+```
+
+**為什麼分工。** 統整者（Claude）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型（Gemini 3.8 Flash）
+動手寫，再由兩位獨立模型（Opus 4.6、Gemini 3.1 Pro，block 級加 Codex）複審。省的是統整者回合，
+作者≠審核者避免「自己寫自己審」的盲區。
+
+**寫手 wrapper 的自我約束（G1–G6 各擋什麼）。**
+- G1：worktree 不在 main 且乾淨（不污損主分支）。
+- G2：settings.json allow regex 對帳（防指令被拒靜默退出）。
+- G3：stream-json 判定工作成功而非程序成功（防 exit 0 假象）。
+- G4：越界改檔 fail-closed（不修、不還原、回統整者）。
+- G5：每輪寫 ndjson 台帳（留可稽核軌跡）。
+- G6：迴圈硬上限 ≤ 5 輪（防無窮空轉）。
+
+**信任邊界。** 本機閘可繞、不得當安全邊界；GitHub PR ruleset 才是唯一的門。
+產物與台帳在 `.local/llm-team/`。
+「不簽」不是紅燈，是統整者要讀的訊息；統整者必須親自開檔坐實每位審查者的 Q6，
+無誤才觸發 `publish`，永不自動 merge，最終由人核准合併。
+
 ### CI 的 workflow 檢查
 
 ```yaml

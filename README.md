@@ -68,6 +68,8 @@ bash .github/scripts/progress.sh
 還沒設定的清單，每一條都寫了**這是什麼、怎麼做、不做會怎樣**；
 做完一件就少一條，全部做完清單自己消失。
 
+多模型分工：先 `node .github/scripts/llm-team/setup.mjs --check`，流程見 `prompts/07-ticket.md`。
+
 日常操作一律 `npx openspec ...`，**不需要設定任何環境變數**。
 
 **複製之後把這份 README 換掉。** 它描述的是模板，不是你的專案 ——

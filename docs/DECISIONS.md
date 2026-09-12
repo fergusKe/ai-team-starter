@@ -1389,3 +1389,21 @@ diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不�
 
 **這條的通則**：「我覺得清楚」不是證據。要驗的是「第一次看的讀者猜了什麼」，
 而作者不可能是第一次看的讀者。
+
+---
+
+## 多模型分工工具進模板目錄，不做 npm 套件也不用 subtree
+
+2026-09-13 三方共識（agy opus-4-6／Gemini 3.1 Pro／codex sol）。
+
+**決定**：多模型派工與票流程腳本（`lib.mjs`、`write.mjs`、`council.mjs`、`ticket.mjs`、`setup.mjs`）直接進模板 `.github/scripts/llm-team/` 目錄出貨。
+
+**拒絕的替代**：
+1. **獨立 npm 套件**：發布到 npm 會引入打包構建、版本相依與安裝門檻，且這套工具目前僅在真實專案跑過三張票，過早承諾套件 API 與語意版本維護是負擔不是資產。
+2. **git subtree / git submodule**：衍生專案複製模板時一向是一次性複製乾淨目錄（不含 submodule/subtree 複雜度），增加 git 操作複雜度且可能被分支閘門絆倒。
+3. **只留在特定衍生專案**：在 web-agency-system 實測證明有效，但多專案各自維護腳本會立刻重演代碼漂移與錯誤判定。
+
+**為什麼**：
+- **零相依、複製即用**：只用 Node.js 內建模組（`node:fs`、`node:path`、`node:child_process`），無需額外 npm install 即可運作。
+- **更新怎麼傳**：模板 repo 是單一真源，衍生專案以「逐字拿」方式同步腳本檔案。專案特有設定（模型 ID、指令白名單、worktree 路徑等）全部集中在 `config.json`，那是專案唯一該修改的設定檔。
+- **治理白名單決定**：同時將 `.claude/skills/` 納入 `check-pr-branch.sh` 的 `governance/*` 白名單。理由：它與 `prompts/` 同性質，皆為給 LLM 的操作規則（模板出貨的一部分），修改 skill 同屬改動流程與治理層，應允許在 governance PR 中維護。

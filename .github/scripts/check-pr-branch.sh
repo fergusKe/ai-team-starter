@@ -545,11 +545,13 @@ ARCHIVE_IDENTITY
     # （它本來只是治理選擇 —— 那時機器不讀它。排程從它身上刪掉之後，
     # 剩下的關係是「索引」，而索引是可以驗的。）
     #
+    # `.claude/skills/` 也在清單裡：它跟 `prompts/` 一樣是給 LLM 的操作規則（模板出貨的一部分），改了它同屬改流程。
+    #
     # 注意：這一關擋不住「在 PR 裡把 ci.yml 改成 run: true」。
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.claude/skills/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
