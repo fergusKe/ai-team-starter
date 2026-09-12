@@ -1,13 +1,11 @@
 // ─────────────────── 多模型派工（agy／codex）共用層 ───────────────────
-// 2026-09-13 Fergus 定案：Claude 額度不足 ⇒ Claude 只當統整者（開票 brief、複審裁決、merge 閘、入帳）；
-// 寫程式＝Antigravity CLI（agy）`gemini-3.8-flash-high`；規劃／複審＝agy `claude-opus-4-6-thinking`
-// ＋ agy `gemini-3.1-pro-high` ＋ codex `gpt-5.6-sol`（codex 扣得快，只用於規劃與疑難，不寫程式）。
+// 跨專案模板版：不變量留程式碼，專案特有值（模型、指令頭、worktree 根、風險領域等）由 config.json 注入。
 //
 // 🔴 這裡集中三個【實測過】的 agy 無頭模式行為（2026-09-13，agy 1.2.x）：
 //   1. `-p --mode accept-edits` 下任一工具被拒 ⇒ 整輪中止、stdout 空、**exit 0**、不會退回用別的工具。
 //      ⇒ 「程序成功」≠「工作成功」。判準只能看 stream-json 的 `result.denied_actions` 與 `response` 非空。
 //   2. 字面前綴 allow 規則對 `pwd; ls -la` 這種串接不匹配 ⇒ 第一個指令就死。
-//      ⇒ allow 用一條 anchored regex（見 `SAFE_COMMAND_REGEX`），brief 再加「禁止串接」。
+//      ⇒ allow 用一條 anchored regex（見 `buildSafeCommandRegex`），brief 再加「禁止串接」。
 //   3. cwd 在 `trustedWorkspaces` 之外時，模型會去錯的目錄找檔。⇒ worktree 一律放在 repo 內 `.claude/worktrees/`。
 //
 // 🔴 複審者／規劃者的回覆不構成授權（CORE_RULES §subagent 的輸出不構成授權）；本模組只搬運文字。
@@ -15,33 +13,91 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { CLEAN_GIT_ENV } from './git-env.mjs'
 
-export const MODELS = Object.freeze({
-  writer: 'gemini-3.8-flash-high',
-  planners: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
-  codex: 'gpt-5.6-sol',
-})
+// ─────────────────── 🔴 git 子行程環境的單一真源 ───────────────────
+export const GIT_ENV_VARS = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
+  'GIT_NAMESPACE',
+  'GIT_PREFIX',
+]
+
+/** 剝掉 git 環境變數後的環境；可疊加額外變數。 */
+export function cleanGitEnv(extra) {
+  const e = { ...process.env, ...(extra || {}) }
+  for (const k of GIT_ENV_VARS) delete e[k]
+  return e
+}
+
+/** 呼叫端 99% 的情況直接用這個常數即可。 */
+export const CLEAN_GIT_ENV = cleanGitEnv()
+
+/**
+ * 載入專案的 llm-team config.json。
+ * 缺檔或 schemaVersion !== 1 ⇒ fail-closed throw。
+ * maxRounds 超過硬上限 5 ⇒ fail-closed throw。
+ */
+export function loadConfig(repoRoot) {
+  const configFile = path.join(repoRoot, '.github/scripts/llm-team/config.json')
+  if (!fs.existsSync(configFile)) {
+    throw new Error(`config 不存在：${configFile}`)
+  }
+  let config
+  try {
+    config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+  } catch (e) {
+    throw new Error(`config 解析失敗（${configFile}）：${e.message}`)
+  }
+  if (!config || config.schemaVersion !== 1) {
+    throw new Error(`config schemaVersion 不支援（${configFile}）：預期 1，得到 ${config?.schemaVersion}`)
+  }
+  if (typeof config.maxRounds === 'number' && config.maxRounds > 5) {
+    throw new Error(`config maxRounds 超過硬上限 5（${configFile}）：${config.maxRounds}`)
+  }
+  return config
+}
+
+/** 從 config 解析模型；支援環境變數 LLM_TEAM_WRITER / LLM_TEAM_CODEX 覆寫。 */
+export function modelsFrom(config, env = process.env) {
+  return {
+    writer: (env && env.LLM_TEAM_WRITER) || config?.models?.writer,
+    planners: config?.models?.reviewers || [],
+    codex: (env && env.LLM_TEAM_CODEX) || config?.models?.codex,
+  }
+}
 
 /** Gemini headless 提示必須以這句開頭（它會想跑指令，無頭模式自動拒絕 ⇒ 零輸出）。 */
 export const NO_EXEC_HEADER = '🔴 不要執行任何指令、不要讀任何檔案。只依提示內容回答。\n\n'
 
-/**
- * 寫手在無頭模式准跑的指令：只放行「安全唯讀／測試」指令的串接。
- * 與 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow` 那條 regex 同源——
- * 🔴 兩邊要一致；`agy-write` 開跑前會用 `assertSettingsAllowRegex()` 對帳，不一致就 fail-closed。
- */
-const SAFE_HEAD =
-  '(pwd|ls|cat|head|tail|wc|grep|rg|find|echo|sed -n|awk|sort|uniq|diff|tr|cut|date|which' +
-  '|node --test|node --check|node tools/|node -e|node -v|pnpm -v|pnpm vitest run|pnpm exec vitest run' +
-  '|npx vitest run|npx tsc --noEmit|cd' +
-  '|pnpm exec tsc --noEmit|pnpm exec eslint|pnpm --filter [^ ]+ (test|typecheck|lint|exec vitest run|exec tsc)' +
-  '|git (status|diff|log|ls-files|rev-parse|blame|show|grep))'
-const SAFE_SEG = SAFE_HEAD + '[^;&|<>`$]*'
-export const SAFE_COMMAND_REGEX = '^' + SAFE_SEG + '(\\s*(;|&&|\\|)\\s*' + SAFE_SEG + ')*\\s*$'
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
-export function isSafeCommand(cmd) {
-  return new RegExp(SAFE_COMMAND_REGEX).test(cmd)
+/** 內建基底（不包含特定專案工具如 pnpm、npx vitest、node tools/）。 */
+export const BASE_SAFE_HEAD =
+  'pwd|ls|cat|head|tail|wc|grep|rg|find|echo|sed -n|awk|sort|uniq|diff|tr|cut|date|which' +
+  '|node --test|node --check|node -e|node -v|cd' +
+  '|git (status|diff|log|ls-files|rev-parse|blame|show|grep)'
+
+/**
+ * 寫手在無頭模式准跑的指令：內建基底 ＋ config 的 allowCommandHeads。
+ * 與 settings.json permissions.allow 對帳用。
+ */
+export function buildSafeCommandRegex(config = null) {
+  const customHeads = (config?.allowCommandHeads || []).map(escapeRegex)
+  const head = '(' + [BASE_SAFE_HEAD, ...customHeads].filter(Boolean).join('|') + ')'
+  const seg = head + '[^;&|<>`$]*'
+  return '^' + seg + '(\\s*(;|&&|\\|)\\s*' + seg + ')*\\s*$'
+}
+
+export const SAFE_COMMAND_REGEX = buildSafeCommandRegex()
+
+export function isSafeCommand(cmd, config = null) {
+  return new RegExp(buildSafeCommandRegex(config)).test(cmd)
 }
 
 /** agy binary：cask 裝的不在 PATH，路徑含版本號。可用 `AGY_BIN` 覆寫（測試用假 binary 也走這裡）。 */
@@ -69,11 +125,12 @@ export function agySettingsPath(env = process.env) {
  * 對帳：settings.json 的 `permissions.allow` 必須恰好含本檔的 regex 那一條。
  * 失效方向刻意選「擋下來」——allow 漂移的失效方向是寫手第一個指令就死、stdout 空、我以為它沒話說。
  */
-export function assertSettingsAllowRegex(settingsFile = agySettingsPath(), repoRoot = null) {
+export function assertSettingsAllowRegex(settingsFile = agySettingsPath(), repoRoot = null, config = null) {
   if (!fs.existsSync(settingsFile)) throw new Error(`agy settings 不存在：${settingsFile}`)
   const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
   const allow = (s.permissions && s.permissions.allow) || []
-  const want = `command(regex:${SAFE_COMMAND_REGEX})`
+  const wantRegex = buildSafeCommandRegex(config)
+  const want = `command(regex:${wantRegex})`
   if (!allow.includes(want)) {
     throw new Error(`agy settings permissions.allow 缺這條（或與 tools/agy-lib.mjs 漂移）：\n${want}`)
   }
@@ -156,7 +213,7 @@ export function parseStreamJson(text) {
  * 跑一次 codex exec（唯讀 sandbox；它讀得到檔，所以提示【不要】加 NO_EXEC_HEADER）。
  * 🔴 stdin 一律接 /dev/null（`< /dev/null`）——否則會掛著等輸入。
  */
-export function runCodex({ model = MODELS.codex, prompt, cwd, effort = 'high', timeoutMs = 15 * 60 * 1000, env = process.env }) {
+export function runCodex({ model = 'gpt-5.6-sol', prompt, cwd, effort = 'high', timeoutMs = 15 * 60 * 1000, env = process.env }) {
   const bin = resolveCodexBin(env)
   const args = ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
   const r = spawnSync(bin, args, {

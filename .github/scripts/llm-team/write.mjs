@@ -1,26 +1,27 @@
 #!/usr/bin/env node
 // ─────────────────── agy 寫手 wrapper（fail-closed） ───────────────────
 // 用法：
-//   node tools/agy-write.mjs --worktree <abs> --brief <file> --allow <path> [--allow <path>…]
-//        [--model gemini-3.8-flash-high] [--max-rounds 3] [--test "<指令>"] [--ledger <file>] [--out <dir>]
+//   node .github/scripts/llm-team/write.mjs --worktree <abs> --brief <file> --allow <path> [--allow <path>…]
+//        [--model <model>] [--max-rounds <n>] [--test "<指令>"] [--ledger <file>] [--out <dir>]
 //
 // 每輪：跑 agy accept-edits（stream-json）→ 判「工作成功」而非「程序成功」→ 越界檔對帳 → 跑 --test →
 // 紅就把測試輸出餵回 agy（--continue）再一輪；到 --max-rounds 仍紅 ⇒ exit 3 回統整者。
 //
 // 🔴 2026-09-13 三方（agy opus-4-6／Gemini 3.1 Pro／codex sol）共識的機械保護，一條都不准拿掉：
 //   G1 worktree 分支不是 main、乾淨（開跑前）——否則不准動手。
-//   G2 settings.json 的 allow regex 與 tools/agy-lib.mjs 同源（漂移 ⇒ 寫手第一個指令就死）。
+//   G2 settings.json 的 allow regex 與 lib.mjs 同源（漂移 ⇒ 寫手第一個指令就死）。
 //   G3 stdout 的 result.response 非空且 denied_actions 空——否則判 FAIL（exit 0 是假的）。
 //   G4 `git status --porcelain` 的每個檔都在 allowlist——越界 ⇒ FAIL，不修、不還原、回統整者。
 //   G5 每輪都寫台帳（ndjson）：round、baseline sha、changed、denied、test exit。
-//   G6 迴圈上限 --max-rounds（預設 3）。
+//   G6 迴圈上限 --max-rounds（預設從 config.json 讀取，硬上限 5）。
 // 🔴 不做的事：不 stash、不 `git checkout --`、不 commit、不 push——那些是統整者在 merge 閘做的。
 
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import {
-  MODELS,
+  loadConfig,
+  modelsFrom,
   runAgy,
   git,
   changedFiles,
@@ -28,15 +29,15 @@ import {
   ledgerAppend,
   parseArgs,
   assertSettingsAllowRegex,
-} from './agy-lib.mjs'
-import { CLEAN_GIT_ENV } from './git-env.mjs'
+  CLEAN_GIT_ENV,
+} from './lib.mjs'
 
 export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback }) {
   const head = [
     `工作目錄（絕對路徑，所有檔案操作只准在這棵樹內）：${worktree}`,
     '🔴 硬規則（違反任一條就停下來回報，不要自己變通）：',
     `  1. 只准建立或修改以下路徑：${allowlist.map((a) => `\`${a}\``).join('、')}。其他檔一律不碰（包括「順手」重構）。`,
-    '  2. 每次只執行【一個】指令；禁止用 `;`、`&&`、`||`、管線串接；禁止 rm、git commit/push/checkout/reset/stash/clean、curl、pnpm install。',
+    '  2. 每次只執行【一個】指令；禁止用 `;`、`&&`、`||`、管線串接；禁止 rm、git commit/push/checkout/reset/stash/clean、curl、安裝相依。',
     '     `node -e "…"` 裡的程式碼也不准含 `;`、`&&`、`|`、`$`、反引號（權限規則把它們當串接，整輪會被中止）；要做實驗就寫進測試檔用 node --test 跑。',
     '     不要 `ps`、不要等背景任務——所有指令都同步跑完再看結果。',
     '  3. 需要碰清單外的檔、或需要清單外的指令 ⇒ 立刻停止，在回覆裡說明「需要什麼、為什麼」。',
@@ -75,39 +76,98 @@ export function main(argv, deps = {}) {
     console.error('用法：--worktree <abs> --brief <file> --allow <path>… [--model] [--max-rounds] [--test "<cmd>"] [--ledger] [--out]')
     return 2
   }
-  const model = a.model || MODELS.writer
-  const maxRounds = Number(a['max-rounds'] || 3)
-  const outDir = a.out || path.join(worktree, '.agy-write')
+
+  const gitFn = deps.git || git
+  let repoRoot
+  let config
+  try {
+    const commonDir = path.resolve(worktree, gitFn(worktree, ['rev-parse', '--git-common-dir']))
+    repoRoot = path.dirname(commonDir)
+    const loadCfg = deps.loadConfig || loadConfig
+    config = loadCfg(repoRoot)
+  } catch (e) {
+    console.error(`🔴 config 載入失敗：${e.message}`)
+    return 2
+  }
+
+  const models = modelsFrom(config)
+  const model = a.model || models.writer
+  const rawMaxRounds = a['max-rounds'] !== undefined ? Number(a['max-rounds']) : config.maxRounds
+  const maxRounds = Number(rawMaxRounds || 3)
+  if (maxRounds > 5) {
+    console.error('🔴 --max-rounds 超過硬上限 5')
+    return 2
+  }
+
+  const outDir = a.out
+    ? path.resolve(a.out)
+    : path.join(repoRoot, config.outDir, path.basename(worktree), 'write')
   const ledger = a.ledger || path.join(outDir, 'ledger.ndjson')
   const brief = fs.readFileSync(a.brief, 'utf8')
   const allowlist = a.allow
   const run = deps.runAgy || runAgy
   const test = deps.runTest || runTest
   const checkSettings = deps.assertSettings || assertSettingsAllowRegex
+  const changedFilesFn = deps.changedFiles || changedFiles
+
+  const project = path.basename(repoRoot)
+  const ticket = path.basename(worktree)
+
+  const outRel = path.relative(worktree, outDir)
+  const isOutInsideWorktree = !outRel.startsWith('..') && !path.isAbsolute(outRel)
+  const outPrefix = isOutInsideWorktree ? (outRel.endsWith('/') ? outRel : outRel + '/') : null
+  const isIgnored = (f) => f.startsWith('.agy-write/') || (outPrefix && f.startsWith(outPrefix))
 
   // G1
-  const branch = git(worktree, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  const branch = gitFn(worktree, ['rev-parse', '--abbrev-ref', 'HEAD'])
   if (branch === 'main') {
     console.error(`🔴 G1：worktree 在 main（${worktree}），不准動手。`)
     return 2
   }
-  const dirty = changedFiles(worktree).filter((f) => !f.startsWith('.agy-write/'))
+  const dirty = changedFilesFn(worktree).filter((f) => !isIgnored(f))
   if (dirty.length) {
     console.error(`🔴 G1：worktree 不乾淨，先處理：\n  ${dirty.join('\n  ')}`)
     return 2
   }
+
   // G2
   try {
-    // repo 根＝worktree 的 --git-common-dir 的上一層（linked worktree 的 .git 是檔案，指回主 checkout）
-    const commonDir = path.resolve(worktree, git(worktree, ['rev-parse', '--git-common-dir']))
-    checkSettings(undefined, path.dirname(commonDir))
+    checkSettings(undefined, repoRoot, config)
   } catch (e) {
     console.error(`🔴 G2：${e.message}`)
     return 2
   }
+
+  // installCommand
+  let installExit = null
+  if (config.installCommand && config.installCommand.trim()) {
+    const runInstall = deps.runInstall || ((cmd, cwd) => {
+      const r = spawnSync('sh', ['-c', cmd], {
+        cwd,
+        env: CLEAN_GIT_ENV,
+        encoding: 'utf8',
+        maxBuffer: 16 * 1024 * 1024,
+      })
+      return { exit: r.status, out: (r.stdout || '') + (r.stderr || '') }
+    })
+    const ins = runInstall(config.installCommand, worktree)
+    installExit = ins.exit
+    if (installExit !== 0) {
+      console.error(`🔴 installCommand 失敗（exit=${installExit}）：${ins.out || ''}`)
+    }
+  }
+
   fs.mkdirSync(outDir, { recursive: true })
-  const baseline = git(worktree, ['rev-parse', 'HEAD'])
+  const baseline = gitFn(worktree, ['rev-parse', 'HEAD'])
   let feedback = ''
+
+  const baseEntry = {
+    schemaVersion: 1,
+    project,
+    ticket,
+    tool: 'agy-write',
+    ...(installExit !== null ? { installExit } : {}),
+  }
 
   let toolErrorRetries = 0
   for (let round = 1; round <= maxRounds; round++) {
@@ -131,7 +191,15 @@ export function main(argv, deps = {}) {
     ) {
       toolErrorRetries++
       fs.writeFileSync(path.join(outDir, `round-${round}.toolerror-${toolErrorRetries}.stdout.ndjson`), r.stdout)
-      ledgerAppend(ledger, { tool: 'agy-write', round, model, baseline, verdict: 'RETRY_toolerror', retry: toolErrorRetries, lastStep: r.steps[r.steps.length - 1] })
+      ledgerAppend(ledger, {
+        ...baseEntry,
+        round,
+        model,
+        baseline,
+        verdict: 'RETRY_toolerror',
+        retry: toolErrorRetries,
+        lastStep: r.steps[r.steps.length - 1],
+      })
       console.error(`🟡 第 ${round} 輪：最後一個工具呼叫參數不合法而整輪中止，--continue 續第 ${toolErrorRetries} 次`)
       r = run({
         model,
@@ -144,10 +212,10 @@ export function main(argv, deps = {}) {
     fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout)
     fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr)
     const response = (r.result && r.result.response) || ''
-    const changed = changedFiles(worktree).filter((f) => !f.startsWith('.agy-write/'))
+    const changed = changedFilesFn(worktree).filter((f) => !isIgnored(f))
     const oos = outOfScope(changed, allowlist)
     const entry = {
-      tool: 'agy-write',
+      ...baseEntry,
       round,
       model,
       baseline,

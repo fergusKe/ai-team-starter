@@ -1,10 +1,10 @@
 /**
- * `tools/agy-lib.mjs`／`agy-write.mjs`／`agy-council.mjs` 的測試——由 `pnpm guards` 自動收。
+ * `.github/scripts/llm-team/`（`lib.mjs`／`write.mjs`／`council.mjs`）的測試。
  *
  * 🔴 這裡不打真的 agy／codex（會花額度、會被 Gatekeeper 殺、會等網路）。用【假 binary】：
  *   一支 shell script 依環境變數扮演「正常寫檔」「被拒零輸出」「越界改檔」三種行為，
  *   輸出照真 agy 的 stream-json 形狀（2026-09-13 實測樣本）。
- * 🔴 每條守門都要有陽性對照，而且對照要指得出【是哪一條】炸的（G3 / G4 / G6 各自紅、各自的訊息）。
+ * 🔴 每條守門都要有陽性對照，而且對照要指得出【是哪一條】炸的（G1–G6 各自紅、各自的訊息）。
  */
 
 import { test, describe } from 'node:test'
@@ -13,8 +13,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { CLEAN_GIT_ENV } from './git-env.mjs'
 import {
+  CLEAN_GIT_ENV,
+  loadConfig,
+  modelsFrom,
+  buildSafeCommandRegex,
   SAFE_COMMAND_REGEX,
   isSafeCommand,
   parseStreamJson,
@@ -22,22 +25,41 @@ import {
   assertSettingsAllowRegex,
   resolveAgyBin,
   parseArgs,
-} from './agy-lib.mjs'
-import { main as writeMain, buildWriterPrompt } from './agy-write.mjs'
-import { main as councilMain, parseVerdicts, buildReviewPrompt } from './agy-council.mjs'
+} from './lib.mjs'
+import { main as writeMain, buildWriterPrompt } from './write.mjs'
+import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
-/** 建一個有 main＋feature 分支的拋棄式 repo，回 worktree 路徑（在 feature 分支上）。 */
-function makeRepo() {
+const TEST_CONFIG = {
+  schemaVersion: 1,
+  models: {
+    writer: 'gemini-3.8-flash-high',
+    reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
+    codex: 'gpt-5.6-sol',
+  },
+  allowCommandHeads: ['npm test', 'bash .github/scripts/test-'],
+  worktreeRoot: '.claude/worktrees',
+  installCommand: '',
+  maxRounds: 3,
+  riskDomains: [],
+  outDir: '.local/llm-team',
+}
+
+/** 建一個有 main＋feature 分支與 config.json 的拋棄式 repo，回 worktree 路徑（在 feature 分支上）。 */
+function makeRepo(configOverride = {}) {
   const dir = tmpdir('agy-test-')
   const g = (...args) => execFileSync('git', ['-C', dir, ...args], { env: CLEAN_GIT_ENV, encoding: 'utf8' })
   g('init', '-q', '-b', 'main')
   g('config', 'user.email', 't@example.com')
   g('config', 'user.name', 't')
   fs.writeFileSync(path.join(dir, 'add.mjs'), 'export function add(a, b) { return a + b }\n')
+  const cfgDir = path.join(dir, '.github', 'scripts', 'llm-team')
+  fs.mkdirSync(cfgDir, { recursive: true })
+  const cfg = { ...TEST_CONFIG, ...configOverride }
+  fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify(cfg, null, 2))
   g('add', '-A')
   g('commit', '-qm', 'init')
   g('checkout', '-qb', 'feat/x')
@@ -82,42 +104,138 @@ esac
 
 function makeSettings(allowLine) {
   const f = path.join(tmpdir('agy-settings-'), 'settings.json')
-  fs.writeFileSync(f, JSON.stringify({ permissions: { allow: allowLine ? [allowLine, `read_file(${os.tmpdir()}/)`, 'read_file(/private/var/folders/)', 'read_file(/var/folders/)'] : [] } }))
+  fs.writeFileSync(
+    f,
+    JSON.stringify({
+      permissions: {
+        allow: allowLine
+          ? [allowLine, `read_file(${os.tmpdir()}/)`, 'read_file(/private/var/folders/)', 'read_file(/var/folders/)']
+          : [],
+      },
+    })
+  )
   return f
 }
 
-const GOOD_ALLOW = `command(regex:${SAFE_COMMAND_REGEX})`
+const TEST_REGEX = buildSafeCommandRegex(TEST_CONFIG)
+const GOOD_ALLOW = `command(regex:${TEST_REGEX})`
 
-// 🔴 樣本陣列被清空時迴圈一次都不跑、測試照樣綠 ⇒ 用前先斷言非空
-//    （guard-selfcheck-meta 要的非空分母保護；node:test 檔的等價形態就是 `.length > 0`）。
-const ALLOWED_SAMPLES = ['pwd; ls -la', 'node --test add.test.mjs', 'git status && git diff --stat', 'cat a.mjs | head -5', 'pnpm --filter @agency/platform exec vitest run src/x.test.ts', 'node tools/progress.mjs --check', 'cd apps/platform && npx vitest run src/x.test.ts --maxWorkers=1']
-const DENIED_SAMPLES = ['rm -rf x', 'ls; rm x', 'cd apps && rm -rf x', 'npx some-other-bin', 'cd apps/platform && npx vitest run x && curl http://x', 'git commit -m x', 'git push origin main', 'curl http://x', 'pnpm install', 'cat a | sh', 'echo $(rm x)', 'ls > out.txt']
+const ALLOWED_SAMPLES = [
+  'npm test',
+  'bash .github/scripts/test-progress-check.sh',
+  'node --test x.test.mjs && git status',
+  'pwd; ls -la',
+  'cat a.mjs | head -5',
+]
+const DENIED_SAMPLES = [
+  'pnpm vitest run x',
+  'npm test && curl http://x',
+  'rm -rf x',
+  'ls; rm x',
+  'cd apps && rm -rf x',
+  'npx some-other-bin',
+  'git commit -m x',
+  'git push origin main',
+  'curl http://x',
+  'pnpm install',
+  'cat a | sh',
+  'echo $(rm x)',
+  'ls > out.txt',
+]
+
+describe('loadConfig：載入專案 config.json（fail-closed）', () => {
+  test('缺檔 ⇒ throw 且訊息含路徑', () => {
+    const emptyDir = tmpdir('empty-repo-')
+    const expectedPath = path.join(emptyDir, '.github/scripts/llm-team/config.json')
+    assert.throws(
+      () => loadConfig(emptyDir),
+      (err) => {
+        assert.match(err.message, /config 不存在/)
+        assert.ok(err.message.includes(expectedPath), `訊息應含 ${expectedPath}，得到 ${err.message}`)
+        return true
+      }
+    )
+  })
+
+  test('schemaVersion !== 1 (例如 schemaVersion: 2) ⇒ throw', () => {
+    const badSchemaDir = tmpdir('bad-schema-')
+    const cfgDir = path.join(badSchemaDir, '.github/scripts/llm-team')
+    fs.mkdirSync(cfgDir, { recursive: true })
+    fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({ schemaVersion: 2 }))
+    assert.throws(() => loadConfig(badSchemaDir), /schemaVersion 不支援/)
+  })
+
+  test('maxRounds: 6（超過硬上限 5）⇒ throw', () => {
+    const badRoundsDir = tmpdir('bad-rounds-')
+    const cfgDir = path.join(badRoundsDir, '.github/scripts/llm-team')
+    fs.mkdirSync(cfgDir, { recursive: true })
+    fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({ schemaVersion: 1, maxRounds: 6 }))
+    assert.throws(() => loadConfig(badRoundsDir), /maxRounds 超過硬上限 5/)
+  })
+
+  test('合法 config ⇒ 成功解析回傳物件', () => {
+    const okDir = tmpdir('ok-repo-')
+    const cfgDir = path.join(okDir, '.github/scripts/llm-team')
+    fs.mkdirSync(cfgDir, { recursive: true })
+    fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify(TEST_CONFIG))
+    const cfg = loadConfig(okDir)
+    assert.equal(cfg.schemaVersion, 1)
+    assert.equal(cfg.maxRounds, 3)
+  })
+})
+
+describe('modelsFrom：模型對應與環境變數覆寫', () => {
+  const cfg = {
+    models: {
+      writer: 'gemini-3.8-flash-high',
+      reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
+      codex: 'gpt-5.6-sol',
+    },
+  }
+
+  test('預設從 config 讀取', () => {
+    const m = modelsFrom(cfg, {})
+    assert.equal(m.writer, 'gemini-3.8-flash-high')
+    assert.deepEqual(m.planners, ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'])
+    assert.equal(m.codex, 'gpt-5.6-sol')
+  })
+
+  test('環境變數覆寫（傳 env 參數，不改 process.env）', () => {
+    const m = modelsFrom(cfg, {
+      LLM_TEAM_WRITER: 'my-custom-writer',
+      LLM_TEAM_CODEX: 'my-custom-codex',
+    })
+    assert.equal(m.writer, 'my-custom-writer')
+    assert.equal(m.codex, 'my-custom-codex')
+    assert.deepEqual(m.planners, ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'])
+  })
+})
 
 describe('SAFE_COMMAND_REGEX：只放行安全指令的串接', () => {
   test('放行：單一與串接的唯讀／測試指令', () => {
     assert.ok(ALLOWED_SAMPLES.length > 0, 'ALLOWED_SAMPLES 是空的 ⇒ 本條對空集合恆真')
     for (const c of ALLOWED_SAMPLES) {
-      assert.equal(isSafeCommand(c), true, c)
+      assert.equal(isSafeCommand(c, TEST_CONFIG), true, c)
     }
   })
   test('🔴 陽性對照：破壞性／越權指令必須擋（含串接在安全指令後面）', () => {
     assert.ok(DENIED_SAMPLES.length > 0, 'DENIED_SAMPLES 是空的 ⇒ 本條對空集合恆真')
     for (const c of DENIED_SAMPLES) {
-      assert.equal(isSafeCommand(c), false, c)
+      assert.equal(isSafeCommand(c, TEST_CONFIG), false, c)
     }
   })
   test('settings 對帳：缺那條 regex ⇒ throw（G2 的尺）', () => {
-    assert.equal(assertSettingsAllowRegex(makeSettings(GOOD_ALLOW)), true)
-    assert.throws(() => assertSettingsAllowRegex(makeSettings('command(node --test)')), /permissions\.allow 缺這條/)
-    assert.throws(() => assertSettingsAllowRegex(makeSettings(null)), /缺這條/)
+    assert.equal(assertSettingsAllowRegex(makeSettings(GOOD_ALLOW), null, TEST_CONFIG), true)
+    assert.throws(() => assertSettingsAllowRegex(makeSettings('command(node --test)'), null, TEST_CONFIG), /permissions\.allow 缺這條/)
+    assert.throws(() => assertSettingsAllowRegex(makeSettings(null), null, TEST_CONFIG), /缺這條/)
   })
   test('settings 對帳：給 repoRoot 時還要有覆蓋它的 read_file 規則（無頭讀檔會被拒的那條）', () => {
     const f = path.join(tmpdir('agy-settings-'), 'settings.json')
     fs.writeFileSync(f, JSON.stringify({ permissions: { allow: [GOOD_ALLOW, 'read_file(/repo/)'] } }))
-    assert.equal(assertSettingsAllowRegex(f, '/repo'), true)
-    assert.equal(assertSettingsAllowRegex(f, '/repo/.claude/worktrees/x'), true, '上層規則覆蓋 worktree')
-    assert.throws(() => assertSettingsAllowRegex(f, '/other'), /缺 read_file\(\/other\/\)/)
-    assert.throws(() => assertSettingsAllowRegex(makeSettings(GOOD_ALLOW), '/repo'), /缺 read_file/)
+    assert.equal(assertSettingsAllowRegex(f, '/repo', TEST_CONFIG), true)
+    assert.equal(assertSettingsAllowRegex(f, '/repo/.claude/worktrees/x', TEST_CONFIG), true, '上層規則覆蓋 worktree')
+    assert.throws(() => assertSettingsAllowRegex(f, '/other', TEST_CONFIG), /缺 read_file\(\/other\/\)/)
+    assert.throws(() => assertSettingsAllowRegex(makeSettings(GOOD_ALLOW), '/repo', TEST_CONFIG), /缺 read_file/)
   })
 })
 
@@ -139,7 +257,7 @@ describe('parseStreamJson：判「工作成功」不是「程序成功」', () =
 
 describe('changedFiles：porcelain 解析不吃第一個字', () => {
   test('🔴 陽性對照（2026-09-13 真跑咬到的形狀）：第一筆是【已追蹤且修改】的檔（` M path`）時路徑完整', async () => {
-    const { changedFiles } = await import('./agy-lib.mjs')
+    const { changedFiles } = await import('./lib.mjs')
     const repo = makeRepo()
     fs.appendFileSync(path.join(repo.dir, 'add.mjs'), '// touched\n')
     fs.writeFileSync(path.join(repo.dir, 'new.mjs'), 'x')
@@ -156,10 +274,11 @@ describe('outOfScope：越界檔對帳', () => {
   })
 })
 
-describe('agy-write：六道守門各自紅、各自的訊息', () => {
+describe('write.mjs：六道守門各自紅、各自的訊息', () => {
   const bin = makeFakeAgy()
   const settings = makeSettings(GOOD_ALLOW)
   const baseEnv = { AGY_BIN: bin, AGY_SETTINGS: settings }
+
   test('G1：在 main 上 ⇒ exit 2、訊息點名 G1', () => {
     const repo = makeRepo()
     repo.g('checkout', '-q', 'main')
@@ -185,9 +304,12 @@ describe('agy-write：六道守門各自紅、各自的訊息', () => {
     const r = runWriteReal(repo, 'denied')
     assert.equal(r.code, 3)
     assert.match(r.errs, /G3 第 1 輪[\s\S]*RunCommand/)
-    // 台帳有這一筆、verdict 是 FAIL_headless
+    // 台帳有這一筆、verdict 是 FAIL_headless、含 schemaVersion: 1、project、ticket
     const ledger = fs.readFileSync(path.join(repo.dir, '.agy-write', 'ledger.ndjson'), 'utf8')
     assert.match(ledger, /"verdict":"FAIL_headless"/)
+    assert.match(ledger, /"schemaVersion":1/)
+    assert.match(ledger, /"project":/)
+    assert.match(ledger, /"ticket":/)
   })
   test('G4：越界改檔 ⇒ exit 3、點名越界檔、不還原', () => {
     const repo = makeRepo()
@@ -196,12 +318,16 @@ describe('agy-write：六道守門各自紅、各自的訊息', () => {
     assert.match(r.errs, /G4 第 1 輪[\s\S]*leak\.mjs/)
     assert.ok(fs.existsSync(path.join(repo.dir, 'leak.mjs')), '越界檔不還原（留給統整者看）')
   })
-  test('綠：寫檔＋測試綠 ⇒ exit 0、台帳 PASS', () => {
+  test('綠：寫檔＋測試綠 ⇒ exit 0、台帳 PASS、含專案與票名', () => {
     const repo = makeRepo()
     const r = runWriteReal(repo, 'ok', ['--test', 'node --test add.test.mjs'])
     assert.equal(r.code, 0, r.errs)
     assert.match(r.outs, /第 1 輪測試綠/)
-    assert.match(fs.readFileSync(path.join(repo.dir, '.agy-write', 'ledger.ndjson'), 'utf8'), /"verdict":"PASS"/)
+    const ledger = fs.readFileSync(path.join(repo.dir, '.agy-write', 'ledger.ndjson'), 'utf8')
+    assert.match(ledger, /"verdict":"PASS"/)
+    assert.match(ledger, /"schemaVersion":1/)
+    assert.match(ledger, /"project":/)
+    assert.match(ledger, /"ticket":/)
   })
   test('G6：每輪都紅 ⇒ 到 --max-rounds 停、exit 3、第 2 輪起帶 --continue', () => {
     const repo = makeRepo()
@@ -217,7 +343,17 @@ describe('agy-write：六道守門各自紅、各自的訊息', () => {
     assert.match(p, /第 2 輪/)
     assert.match(p, /FAIL xyz/)
     assert.match(p, /禁止用 `;`/)
+    assert.match(p, /安裝相依/)
+    assert.doesNotMatch(p, /pnpm install/)
     assert.doesNotMatch(p, /\nB$/)
+  })
+  test('installCommand 非空時於第 1 輪前在 worktree 執行並寫入台帳 installExit', () => {
+    const repo = makeRepo({ installCommand: 'echo installed > install.txt' })
+    const r = runWriteReal(repo, 'ok', ['--test', 'node --test add.test.mjs', '--allow', 'install.txt'])
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(fs.readFileSync(path.join(repo.dir, 'install.txt'), 'utf8').trim(), 'installed')
+    const ledger = fs.readFileSync(path.join(repo.dir, '.agy-write', 'ledger.ndjson'), 'utf8')
+    assert.match(ledger, /"installExit":0/)
   })
 
   function runWriteReal(repo, mode, extra = [], envOverride = {}) {
@@ -250,7 +386,7 @@ describe('agy-write：六道守門各自紅、各自的訊息', () => {
   }
 })
 
-describe('agy-council', () => {
+describe('council.mjs：複審與三方會議', () => {
   test('parseVerdicts：逐題與整份', () => {
     const v = parseVerdicts('Q1：簽｜ok｜無\nQ2：不簽｜x｜y\n**整份：不簽**')
     assert.deepEqual(v.q, { Q1: '簽', Q2: '不簽' })
@@ -259,11 +395,26 @@ describe('agy-council', () => {
   test('parseVerdicts：零輸出 ⇒ overall null（不是簽）', () => {
     assert.equal(parseVerdicts('').overall, null)
   })
-  test('buildReviewPrompt 含 brief、diff、六題', () => {
-    const p = buildReviewPrompt({ brief: 'BRIEF', diff: '+x', tier: 'block', diffStat: '1 file' })
+  test('buildReviewPrompt：Q4 骨架在 riskDomains: [] 時不含「租戶」字樣，只剩固定尾句', () => {
+    const p = buildReviewPrompt({ brief: 'BRIEF', diff: '+x', tier: 'block', diffStat: '1 file', riskDomains: [] })
     assert.match(p, /BRIEF/)
     assert.match(p, /block 級/)
     assert.match(p, /Q6/)
+    assert.doesNotMatch(p, /租戶/)
+    assert.match(p, /Q4 若 diff【新增】了會變紅的閘門：有沒有引用本 repo 真實事故＋可重現的陽性對照＋停止條件？沒有 ⇒ 不簽。/)
+  })
+  test('buildReviewPrompt：riskDomains: [\'租戶隔離\', \'金流\'] 時含「租戶隔離／金流」', () => {
+    const p = buildReviewPrompt({
+      brief: 'BRIEF',
+      diff: '+x',
+      tier: 'standard',
+      diffStat: '1 file',
+      writerModel: 'custom-writer',
+      riskDomains: ['租戶隔離', '金流'],
+    })
+    assert.match(p, /作者是另一個模型（custom-writer）/)
+    assert.match(p, /租戶隔離／金流/)
+    assert.match(p, /Q4 租戶隔離／金流 有沒有被碰到？碰到的話是不是 block 級、有沒有對應守門？/)
   })
   test('review：兩位 agy（假 binary 回「不簽」）⇒ 表格印 不簽、exit 0；零輸出成員 ⇒ exit 3', () => {
     const repo = makeRepo()
@@ -293,8 +444,9 @@ describe('agy-council', () => {
     assert.match(table, /\| opus \| claude-opus-4-6-thinking \| 0 \|[^|]*\| 不簽 \| Q1=簽 Q2=不簽/)
     assert.match(table, /\| gemini \| gemini-3.1-pro-high/)
     assert.doesNotMatch(table, /codex/, 'standard 不叫 codex')
-    // prompt 以 NO_EXEC_HEADER 開頭這件事在 runOne 內；這裡驗 prompt.md 已落地含 diff
     assert.match(fs.readFileSync(path.join(repo.dir, '.review', 'prompt.md'), 'utf8'), /\+ 0 \}/)
+    const ledger = fs.readFileSync(path.join(repo.dir, '.review', 'ledger.ndjson'), 'utf8')
+    assert.match(ledger, /"schemaVersion":1/)
 
     // 🔴 陽性對照：假 binary 改成 denied（零輸出）⇒ exit 3、表格標「零輸出」
     const logs2 = []
@@ -340,7 +492,7 @@ describe('parseArgs', () => {
 })
 
 describe('lastStepIsToolError：agy 無頭第 4 坑（工具參數錯 ⇒ 整輪靜默結束）的判定', async () => {
-  const { lastStepIsToolError } = await import('./agy-write.mjs')
+  const { lastStepIsToolError } = await import('./write.mjs')
   test('最後一個工具步驟是參數錯 ⇒ true；最後一步正常 ⇒ false；permission 錯不算（那是 G3 的 denied）', () => {
     const argErr = { tool: 'grep_search', error: "invalid arguments:\n- at '/Includes': got string, want array" }
     assert.equal(lastStepIsToolError([{ tool: 'view_file', error: null }, argErr]), true)
