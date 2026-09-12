@@ -22,3 +22,6 @@ docs/arch.html
 # 是試驗的量尺，結算完就刪；進了版控就會變成第二份「審查紀錄」而沒有人維護。只忽略它自己的兩個路徑。
 /.local/archive-review/
 /.local/archive-review.jsonl
+
+# 多模型派工與票流程的產物與台帳（`.github/scripts/llm-team/`）。**不進版控** ——
+/.local/llm-team/

@@ -173,6 +173,10 @@ jobs:
       - name: Archive review tests
         run: bash .github/scripts/test-archive-review.sh
 
+      # 同上：寫手 wrapper 與票流程不是閘門，但它們的 fail-closed 判定是尺，尺要有測試。
+      - name: LLM team tests
+        run: bash .github/scripts/test-llm-team.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——
