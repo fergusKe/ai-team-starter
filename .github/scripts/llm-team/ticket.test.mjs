@@ -15,7 +15,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { CLEAN_GIT_ENV, buildSafeCommandRegex } from './lib.mjs'
 import { main as ticketMain } from './ticket.mjs'
-import { main as setupMain, SYNC_FILES } from './setup.mjs'
+import { main as setupMain } from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -963,9 +963,23 @@ describe('setup.mjs 設定對帳測試', () => {
     }
   }
 
+  const CONTRACT_SYNC_FILES = [
+    '.github/scripts/llm-team/lib.mjs',
+    '.github/scripts/llm-team/write.mjs',
+    '.github/scripts/llm-team/council.mjs',
+    '.github/scripts/llm-team/ticket.mjs',
+    '.github/scripts/llm-team/setup.mjs',
+    '.github/scripts/llm-team/llm-team.test.mjs',
+    '.github/scripts/llm-team/ticket.test.mjs',
+    '.github/scripts/test-llm-team.sh',
+    'prompts/07-ticket.md',
+    '.claude/skills/llm-team/SKILL.md',
+    '.github/scripts/llm-team/VERSION',
+  ]
+
   function makeDefaultSyncTree() {
     const files = {}
-    for (const f of SYNC_FILES) {
+    for (const f of CONTRACT_SYNC_FILES) {
       files[f] = f.endsWith('VERSION') ? '1\n' : `export default "${f}"\n`
     }
     return files
@@ -1014,6 +1028,29 @@ describe('setup.mjs 設定對帳測試', () => {
     assert.equal(code, 0, `兩邊完全一致時 exit 應為 0，實際為 ${code}`)
     assert.ok(outText.includes('漂移 0 檔'), `stdout 應包含「漂移 0 檔」，實際：\n${outText}`)
     assert.ok(!outText.includes('≠'), `stdout 不應包含「≠」，實際：\n${outText}`)
+
+    // 逐條斷言 stdout 含 = <path>（11 次）
+    for (const f of CONTRACT_SYNC_FILES) {
+      assert.ok(outText.includes(`= ${f}`), `stdout 應包含「= ${f}」，實際：\n${outText}`)
+    }
+
+    // 另加一條斷言：把 fixture 少放一條契約路徑 ⇒ exit 1 且輸出含 − <那條>（證明母體真的有 11 條、少一條就紅）
+    const missingContractPath = CONTRACT_SYNC_FILES[10] // .github/scripts/llm-team/VERSION
+    fs.unlinkSync(path.join(dirA, missingContractPath))
+    const missingOuts = []
+    console.log = (m) => missingOuts.push(String(m))
+    let missingCode
+    try {
+      missingCode = setupMain(['--sync-check', dirS], { repoRoot: dirA })
+    } finally {
+      console.log = origLog
+    }
+    const missingOutText = missingOuts.join('\n')
+    assert.equal(missingCode, 1, `fixture 少放契約路徑時 exit 應為 1，實際為 ${missingCode}`)
+    assert.ok(
+      missingOutText.includes(`− ${missingContractPath}`),
+      `stdout 應包含「− ${missingContractPath}」，實際：\n${missingOutText}`
+    )
   })
 
   test('T14 setup --sync-check 陽性對照：A 的 lib.mjs 多一字元 ⇒ exit 1、stdout 含 ≠ lib.mjs；只改 A 的 config.json ⇒ exit 0', () => {
@@ -1149,6 +1186,54 @@ describe('setup.mjs 設定對帳測試', () => {
         `檔案 ${relPath} 跑後內容應與跑前逐字相同，實際發現被修改`
       )
     }
+  })
+
+  test('T19 setup --sync-check：把 fixture 少放一條契約路徑 ⇒ exit 1 且 stdout 含「− <那條>」', () => {
+    const { dirA, dirS } = makeSyncPair()
+    const targetPath = CONTRACT_SYNC_FILES[10] // .github/scripts/llm-team/VERSION
+    fs.unlinkSync(path.join(dirA, targetPath))
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--sync-check', dirS], { repoRoot: dirA })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText = outs.join('\n')
+    assert.equal(code, 1, `fixture 少放契約路徑時 exit 應為 1，實際為 ${code}`)
+    assert.ok(
+      outText.includes(`− ${targetPath}`),
+      `stdout 應包含「− ${targetPath}」，實際：\n${outText}`
+    )
+  })
+
+  test('T20 setup --sync-check：兩邊都缺某檔 ⇒ 輸出含「? 」且 exit 1', () => {
+    const { dirA, dirS } = makeSyncPair()
+    const missingBoth = CONTRACT_SYNC_FILES[0] // .github/scripts/llm-team/lib.mjs
+    fs.unlinkSync(path.join(dirA, missingBoth))
+    fs.unlinkSync(path.join(dirS, missingBoth))
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--sync-check', dirS], { repoRoot: dirA })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText = outs.join('\n')
+    assert.equal(code, 1, `兩邊都缺某檔時 exit 應為 1，實際為 ${code}`)
+    assert.ok(outText.includes('? '), `stdout 應包含「? 」，實際：\n${outText}`)
+    assert.ok(
+      outText.includes(`? ${missingBoth}（兩邊皆無）`),
+      `stdout 應包含「? ${missingBoth}（兩邊皆無）」，實際：\n${outText}`
+    )
   })
 })
 

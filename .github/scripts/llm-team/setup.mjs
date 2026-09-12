@@ -48,9 +48,8 @@ export function syncCheck(repoRoot, starterArg, deps = {}) {
   }
 
   let driftCount = 0
-  const syncFiles = deps.syncFiles || SYNC_FILES
 
-  for (const relPath of syncFiles) {
+  for (const relPath of SYNC_FILES) {
     const localPath = path.join(repoRoot, relPath)
     const starterPath = path.join(starterRoot, relPath)
 
@@ -76,7 +75,7 @@ export function syncCheck(repoRoot, starterArg, deps = {}) {
       console.log(`+ ${relPath}（模板已無此檔）`)
     } else {
       driftCount++
-      console.log(`+ ${relPath}（模板已無此檔）`)
+      console.log(`? ${relPath}（兩邊皆無）`)
     }
   }
 

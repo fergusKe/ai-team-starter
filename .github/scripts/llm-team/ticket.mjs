@@ -132,6 +132,7 @@ export function main(argv, deps = {}) {
       return 2
     }
 
+    // 🔴 B4 閘（2026-09-13 事故：brief 的驗收指令 bash -n／node .github/… 不在 allow ⇒ 寫手最後一步被拒、整輪靜默中止、exit 0）。停止條件：agy 無頭把被拒改成非零 exit 或明確錯誤事件後，這道閘可降為警告。
     if (!isSafeCommandFn(a.test, config)) {
       console.error(
         `🔴 --test 不在寫手的 allow 內，寫手最後一步會被拒而整輪靜默中止：${a.test}`
