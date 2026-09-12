@@ -42,9 +42,9 @@ bash .github/scripts/archive-review.sh <change-id>
 ```
 
 它把凍結的規格、WBS 那一列、DECISIONS 裡提到它的段落、所有 slice 的 diff（含 commit 內文與 PR 說明）打成一包，
-平行送 codex 與 gemini（3–6 分鐘；**放背景跑**，回來看 `.local/archive-review/<id>/r1/`），結果只有三種標籤：
+平行送兩個不是寫它的模型（**放背景跑**；等待上限腳本會印，回來看 `.local/archive-review/<id>/r1/`），結果只有三種標籤：
 需修正／可接受風險／誤報候選。**不阻塞** —— 標「需修正」而且你重現得了的，在這個 session 修好、合併，
-再 `--rereview` 一次（只准一次）；每一條需修正判定後 `--judge`。
+再 `--rereview` 一次（只准一次）；每一條需修正判定後 `--judge`（誤報／已驗證／已修 —— 「已修」要回審過才收）。
 為什麼是這裡不是每個 PR、什麼時候升成阻塞、什麼時候整套拆掉：寫在那支腳本開頭與 `AGENTS.md`。
 
 ### 這個 change 的 Scenario 要到 archive 之後才會出現在缺口報告裡
