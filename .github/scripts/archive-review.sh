@@ -42,7 +42,7 @@ count() { grep -Ec "${TAG}\[$2\]" "$1" 2>/dev/null || true; }
 # 沒回答的記 ok=false，report 不算它。
 answered() { # answered <rc> <file> [round]
   [ "$1" = 0 ] || { echo false; return; }
-  if [ "${3:-1}" = 2 ]; then grep -Eq "已修|未修|改壞了" "$2" && echo true || echo false
+  if [ "${3:-1}" = 2 ]; then grep -Eq "^[[:space:]]*[0-9]+[.)][[:space:]]*(已修|未修|改壞了)" "$2" && echo true || echo false
   else grep -q "^結論[：:]" "$2" && echo true || echo false; fi
 }
 # 沒有 coreutils timeout（macOS）：自己盯。超過 ARCHIVE_REVIEW_TIMEOUT（預設 1500 秒）就殺，不要讓 wait 等到天亮。
@@ -100,8 +100,12 @@ if [ "${1:-}" = "--judge" ]; then
   [ $# -ge 4 ] || { echo "用法：--judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]" >&2; exit 2; }
   case "$2" in codex|gemini) ;; *) echo "模型只能是 codex 或 gemini" >&2; exit 2;; esac
   case "$4" in 誤報|已驗證|已修) ;; *) echo "判定只能是 誤報、已驗證（重現了但還沒修）或 已修（重現了、修了、回審過）" >&2; exit 2;; esac
-  # 「已修」是升阻塞數的那個 —— 要有證據：那個模型的第二輪回答存在。沒回審過就只能標「已驗證」。
-  [ "$4" != 已修 ] || [ "$(answered 0 "$DIR/r2/$2.md" 2 2>/dev/null)" = true ] || { echo "✗ 要標「已修」先 --rereview，讓 $2 看過修正（$DIR/r2/$2.md 不存在或沒回答）" >&2; exit 2; }
+  # 「已修」是升阻塞數的那個 —— 要有證據：那個模型第二輪**對這一條**寫了「已修」。
+  # 第二輪 bundle 把上一輪的需修正逐條編號（codex 的在前、gemini 的在後），模型照編號答；這裡查對應那一號。
+  if [ "$4" = 已修 ]; then
+    G=$3; [ "$2" != gemini ] || G=$(( $(grep -Ec "${TAG}\[需修正\]" "$DIR/r1/codex.md" 2>/dev/null || echo 0) + $3 ))
+    grep -Eq "^[[:space:]]*${G}[.)][[:space:]]*已修" "$DIR/r2/$2.md" 2>/dev/null || { echo "✗ 要標「已修」，$2 的第二輪回答（$DIR/r2/$2.md）要有「${G}. 已修」這一行 —— 沒回審過、或它說未修，就只能標「已驗證」" >&2; exit 2; }
+  fi
   # 只能判真的存在的那一條，而且一條只判一次 —— 不然精確率是編出來的。
   N=$(grep -Ec "${TAG}\[需修正\]" "$DIR/r1/$2.md" 2>/dev/null || true)
   [ "$3" -ge 1 ] 2>/dev/null && [ "$3" -le "${N:-0}" ] || { echo "✗ $2 第一輪只有 ${N:-0} 條需修正，沒有第 $3 條" >&2; exit 2; }
@@ -110,8 +114,12 @@ if [ "${1:-}" = "--judge" ]; then
   echo "✓ 記下了：$ID $2 第 $3 條 → $4"; exit 0
 fi
 
-[ -d "openspec/changes/$ID" ] || { echo "✗ openspec/changes/$ID 不存在 —— 已經封存了？這支要在 /opsx:archive **之前**跑。" >&2; exit 2; }
 command -v gh >/dev/null || { echo "✗ 找不到 gh —— slice 清單從 PR 的分支名來，沒有它這一輪不算數" >&2; exit 2; }
+git fetch -q origin main
+MAIN="$(git rev-parse origin/main)"
+# 規格從 origin/main 讀，不從 working tree —— 凍結的是 main 上那份，working tree 可能正在改。
+SPEC_FILES="$(git ls-tree -r --name-only "$MAIN" -- "openspec/changes/$ID" | grep '\.md$' || true)"
+[ -n "$SPEC_FILES" ] || { echo "✗ origin/main 上沒有 openspec/changes/$ID —— 已經封存了？還是 spec PR 還沒合併？這支要在 /opsx:archive **之前**跑。" >&2; exit 2; }
 
 # 答過的不重送：一個模型的第一輪答案就是它在樣本裡的那一份。帳本說它答過、檔案卻不在 → 有人移走 r1 想重跑，拒絕。
 # 重跑只補沒回答的那個模型（CLI 不在、逾時），樣本順序以兩個都答齊的時間算，補跑不會插隊。
@@ -125,9 +133,12 @@ else
   for m in codex gemini; do ! in_ledger "$m" 1 || has_answer "$m" 1 || { echo "✗ 帳本說 $m 第一輪答過了，$DIR/r1/$m.md 卻不在 —— 不要移走 r1 重跑；答過的那份就是樣本。" >&2; exit 2; }; done
   ! { has_answer codex 1 && has_answer gemini 1; } || { echo "✗ 兩個模型第一輪都答過了（$DIR/r1）。要回審用 --rereview。" >&2; exit 2; }
 fi
-git fetch -q origin main
-MAIN="$(git rev-parse origin/main)"
-OUT="$DIR/r$ROUND"; mkdir -p "$OUT"; printf '%s\n' "$MAIN" > "$OUT/main.sha"
+OUT="$DIR/r$ROUND"; mkdir -p "$OUT"
+# 補跑沒回答的那個模型時，**沿用第一輪的 bundle 與 main.sha**：兩個模型要看同一份東西，不然不是同一個樣本。
+if [ "$ROUND" = 1 ] && [ -s "$OUT/bundle.md" ] && [ -s "$OUT/main.sha" ]; then
+  MAIN="$(cat "$OUT/main.sha")"; echo "沿用第一輪的 bundle（main $(git rev-parse --short "$MAIN")）：$OUT/bundle.md"
+else
+printf '%s\n' "$MAIN" > "$OUT/main.sha"
 
 # ── bundle ────────────────────────────────────────────────────────────────────────────────────────
 # WBS 的對應**跟 progress.sh --json 要**（AGENTS：不要自己再解析一次 docs/WBS.md）。對不到就明說 —— 那本身是 --check 違規。
@@ -149,18 +160,23 @@ ps.sort(key=lambda p:p["mergedAt"])
 print(json.dumps(ps, ensure_ascii=False))' "$ID")" || { echo "✗ 拿不到合併的 PR 清單（gh 沒登入？離線？）—— 這一輪不算數" >&2; exit 2; }
 # diff 從 PR 拿（`gh pr diff`），不是 merge commit 的 `git show` —— 只有 squash 合併時後者才等於整個 PR。
 # 排除 lockfile 與 archive 目錄（人不讀、佔 bundle）；圖片等二進位 diff 本來就只有一行。
-show_slice() { # show_slice <sha> <pr#> <body-file>
-  git merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null || { echo "（PR #$2 的 merge commit $1 不在 origin/main 上，略過）"; return 0; }
-  echo "### PR #$2 $(git log -1 --format=%s "$1" 2>/dev/null)"; echo
-  gh pr diff "$2" 2>/dev/null | python3 -c '
+# **任何一個 PR 的 diff 拿不到，整輪不算數**（exit 2，不寫帳本）—— 少了實作內容的 bundle 不能進樣本。
+fetch_diff() { # fetch_diff <pr#> → $OUT/pr-<n>.diff
+  gh pr diff "$1" 2>"$OUT/pr-$1.diff.err" | python3 -c '
 import sys,re
 skip=re.compile(r"^diff --git a/((.*/)?(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|go\.sum|Gemfile\.lock|composer\.lock)|openspec/changes/archive/.*) b/")
 out=[]; drop=False
 for line in sys.stdin:
     if line.startswith("diff --git "): drop = bool(skip.match(line)); out.append("（略過：%s）\n" % line.split(" b/")[-1].strip() if drop else "")
     if not drop: out.append(line)
-sys.stdout.write("".join(out))' || echo "（拿不到 PR #$2 的 diff）"
-  echo; echo "#### PR #$2 的說明"; cat "$3"
+sys.stdout.write("".join(out))' > "$OUT/pr-$1.diff" && [ -s "$OUT/pr-$1.diff" ] \
+    || { echo "✗ 拿不到 PR #$1 的 diff（$(tail -n 1 "$OUT/pr-$1.diff.err" 2>/dev/null)）—— 這一輪不算數" >&2; exit 2; }
+}
+show_slice() { # show_slice <sha> <pr#>
+  git merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null || { echo "（PR #$2 的 merge commit $1 不在 origin/main 上，略過）"; return 0; }
+  echo "### PR #$2 $(git log -1 --format=%s "$1" 2>/dev/null)"; echo
+  cat "$OUT/pr-$2.diff"
+  echo; echo "#### PR #$2 的說明"; cat "$OUT/pr-$2.body"
 }
 slices() { # slices <since-sha|""> ：印 sha<TAB>pr#，寫各 PR 的 body 到 $OUT/pr-<n>.body
   printf '%s' "$PRS" | python3 -c '
@@ -172,6 +188,9 @@ for p in json.load(sys.stdin):
     (out / ("pr-%d.body" % p["number"])).write_text(p.get("body") or "（沒有說明）", encoding="utf-8")
     print("%s\t%d" % (sha, p["number"]))' "$1" "$OUT"
 }
+SINCE=""; [ "$ROUND" = 1 ] || SINCE="$(cat "$DIR/r1/main.sha")"
+SLICES="$(slices "$SINCE")"
+while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; fetch_diff "$pr"; done <<< "$SLICES"
 {
   cat prompts/06-archive-review.md
   echo; echo "# Bundle：${ID}（WBS ${WBS:-對不上}）— main $(git rev-parse --short "$MAIN") — 第 $ROUND 輪"; echo
@@ -179,7 +198,8 @@ for p in json.load(sys.stdin):
     echo "## docs/WBS.md 上這一項（progress.sh --json）"; [ -n "$WBS_JSON" ] && printf '```json\n%s\n```\n' "$WBS_JSON" || echo "（WBS 上沒有任何項目指到 $ID —— 這本身就值得寫進發現）"
     echo; echo "## docs/DECISIONS.md 裡提到它的整節（已拒絕的方案）"
     python3 -c '
-import re,sys
+import re,sys,os
+if not os.path.exists("docs/DECISIONS.md"): print("（沒有 docs/DECISIONS.md）"); sys.exit(0)
 t=open("docs/DECISIONS.md",encoding="utf-8").read(); keys=[k for k in sys.argv[1:] if k]
 parts=re.split(r"(?m)^(## .+)$", t); hit=0
 for i in range(1,len(parts),2):
@@ -187,17 +207,19 @@ for i in range(1,len(parts),2):
     if any(k.lower() in sec.lower() for k in keys): print(sec.rstrip()); print(); hit+=1
 if not hit: print("（沒有）")' "$ID" "$WBS"
     echo; echo "## 凍結的規格（openspec/changes/$ID/）"
-    find "openspec/changes/$ID" -name '*.md' -type f | sort | while read -r f; do echo; echo "### $f"; echo; cat "$f"; done
+    while read -r f; do [ -n "$f" ] || continue; echo; echo "### $f"; echo; git show "$MAIN:$f"; done <<< "$SPEC_FILES"
     echo; echo "## 合併進 main 的 slice（分支名 feat/${ID}[--<slice>]、fix/${ID}[--<slice>] 的 PR，舊到新）"
-    n=0; while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; n=$((n+1)); echo; show_slice "$sha" "$pr" "$OUT/pr-$pr.body"; done < <(slices "")
+    n=0; while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; n=$((n+1)); echo; show_slice "$sha" "$pr"; done <<< "$SLICES"
     echo; echo "（共 $n 個 slice PR）"; [ "$n" -gt 0 ] || echo "**沒有任何 slice 合併進 main —— 沒東西可審；規格本身的問題標可接受風險。**"
   else
-    echo "## 上一輪標「需修正」的"; grep -Eh "${TAG}\[需修正\]" "$DIR/r1/codex.md" "$DIR/r1/gemini.md" 2>/dev/null || echo "（沒有 —— 那就不需要回審）"
+    echo "## 上一輪標「需修正」的（照這個編號逐條答：\`N. 已修／未修／改壞了別的\`）"
+    grep -Eh "${TAG}\[需修正\]" "$DIR/r1/codex.md" "$DIR/r1/gemini.md" 2>/dev/null | sed -E "s/${TAG}//" | awk '{ printf "%d. %s\n", NR, $0 }' | grep . || echo "（沒有 —— 那就不需要回審）"
     echo; echo "## 上一輪之後合併進 main 的修正"
-    n=0; while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; n=$((n+1)); echo; show_slice "$sha" "$pr" "$OUT/pr-$pr.body"; done < <(slices "$(cat "$DIR/r1/main.sha")")
+    n=0; while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; n=$((n+1)); echo; show_slice "$sha" "$pr"; done <<< "$SLICES"
     [ "$n" -gt 0 ] || echo "（上一輪之後沒有任何 ${ID} 的 PR 合併 —— 那就沒有東西可回審）"
   fi
 } > "$OUT/bundle.md"
+fi
 SIZE=$(wc -c < "$OUT/bundle.md" | tr -d " ")
 [ "$SIZE" -lt 700000 ] || { echo "✗ bundle ${SIZE} bytes，超過命令列能塞的量 —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
 echo "bundle：$OUT/bundle.md（$SIZE bytes）；等待上限 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒／模型，放背景跑"

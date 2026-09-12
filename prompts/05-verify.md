@@ -41,7 +41,7 @@ npm run lint && npm run typecheck && npm test && npm run build
 bash .github/scripts/archive-review.sh <change-id>
 ```
 
-它把凍結的規格、WBS 那一列、DECISIONS 裡提到它的段落、所有 slice 的 diff（含 commit 內文與 PR 說明）打成一包，
+它把 main 上凍結的規格、WBS 那一項、DECISIONS 裡提到它的整節、每個 slice PR 的 diff（排除 lockfile；拿不到就整輪不算）與 PR 說明打成一包，
 平行送兩個不是寫它的模型（**放背景跑**；等待上限腳本會印，回來看 `.local/archive-review/<id>/r1/`），結果只有三種標籤：
 需修正／可接受風險／誤報候選。**不阻塞** —— 標「需修正」而且你重現得了的，在這個 session 修好、合併，
 再 `--rereview` 一次（只准一次）；每一條需修正判定後 `--judge`（誤報／已驗證／已修 —— 「已修」要回審過才收）。
