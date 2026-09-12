@@ -25,6 +25,7 @@
 # （移走重跑、沒答完、結論跟明細對不上、判定套到別的發現上），**不防惡意竄改** —— 一個人合併的專案，
 # 竄改自己的試驗量尺沒有對手。升阻塞的決定仍由人看 --report 與檔案下，不是腳本自動升。
 set -euo pipefail
+[[ "${ARCHIVE_REVIEW_TIMEOUT:-1500}" =~ ^[1-9][0-9]*$ ]] || { echo "✗ ARCHIVE_REVIEW_TIMEOUT 要是正整數秒數，不是「${ARCHIVE_REVIEW_TIMEOUT}」" >&2; exit 2; }
 
 # ── 升阻塞的條件（唯一定義處；改這裡，report 會印出來） ──────────────────────────────────────────
 TRIAL_N=10          # 試驗樣本：最早的 N 個「兩個模型都回答了」的 change，之後的不算（樣本凍結，不能一直跑到成立為止）
@@ -51,16 +52,34 @@ answered() { # answered <rc> <file> [round]
   [ "$1" = 0 ] && [ -s "$2" ] || { echo false; return; }
   if [ "${3:-1}" = 2 ]; then
     local n; n=$(r2_expected); [ "$n" -gt 0 ] || { echo true; return; }
-    local i=1; while [ "$i" -le "$n" ]; do [ "$(grep -Ec "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)" "$2")" = 1 ] || { echo false; return; }; i=$((i+1)); done; echo true   # 每一號恰好一次：重複、矛盾都不算
+    # 每一號恰好一次（重複、矛盾都不算）；狀態詞後面要斷開（「已修但不確定」不是已修）；不准有 1..N 以外的編號行。
+    local i=1; while [ "$i" -le "$n" ]; do [ "$(grep -Ec "^[[:space:]]*${i}[.)][[:space:]]*(已修|未修|改壞了)([[:space:]—:：-]|$)" "$2")" = 1 ] || { echo false; return; }; i=$((i+1)); done
+    [ "$(grep -Ec "^[[:space:]]*[0-9]+[.)][[:space:]]*(已修|未修|改壞了)" "$2")" = "$n" ] || { echo false; return; }; echo true
   else
-    local c; c="$(grep -m1 "^結論[：:]" "$2" | grep -oE '[0-9]+' | tr '\n' ' ')"
-    [ "$c" = "$(count "$2" 需修正) $(count "$2" 可接受風險) $(count "$2" 誤報候選) " ] && echo true || echo false
+    # 結論行是最後一個非空行、格式固定、只能有一行；三個數字＝明細標籤數。
+    [ "$(grep -c "^結論[：:]" "$2")" = 1 ] || { echo false; return; }
+    local last; last="$(grep -v '^[[:space:]]*$' "$2" | tail -n 1)"
+    [[ "$last" =~ ^結論[：:]需修正\ ([0-9]+)\ 條／可接受風險\ ([0-9]+)\ 條／誤報候選\ ([0-9]+)\ 條[[:space:]]*$ ]] || { echo false; return; }
+    [ "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}" = "$(count "$2" 需修正) $(count "$2" 可接受風險) $(count "$2" 誤報候選)" ] && echo true || echo false
   fi
 }
 # 沒有 coreutils timeout（macOS）：自己盯。超過 ARCHIVE_REVIEW_TIMEOUT（預設 1500 秒）就殺，不要讓 wait 等到天亮。
-watch() { local pid=$1 t=0; while kill -0 "$pid" 2>/dev/null; do [ "$t" -ge "${ARCHIVE_REVIEW_TIMEOUT:-1500}" ] && { kill "$pid" 2>/dev/null; return 124; }; sleep 5; t=$((t+5)); done; wait "$pid"; }
+# 逾時要**殺整棵樹並收割**：只 kill 父行程，子行程會繼續寫回答檔，寫進的是下一次「沿用」會讀到的檔案。
+killtree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c"; done; kill "$1" 2>/dev/null || true; }
+watch() {
+  local pid=$1 t=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$t" -ge "${ARCHIVE_REVIEW_TIMEOUT:-1500}" ]; then
+      killtree "$pid"; sleep 2; kill -0 "$pid" 2>/dev/null && { pkill -KILL -P "$pid" 2>/dev/null || true; kill -KILL "$pid" 2>/dev/null || true; }
+      wait "$pid" 2>/dev/null || true; return 124
+    fi
+    sleep 5; t=$((t+5))
+  done
+  wait "$pid"
+}
 
 if [ "${1:-}" = "--report" ]; then
+  [ $# -eq 1 ] || { echo "✗ --report 不收其他參數" >&2; exit 2; }
   [ -s "$LEDGER" ] || { echo "帳本是空的（${LEDGER}）"; exit 0; }
   python3 - "$LEDGER" "$TRIAL_N" "$MIN_VERIFIED" "$MAX_FP" "$MAX_WAIT_P90" <<'ZZPY'
 import json, sys, math, re, os
@@ -73,14 +92,16 @@ def read(i, m, rnd):
     f = f".local/archive-review/{i}/r{rnd}/{m}.md"
     return open(f, encoding="utf-8").read() if os.path.isfile(f) else None
 def tags(txt): return {k: len(re.findall(TAG % k, txt)) for k in ("需修正", "可接受風險", "誤報候選")}
-def r1_ok(txt):   # 結論那一行的三個數字＝明細的標籤數
-    if txt is None: return False
-    m1 = re.search(r"(?m)^結論[：:].*$", txt)
-    return bool(m1) and [int(x) for x in re.findall(r"\d+", m1.group(0))] == list(tags(txt).values())
-def r2_lines(txt, n): return re.findall(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)" % n, txt)
+def r1_ok(txt):   # 結論行只有一行、是最後一個非空行、格式固定；三個數字＝明細的標籤數
+    if txt is None or len(re.findall(r"(?m)^結論[：:]", txt)) != 1: return False
+    last = [l for l in txt.splitlines() if l.strip()][-1:]
+    m1 = re.fullmatch(r"結論[：:]需修正 (\d+) 條／可接受風險 (\d+) 條／誤報候選 (\d+) 條\s*", last[0]) if last else None
+    return bool(m1) and [int(x) for x in m1.groups()] == list(tags(txt).values())
+def r2_lines(txt, n): return re.findall(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)(?=[\s—:：-]|$)" % n, txt)
 def r2_line(txt, n): m2 = r2_lines(txt, n); return m2[0] if len(m2) == 1 else None
-def r2_ok(txt, n):  # 1..n 每一號**恰好一次**：缺號、重複、矛盾都不算
-    return txt is not None and (n == 0 or all(len(r2_lines(txt, k)) == 1 for k in range(1, n + 1)))
+def r2_extra(txt, n): return len(re.findall(r"(?m)^\s*\d+[.)]\s*(?:已修|未修|改壞了)", txt)) != n
+def r2_ok(txt, n):  # 1..n 每一號**恰好一次**：缺號、重複、矛盾、多餘的編號都不算
+    return txt is not None and (n == 0 or (all(len(r2_lines(txt, k)) == 1 for k in range(1, n + 1)) and not r2_extra(txt, n)))
 rev = [r for r in rows if r.get("kind") == "review"]
 led = {}                                              # (id, round, model) → 最早 ok 的 row；之後的重跑不算
 for r in rev:
@@ -99,7 +120,7 @@ for i in cohort:
         if r1_ok(txt): r1.setdefault(i, {})[m] = (led[(i, 1, m)], tags(txt))
         else: broken.append(f"{i}/{m}")
 print(f"條件：最早 {N} 個雙模型樣本內 已修 ≥{MINV}、誤報率 ≤{MAXFP}%、等待 P90 ≤{MAXP90} 秒")
-print(f"雙模型樣本：{len(both)} 個（樣本取前 {N}：{', '.join(cohort) or '—'}）；只有一個模型回答、不算樣本的：{len(half)} 個（{', '.join(half) or '—'}）")
+print(f"雙模型樣本：{len(both)} 個（樣本取前 {N}：{', '.join(cohort) or '—'}）；兩個模型還沒都答完、不算樣本的：{len(half)} 個（{', '.join(half) or '—'}）")
 if not cohort: print("還沒有任何雙模型樣本"); sys.exit(0)
 if broken:
     print(f"樣本裡帳本說答過、檔案卻不在或不完整：{', '.join(broken)}")
@@ -111,8 +132,11 @@ for m in ("codex", "gemini"):
     tg = [r1[i][m][1] for i in cohort]; secs = sorted(r1[i][m][0]["seconds"] for i in cohort)
     print(f"{m}：需修正 {sum(x['需修正'] for x in tg)}／可接受風險 {sum(x['可接受風險'] for x in tg)}／誤報候選 {sum(x['誤報候選'] for x in tg)}；等待 P50 {secs[(len(secs)-1)//2]} 秒、P90 {p90(secs)} 秒")
 total_nf = sum(nf[i][m] for i in cohort for m in ("codex", "gemini"))
+VERDICTS = ("誤報", "已驗證", "已修")
+badrow = [r for r in rows if r.get("kind") == "judge" and (r.get("verdict") not in VERDICTS or not isinstance(r.get("finding"), int) or isinstance(r.get("finding"), bool))] \
+       + [r for r in rev if not isinstance(r.get("ok", True), bool)]
 judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in nf[r["id"]]
-        and 1 <= r["finding"] <= nf[r["id"]][r["model"]]]                   # 判到檔案上沒有的那一條，不算
+        and isinstance(r["finding"], int) and 1 <= r["finding"] <= nf[r["id"]][r["model"]] and r["verdict"] in VERDICTS]   # 判到檔案上沒有的那一條、不在列舉裡的判定，不算
 keys = [(j["id"], j["model"], j["finding"]) for j in judg]
 dup = sorted({f"{i}/{m}#{n}" for k in set(keys) if keys.count(k) > 1 for (i, m, n) in [k]})
 # 「已修」要回頭驗第二輪證據：那個模型第二輪有 ok row、1..N 全答、對應那一號寫的是「已修」。證據不成立就不能下結論。
@@ -133,9 +157,12 @@ fprate = (fp / len(judg) * 100) if judg else None
 print(f"需修正共 {total_nf} 條：已修 {ok}、已驗證但沒修 {ok_norere}、誤報 {fp}、**還沒判定 {pending}**"
       f"；誤報率 {'—' if fprate is None else f'{fprate:.0f}%'}；每個 change 的等待 P90 {w90} 秒")
 if bad_fixed: print(f"標了「已修」但第二輪證據不成立（沒有 ok 的第二輪、沒答完、或那一號不是已修）：{', '.join(bad_fixed)}")
-if dup: print(f"同一條被判了不只一次（帳本被手改過？）：{', '.join(dup)}")
+if badrow: print(f"帳本有 {len(badrow)} 筆欄位不合（verdict 不在列舉、finding 不是整數、ok 不是布林）—— 手改過？"); print("結論：不能下結論：帳本欄位不合"); sys.exit(0)
+if dup:
+    print(f"同一條被判了不只一次（帳本被手改過？）：{', '.join(dup)}")
+    print(f"結論：不能下結論：{len(dup)} 條被判了不只一次（統計不做，數字會失真）"); sys.exit(0)
 if len(cohort) < N:            verdict = f"樣本還沒滿（{len(cohort)}/{N}）"
-elif dup:                      verdict = f"不能下結論：{len(dup)} 條被判了不只一次"
+
 elif pending > 0:              verdict = f"不能下結論：還有 {pending} 條需修正沒判定（--judge）"
 elif bad_fixed:                verdict = f"不能下結論：{len(bad_fixed)} 條「已修」的第二輪證據不成立"
 elif ok >= MINV and fprate is not None and fprate <= MAXFP and w90 <= MAXP90: verdict = "**條件全部成立，可以討論升阻塞**"
@@ -146,6 +173,13 @@ ZZPY
 fi
 
 ID="${1:?用法見檔頭}"; shift
+# 模式是封閉列舉：<id>、<id> --rereview、<id> --judge …。打錯字（--rereveiw）不能悄悄變成第一輪。
+case "${1:-}" in
+  "") ;;
+  --rereview) [ $# -eq 1 ] || { echo "✗ --rereview 不收其他參數" >&2; exit 2; } ;;
+  --judge) ;;
+  *) echo "✗ 不認得「$1」。用法見檔頭：<id>、<id> --rereview、<id> --judge <codex|gemini> <N> <誤報|已驗證|已修> [備註]、--report" >&2; exit 2 ;;
+esac
 # 「答過」＝那一輪帳本有 ok 的 row **而且** 檔案有照格式回答。只看檔案不行：CLI 非零／逾時可能留下格式完整的半成品；
 # 只看帳本不行：帳本說答過、檔案卻被移走，那是有人想重跑。兩者不一致 → 拒絕，不猜。
 file_ok()    { [ "$(answered 0 ".local/archive-review/$ID/r$2/$1.md" "$2" 2>/dev/null)" = true ]; }
@@ -200,6 +234,9 @@ if has_answer codex "$ROUND" && has_answer gemini "$ROUND"; then
   exit 2
 fi
 OUT="$DIR/r$ROUND"; mkdir -p "$OUT"
+# 同一個 change 同一輪只能有一個在跑：兩個一起跑會互相蓋回答檔、各寫一次帳本。mkdir 是原子的。
+mkdir "$OUT/.lock" 2>/dev/null || { echo "✗ $OUT/.lock 存在 —— 同一輪已經在跑（或上次沒正常結束：確認沒有在跑的 codex／agy 之後 rmdir 它）" >&2; exit 2; }
+trap 'rmdir "$OUT/.lock" 2>/dev/null' EXIT
 # 補跑沒回答的那個模型時，**沿用這一輪已經組好的 bundle 與 main.sha**：兩個模型要看同一份東西，不然不是同一個樣本。
 if [ -s "$OUT/bundle.md" ] && [ -s "$OUT/main.sha" ]; then
   MAIN="$(cat "$OUT/main.sha")"; echo "沿用第 $ROUND 輪已組好的 bundle（main $(git rev-parse --short "$MAIN")）：$OUT/bundle.md"
@@ -241,7 +278,7 @@ sys.stdout.write("".join(out))' > "$OUT/pr-$1.diff" && [ -s "$OUT/pr-$1.diff" ] 
     || { echo "✗ 拿不到 PR #$1 的 diff（$(tail -n 1 "$OUT/pr-$1.diff.err" 2>/dev/null)）—— 這一輪不算數" >&2; exit 2; }
 }
 show_slice() { # show_slice <sha> <pr#>
-  git merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null || { echo "（PR #$2 的 merge commit $1 不在 origin/main 上，略過）"; return 0; }
+  git merge-base --is-ancestor "$1" "$MAIN" 2>/dev/null || { echo "✗ PR #$2 的 merge commit $1 不在這一輪釘住的 main（${MAIN}）上 —— fetch 與 pr list 之間有人合併了？重跑一次。這一輪不算數" >&2; exit 2; }
   echo "### PR #$2 $(git log -1 --format=%s "$1" 2>/dev/null)"; echo
   cat "$OUT/pr-$2.diff"
   echo; echo "#### PR #$2 的說明"; cat "$OUT/pr-$2.body"
@@ -289,9 +326,9 @@ if not hit: print("（沒有）")' "$ID" "$WBS"
 } > "$OUT/bundle.md.tmp" && mv "$OUT/bundle.md.tmp" "$OUT/bundle.md"
 fi
 SIZE=$(wc -c < "$OUT/bundle.md" | tr -d " ")
-# 上限 250 KB：gemini 的 prompt（bundle＋第二輪時再加上一輪回答）要走命令列參數（agy 不吃 stdin），
-# Linux 單一參數上限 128 KB、macOS 整條命令列 1 MB；codex 走 stdin 沒這問題。超過就是 change 太大，人工拆開審。
-[ "$SIZE" -lt 250000 ] || { echo "✗ bundle ${SIZE} bytes，超過 250 KB —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
+# 上限 110 KB：gemini 的 prompt（bundle＋第二輪時再加上一輪回答）要走命令列參數（agy 不吃 stdin），
+# Linux 單一參數上限 128 KiB；codex 走 stdin 沒這問題。超過就是 change 太大，人工拆開審 —— 送出前擋，不要送到一半炸。
+[ "$SIZE" -lt 110000 ] || { echo "✗ bundle ${SIZE} bytes，超過 110 KB —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
 echo "bundle：$OUT/bundle.md（$SIZE bytes）；等待上限 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒／模型，放背景跑"
 
 # ── 平行送出 ──────────────────────────────────────────────────────────────────────────────────────
@@ -316,7 +353,8 @@ run_gemini() {
   ! has_answer gemini "$ROUND" || { echo "（gemini 第 $ROUND 輪已經答過，不重送）"; return; }
   command -v "$GEMINI_BIN" >/dev/null || { echo "（跳過 gemini：找不到 ${GEMINI_BIN}）" | tee "$OUT/gemini.md"; row gemini "$t0" 127; return; }
   { [ "$ROUND" = 2 ] && { echo "## 你上一輪的回答"; cat "$DIR/r1/gemini.md"; echo; }; cat "$OUT/bundle.md"; } > "$OUT/gemini.prompt.md"
-  [ "$(wc -c < "$OUT/gemini.prompt.md" | tr -d ' ')" -lt 300000 ] || { echo "（跳過 gemini：prompt 超過 300 KB，命令列塞不下）" | tee "$OUT/gemini.md"; row gemini "$t0" 7; return; }
+  # agy 不吃 stdin，prompt 只能走命令列參數：Linux 單一參數上限 128 KiB，取 120 000 bytes；超過就明說跳過、記帳本（這個 change 進不了雙模型樣本）。
+  [ "$(wc -c < "$OUT/gemini.prompt.md" | tr -d ' ')" -lt 120000 ] || { echo "（跳過 gemini：prompt 超過 120 KB，命令列參數塞不下 —— change 太大，人工拆開審）" | tee "$OUT/gemini.md"; row gemini "$t0" 7; return; }
   "$GEMINI_BIN" --print "$(cat "$OUT/gemini.prompt.md")" --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m > "$OUT/gemini.md" 2> "$OUT/gemini.err" &
   local rc=0; watch $! || rc=$?
   row gemini "$t0" "$rc"

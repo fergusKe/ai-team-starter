@@ -33,10 +33,10 @@ git add -A && git commit -qm "spec" && git remote add origin "$W/repo"
 cat > "$W/bin/gh" <<'GHEOF'
 #!/bin/bash
 case "$1 $2" in
-  "pr list") sha=$(git rev-parse HEAD)
+  "pr list") sha=$(git rev-parse HEAD); [ "$(cat "$GH_MODE")" = offmain ] && sha=0000000000000000000000000000000000000000
     if [ "$(cat "$GH_MODE")" = many ]; then python3 -c 'import json;print(json.dumps([{"number":n,"headRefName":"feat/other","mergeCommit":{"oid":"0"*40},"mergedAt":"2026-01-01T00:00:00Z","body":""} for n in range(1000)]))'
     else printf '[{"number":7,"headRefName":"%s","mergeCommit":{"oid":"%s"},"mergedAt":"2026-01-01T00:00:00Z","body":"PR 說明"}]\n' "$GH_BRANCH" "$sha"; fi ;;
-  "pr diff") [ "$(cat "$GH_MODE")" = ok ] && printf 'diff --git a/x.ts b/x.ts\n+1\n' || { echo boom >&2; exit 1; } ;;
+  "pr diff") { [ "$(cat "$GH_MODE")" = ok ] || [ "$(cat "$GH_MODE")" = offmain ]; } && printf 'diff --git a/x.ts b/x.ts\n+1\n' || { echo boom >&2; exit 1; } ;;
   *) exit 0 ;;
 esac
 GHEOF
@@ -72,6 +72,10 @@ expect_rc 2 "change id 大寫被擋"                  $AR 'APP-C01-x'
 expect_rc 2 "--judge 模型名不在兩個之內被擋"       $AR app-c01-x --judge claude 1 誤報
 expect_rc 2 "--judge 判定不在三種之內被擋"         $AR app-c01-x --judge codex 1 可能
 expect_rc 2 "--judge 第幾條寫「0」被擋"                 $AR app-c01-x --judge codex 0 誤報
+expect_grep "不認得「--rereveiw」" "打錯的模式（--rereveiw）不能悄悄變第一輪"   $AR app-c01-x --rereveiw
+expect_rc 2 "--rereview 帶多餘參數被擋"                  $AR app-c01-x --rereview foo
+expect_rc 2 "--report 帶多餘參數被擋"                    $AR --report foo
+out="$(ARCHIVE_REVIEW_TIMEOUT=abc $AR --report 2>&1)"; echo "$out" | grep -q "正整數秒數" && ok "ARCHIVE_REVIEW_TIMEOUT 不是正整數被擋" || bad "ARCHIVE_REVIEW_TIMEOUT 不是正整數被擋"
 
 echo "── archive-review：--report 的樣本 ──"
 : > "$L"
@@ -92,6 +96,10 @@ r1md app-c9-x codex 0
 mkdir -p openspec/changes/app-c8-x; echo "# p" > openspec/changes/app-c8-x/proposal.md; git add -A && git commit -qm spec8
 printf '[需修正] x\n結論：需修正 2 條／可接受風險 0 條／誤報候選 0 條\n' > .local/archive-review/app-c8-x/r1/codex.md
 expect_grep "不在或不完整" "第一輪結論數字跟明細對不上 → has_answer 不算、拒絕" $AR app-c8-x
+printf '[需修正] x\n結論：需修正 1 條／可接受風險 0 條／誤報候選 0 條\n補充：其實還有一條\n' > .local/archive-review/app-c8-x/r1/codex.md
+expect_grep "不在或不完整" "結論不是最後一行 → 不算完整" $AR app-c8-x
+printf '[需修正] x\n結論：1 需修正、0 可接受、0 誤報\n' > .local/archive-review/app-c8-x/r1/codex.md
+expect_grep "不在或不完整" "結論格式不固定 → 不算完整" $AR app-c8-x
 r1md app-c8-x codex 0
 expect_grep "不能下結論" "需修正沒判定 → 不下結論" report
 # 補跑：app-half-x 的 gemini 後來答了 → 它排到最後，不插隊
@@ -130,6 +138,10 @@ cp .local/archive-review/app-c2-x/r2/codex.md "$W/c2-codex-r2.bak"; printf '1. �
 expect_rc 2 "--judge 第二輪只答了 1、2 號（三條要答完）→ 不算數、不能標已修" $AR app-c2-x --judge codex 2 已修
 printf '2. 已修\n1. 已修\n2. 未修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
 expect_rc 2 "--judge 第二輪同一號出現兩次（矛盾）→ 不算數、不能標已修" $AR app-c2-x --judge codex 2 已修
+printf '1. 已修\n2. 已修\n3. 已修\n4. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+expect_rc 2 "--judge 第二輪多了第 4 號（只有 3 條）→ 不算數" $AR app-c2-x --judge codex 2 已修
+printf '1. 已修\n2. 已修但其實不確定\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+expect_rc 2 "--judge 「已修但其實不確定」不是已修" $AR app-c2-x --judge codex 2 已修
 cp "$W/c2-codex-r2.bak" .local/archive-review/app-c2-x/r2/codex.md
 expect_rc 2 "--judge 第二輪說「未修」的不能標「已修」"           $AR app-c2-x --judge codex 1 已修
 expect_rc 0 "--judge 第二輪說「已修」的可以標「已修」"           $AR app-c2-x --judge codex 2 已修
@@ -187,6 +199,15 @@ for r in rows:
 p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in out)+"\n")
 ZZPY
 expect_grep "條件全部成立" "去掉重複那筆 → 成立" report
+judge app-c2-x codex 1 大概吧
+expect_grep "帳本欄位不合" "未知的判定值（手改）→ 不能下結論" report
+python3 - <<'ZZPY'
+import json,pathlib
+p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+rows=[r for r in rows if r.get("verdict")!="大概吧"]
+p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
+ZZPY
+expect_grep "條件全部成立" "去掉那筆 → 成立" report
 # 第一輪檔案內部一致、但數量跟帳本不同 → report 用檔案的數字（多出一條沒判定 → 不能下結論）
 r1md app-c5-x codex 1
 expect_grep "還沒判定 1" "第一輪檔案的數量才算數，不是帳本的" report
@@ -220,8 +241,13 @@ mkdir -p openspec/changes/app-c3-x; echo "# p" > openspec/changes/app-c3-x/propo
 export GH_BRANCH="feat/app-c3-x--a"
 echo many > "$GH_MODE"
 expect_grep "可能被截斷" "gh pr list 剛好 1000 筆 → 清單可能截斷 → 整輪不算數" $AR app-c3-x
+echo offmain > "$GH_MODE"
+expect_grep "不在這一輪釘住的 main" "slice 的 merge commit 不在釘住的 main 上 → 整輪不算數" $AR app-c3-x
 echo fail > "$GH_MODE"
 expect_grep "拿不到 PR #7 的 diff" "PR diff 拿不到 → 整輪不算數" $AR app-c3-x
+mkdir -p .local/archive-review/app-c3-x/r1/.lock
+expect_grep "同一輪已經在跑" "lock 在 → 拒絕同時跑第二個" $AR app-c3-x
+rmdir .local/archive-review/app-c3-x/r1/.lock
 [ ! -s "$L" ] && ok "diff 拿不到 → 沒寫帳本" || bad "diff 拿不到 → 沒寫帳本"
 echo ok > "$GH_MODE"
 expect_grep "跳過 codex" "diff 拿得到 → 走到送出（模型不在就明說跳過）" $AR app-c3-x
