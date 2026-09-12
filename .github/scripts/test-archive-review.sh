@@ -17,7 +17,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$ROOT/.github/scripts/archive-review.sh"
 W="$(mktemp -d "${TMPDIR:-/tmp}/archive-review-test.XXXXXXXX")"
-trap 'touch "$W/orphan-go"; rm -rf "$W"' EXIT   # 孤兒測試的子行程等這個檔才退，測試中途死掉也不留行程
+trap 'touch "$W/orphan-go" "$W/orphan-go2"; rm -rf "$W"' EXIT   # 孤兒測試的子行程等這個檔才退，測試中途死掉也不留行程
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; return 0; }
@@ -304,6 +304,20 @@ grep -q '"model": "gemini".*"ok": true' "$L" && ok "gemini 帳本 ok" || bad "ge
 touch "$ORPHAN_GO"; sleep 3
 grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.md && bad "逾時的孤兒寫進了發布的回答檔" || ok "逾時的孤兒寫不進發布的回答檔"
 grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.timeout.md && ok "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）" || bad "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）"
+# 第 21 輪：CLI **正常退出（rc=0）**但留下還握著 stdout 的子行程 —— 發布必須換 inode（cp），不然孤兒之後照樣寫進發布檔
+cat > "$W/bin/codex-leaky" <<'ZZ'
+#!/bin/bash
+cat > /dev/null; echo "結論：需修正 0 條／可接受風險 0 條／誤報候選 0 條"
+( trap '' TERM; while [ ! -f "$ORPHAN_GO2" ]; do sleep 1; done; echo "結論：需修正 8 條／可接受風險 0 條／誤報候選 0 條" ) &
+exit 0
+ZZ
+chmod +x "$W/bin/codex-leaky"
+mkdir -p openspec/changes/app-c7-x; echo "# p" > openspec/changes/app-c7-x/proposal.md; git add -A && git commit -qm spec7
+export GH_BRANCH="feat/app-c7-x--a" ORPHAN_GO2="$W/orphan-go2"
+expect_grep "需修正 0 條" "rc=0 但留孤兒 → 發布的是退出當下的回答" bash -c "ARCHIVE_REVIEW_CODEX_BIN=$W/bin/codex-leaky $AR app-c7-x >/dev/null 2>&1; cat .local/archive-review/app-c7-x/r1/codex.md"
+touch "$ORPHAN_GO2"; sleep 3
+grep -q "需修正 8 條" .local/archive-review/app-c7-x/r1/codex.md && bad "rc=0 留下的孤兒寫進了發布檔（mv 沒換 inode）" || ok "rc=0 留下的孤兒寫不進發布檔（cp 換了 inode）"
+ls .local/archive-review/app-c7-x/r1/ | grep -Eq "^codex\.[A-Za-z0-9]{6}$" && bad "成功發布後暫存檔要刪掉" || ok "成功發布後暫存檔刪掉了"
 
 echo
 echo "通過 $PASS / 失敗 $FAIL / 共 $((PASS+FAIL))"

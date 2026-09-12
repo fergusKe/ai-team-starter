@@ -77,12 +77,13 @@ watch() {
   done
   wait "$pid"
 }
-# 回答先寫進**這一次獨有**的暫存檔，跑完才搬成 <model>.md。殺樹殺不乾淨的孤兒（父先退、後代忽略 TERM 被 reparent）
-# 握著的是暫存檔的 fd，寫不進下一次「沿用」會讀的那份；逾時那份改名留著看，永遠不發布。
+# 回答先寫進**這一次獨有**的暫存檔，跑完才**複製**成 <model>.md —— cp 是新 inode，mv 不是：CLI 正常退出（rc=0）
+# 卻留下還握著 stdout 的子行程時，mv 發布的就是它握的那個檔（第 21 輪）。殺樹殺不乾淨的孤兒同理，握的是暫存檔，
+# 寫不進發布的那份；逾時那份改名留著看，永遠不發布。
 finish() { # finish <model> <rc> <tmp>
   if [ "$2" = 124 ]; then
     mv "$3" "$OUT/$1.timeout.md"; echo "（逾時 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒，殺掉了；殘餘輸出在 $OUT/$1.timeout.md，不算回答）" > "$OUT/$1.md"
-  else mv "$3" "$OUT/$1.md"; fi
+  else cp "$3" "$OUT/$1.md" && rm -f "$3"; fi
 }
 
 if [ "${1:-}" = "--report" ]; then
