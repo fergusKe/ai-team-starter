@@ -168,6 +168,8 @@ npx openspec validate --all --strict
 /opsx:propose             產生 proposal → specs → design → tasks，產完就停
         ↓
    spec/<change-id>       規格 PR。這時還沒有任何 code
+                          （prompts/02-to-spec.md：propose 在 main 上跑，產完才
+                           git switch -c spec/<change-id>，還沒 add 的 artifact 會跟著過去）
         ↓
    規格審查                prompts/03-spec-review.md
         ↓

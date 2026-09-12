@@ -48,7 +48,7 @@ Claude Code 進入此 Repository 後：
 | 寫實作（規格已在 main 上） | `feat/<change-id>--<slice>` |
 | 沒有規格的小改（有大小上界，不得碰 `openspec/` 與 `.github/`） | `chore/<描述>` |
 | 把 delta 同步進 `openspec/specs/` | `archive/<change-id>` |
-| 改 CI、CODEOWNERS、AGENTS.md、config.yaml | `governance/<描述>` |
+| 改 CI、CODEOWNERS、AGENTS.md、config.yaml、`docs/WBS.md` | `governance/<描述>` |
 
 **本機沒有任何 hook。** CI 擋得住的東西寫在 `AGENTS.md` 的
 〈這些閘門各自保護什麼、不保護什麼〉——**先讀那一節**。

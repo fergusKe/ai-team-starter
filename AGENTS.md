@@ -27,17 +27,17 @@ Repository 內其他文件與本檔衝突時，以本檔為準。
 
 ```bash
 git branch --show-current                  # 你在哪個 change 上
-openspec list                              # 有哪些 change
-openspec status --change <name>
+npx openspec list                          # 有哪些 change
+npx openspec status --change <name>        # 已經在某個 change 上才跑；<name> 是上一行列出的其中一個
 bash .github/scripts/progress.sh           # 做到哪裡；剛複製的話還會列出待辦
 ```
 
 **最後一個在新專案裡特別重要。** 剛從模板複製的 repo，它會印出還沒設定
 的東西（沒有 `docs/WBS.md`、沒有〈阻塞類型〉表、`package.json` 的 script
-還是佔位⋯⋯）。**先把那份清單清掉再開始寫東西** —— 那些設定沒做，
-後面的閘門有一半是空轉的。
+還是佔位⋯⋯）。**先把那份清單清掉再開第一個 change** —— 那些設定沒做，
+後面的閘門有一半是空轉的。清單裡「沒有 `docs/WBS.md`」那一項，就是靠下一段的 `00` 清掉的。
 
-**新專案的第一步是 `prompts/00-map.md`，不是 `01`。** 先問全貌、攤成 `docs/WBS.md`、
+**新專案的第一步是 `prompts/00-map.md`，不是 `prompts/01-discovery.md`。** 先問全貌、攤成 `docs/WBS.md`、
 走 `governance/` PR 進 main，**然後**才開第一個 change。地圖是交付意圖（做什麼、
 什麼順序、誰擋著誰），不是架構圖（不寫系統怎麼切）。從一個功能開始、每個功能
 各自規劃，最後串不起來 —— 那是這個模板要防的第一件事。
@@ -62,21 +62,31 @@ bash .github/scripts/progress.sh           # 做到哪裡；剛複製的話還�
 **一個 change 有兩個 phase，每個 phase 是自己的分支與 PR。**
 
 ```
-/opsx:explore（可跳過）
-      ↓
-/opsx:propose             產生 artifacts 後停下來
-      ↓
-spec/<change-id>          規格 PR。這時還沒有任何 code
-      ↓
-在 PR 上談定 → 合併        規格進 main，被凍住
-      ↓
-/opsx:apply               才開始實作
-      ↓
-feat/<change-id>--<slice> 實作 PR。可以有很多個
-      ↓
-CI 綠 → review → 合併
-      ↓
-archive/<change-id>       delta 同步進 openspec/specs/
+   整張地圖               prompts/00-map.md（每個專案一次）→ docs/WBS.md 進 main
+        ↓
+   一個工作項目的探索      prompts/01-discovery.md（先在地圖上找到它）
+        ↓
+/opsx:propose             產生 proposal → specs → design → tasks，產完就停
+        ↓
+   spec/<change-id>       規格 PR。這時還沒有任何 code
+                          （prompts/02-to-spec.md：propose 在 main 上跑，產完才
+                           git switch -c spec/<change-id>，還沒 add 的 artifact 會跟著過去）
+        ↓
+   規格審查                prompts/03-spec-review.md
+        ↓
+   合併                    規格進 main，被凍住
+        ↓
+/opsx:apply               談定之後才實作
+        ↓
+   feat/<id>--<slice>     實作 PR，可以有很多個
+        ↓
+   驗證                    prompts/05-verify.md
+        ↓
+   CI 綠 + review → 合併
+        ↓
+   影子審查                prompts/06-archive-review.md（第二、第三個模型看整個 change；不阻塞）
+        ↓
+   archive/<change-id>    delta 同步進 openspec/specs/
 ```
 
 **為什麼規格要單獨合併，而不是同一個分支從頭走到尾**：規格留在同一個分支上，
