@@ -15,7 +15,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { CLEAN_GIT_ENV, buildSafeCommandRegex } from './lib.mjs'
 import { main as ticketMain } from './ticket.mjs'
-import { main as setupMain } from './setup.mjs'
+import { main as setupMain, SYNC_FILES } from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -866,4 +866,201 @@ describe('setup.mjs 設定對帳測試', () => {
     assert.ok(!badOutText.includes('SHOULD-NOT-PRINT-T12'), 'stdout 絕對不應包含 token')
     assert.ok(!badErrText.includes('SHOULD-NOT-PRINT-T12'), 'stderr 絕對不應包含 token')
   })
+
+  function populateTree(baseDir, files = {}) {
+    for (const [relPath, content] of Object.entries(files)) {
+      const full = path.join(baseDir, relPath)
+      fs.mkdirSync(path.dirname(full), { recursive: true })
+      fs.writeFileSync(full, content)
+    }
+  }
+
+  function makeDefaultSyncTree() {
+    const files = {}
+    for (const f of SYNC_FILES) {
+      files[f] = f.endsWith('VERSION') ? '1\n' : `export default "${f}"\n`
+    }
+    return files
+  }
+
+  function makeSyncPair() {
+    const dirA = tmpdir('sync-a-')
+    const dirS = tmpdir('sync-s-')
+    const defaultFiles = makeDefaultSyncTree()
+    populateTree(dirA, defaultFiles)
+    populateTree(dirS, defaultFiles)
+    return { dirA, dirS, defaultFiles }
+  }
+
+  function snapshotDir(dir) {
+    const files = new Map()
+    function walk(current) {
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const full = path.join(current, entry.name)
+        if (entry.isDirectory()) {
+          walk(full)
+        } else if (entry.isFile()) {
+          const rel = path.relative(dir, full)
+          files.set(rel, fs.readFileSync(full))
+        }
+      }
+    }
+    walk(dir)
+    return files
+  }
+
+  test('T13 setup --sync-check：母體每個相對路徑兩邊相同、各有 VERSION 1 ⇒ exit 0、stdout 含「漂移 0 檔」、不含「≠」', () => {
+    const { dirA, dirS } = makeSyncPair()
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--sync-check', dirS], { repoRoot: dirA })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText = outs.join('\n')
+    assert.equal(code, 0, `兩邊完全一致時 exit 應為 0，實際為 ${code}`)
+    assert.ok(outText.includes('漂移 0 檔'), `stdout 應包含「漂移 0 檔」，實際：\n${outText}`)
+    assert.ok(!outText.includes('≠'), `stdout 不應包含「≠」，實際：\n${outText}`)
+  })
+
+  test('T14 setup --sync-check 陽性對照：A 的 lib.mjs 多一字元 ⇒ exit 1、stdout 含 ≠ lib.mjs；只改 A 的 config.json ⇒ exit 0', () => {
+    // 1. A 的 lib.mjs 多一個字元 ⇒ exit 1、stdout 含 ≠ .github/scripts/llm-team/lib.mjs
+    const { dirA: dirA1, dirS: dirS1 } = makeSyncPair()
+    const libPathA = path.join(dirA1, '.github/scripts/llm-team/lib.mjs')
+    fs.appendFileSync(libPathA, '!')
+
+    const outs1 = []
+    const origLog = console.log
+    console.log = (m) => outs1.push(String(m))
+    let code1
+    try {
+      code1 = setupMain(['--sync-check', dirS1], { repoRoot: dirA1 })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText1 = outs1.join('\n')
+    assert.equal(code1, 1, `母體檔案有漂移時 exit 應為 1，實際為 ${code1}`)
+    assert.ok(
+      outText1.includes('≠ .github/scripts/llm-team/lib.mjs'),
+      `stdout 應包含「≠ .github/scripts/llm-team/lib.mjs」，實際：\n${outText1}`
+    )
+    assert.ok(outText1.includes('漂移 1 檔'), `stdout 應包含「漂移 1 檔」，實際：\n${outText1}`)
+
+    // 2. 另一組只改 A 的 .github/scripts/llm-team/config.json ⇒ exit 0（config 不在母體）
+    const { dirA: dirA2, dirS: dirS2 } = makeSyncPair()
+    const configPathA = path.join(dirA2, '.github/scripts/llm-team/config.json')
+    fs.writeFileSync(configPathA, JSON.stringify({ customSettings: true }, null, 2))
+
+    const outs2 = []
+    console.log = (m) => outs2.push(String(m))
+    let code2
+    try {
+      code2 = setupMain(['--sync-check', dirS2], { repoRoot: dirA2 })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText2 = outs2.join('\n')
+    assert.equal(code2, 0, `只改 config.json 時 exit 應為 0，實際為 ${code2}`)
+    assert.ok(outText2.includes('漂移 0 檔'), `stdout 應包含「漂移 0 檔」，實際：\n${outText2}`)
+    assert.ok(!outText2.includes('config.json'), `stdout 不應包含 config.json，實際：\n${outText2}`)
+    assert.ok(!outText2.includes('≠'), `stdout 不應包含「≠」，實際：\n${outText2}`)
+  })
+
+  test('T15 setup --sync-check：S 沒有 VERSION ⇒ exit 2；A 少一個母體檔 ⇒ exit 1 且 stdout 含「− 」', () => {
+    // 1. S 沒有 VERSION ⇒ exit 2
+    const { dirA: dirA1, dirS: dirS1 } = makeSyncPair()
+    const versionPathS = path.join(dirS1, '.github/scripts/llm-team/VERSION')
+    fs.unlinkSync(versionPathS)
+
+    const errs1 = []
+    const origErr = console.error
+    console.error = (m) => errs1.push(String(m))
+    let code1
+    try {
+      code1 = setupMain(['--sync-check', dirS1], { repoRoot: dirA1 })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code1, 2, `S 沒有 VERSION 時 exit 應為 2，實際為 ${code1}`)
+    const errText1 = errs1.join('\n')
+    assert.ok(
+      errText1.includes('VERSION'),
+      `stderr 應提到缺少 VERSION，實際：\n${errText1}`
+    )
+
+    // 2. A 少一個母體檔 ⇒ exit 1 且 stdout 含「− 」
+    const { dirA: dirA2, dirS: dirS2 } = makeSyncPair()
+    const missingFileA = path.join(dirA2, '.github/scripts/llm-team/lib.mjs')
+    fs.unlinkSync(missingFileA)
+
+    const outs2 = []
+    const origLog = console.log
+    console.log = (m) => outs2.push(String(m))
+    let code2
+    try {
+      code2 = setupMain(['--sync-check', dirS2], { repoRoot: dirA2 })
+    } finally {
+      console.log = origLog
+    }
+
+    const outText2 = outs2.join('\n')
+    assert.equal(code2, 1, `A 少母體檔時 exit 應為 1，實際為 ${code2}`)
+    assert.ok(outText2.includes('− '), `stdout 應包含「− 」，實際：\n${outText2}`)
+    assert.ok(
+      outText2.includes('− .github/scripts/llm-team/lib.mjs'),
+      `stdout 應包含「− .github/scripts/llm-team/lib.mjs」，實際：\n${outText2}`
+    )
+  })
+
+  test('T16 setup --sync-check：跑完 T14 情境後，A 裡每個檔的內容與跑前逐字相同（只報告不寫檔）', () => {
+    const { dirA, dirS } = makeSyncPair()
+    // 建立 T14 中的情境：A 的 lib.mjs 漂移，且 A 有額外 config.json
+    fs.appendFileSync(path.join(dirA, '.github/scripts/llm-team/lib.mjs'), '// drifted extra text')
+    fs.writeFileSync(
+      path.join(dirA, '.github/scripts/llm-team/config.json'),
+      JSON.stringify({ custom: 'preserved' }, null, 2)
+    )
+
+    const beforeSnapshot = snapshotDir(dirA)
+    assert.ok(beforeSnapshot.size > 0, '跑前 A 應有檔案')
+
+    const origLog = console.log
+    const origErr = console.error
+    console.log = () => {}
+    console.error = () => {}
+    let code
+    try {
+      code = setupMain(['--sync-check', dirS], { repoRoot: dirA })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+
+    assert.equal(code, 1, `有漂移時 exit code 應為 1，實際為 ${code}`)
+
+    const afterSnapshot = snapshotDir(dirA)
+    assert.equal(
+      afterSnapshot.size,
+      beforeSnapshot.size,
+      `跑後檔案數量應與跑前一致（前：${beforeSnapshot.size}，後：${afterSnapshot.size}）`
+    )
+
+    for (const [relPath, beforeBuf] of beforeSnapshot.entries()) {
+      const afterBuf = afterSnapshot.get(relPath)
+      assert.ok(afterBuf !== undefined, `檔案 ${relPath} 跑後應存在`)
+      assert.ok(
+        beforeBuf.equals(afterBuf),
+        `檔案 ${relPath} 跑後內容應與跑前逐字相同，實際發現被修改`
+      )
+    }
+  })
 })
+
