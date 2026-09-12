@@ -37,7 +37,7 @@ mkdir -p .local/archive-review
 
 ledger() { python3 -c 'import json,sys,datetime;d=json.loads(sys.argv[1]);d["ts"]=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds");print(json.dumps(d,ensure_ascii=False))' "$1" >> "$LEDGER"; }
 TAG='^[[:space:]]*([-*]|[0-9]+[.)])?[[:space:]]*'
-count() { grep -Ec "${TAG}\[$2\]" "$1" 2>/dev/null || true; }
+count() { local n; n=$(grep -Ec "${TAG}\[$2\]" "$1" 2>/dev/null); echo "${n:-0}"; }   # 檔案不在也回 0，不回空字串（空字串進算式會炸）
 # 一次審查「算數」的條件：CLI rc=0 而且真的照格式**答完整** ——
 # 第一輪：有結論那一行，而且結論裡的三個數字跟明細裡的標籤數一致（「結論說 3 條、明細沒有」不算數）；
 # 第二輪：上一輪的每一條需修正（r2 bundle 的每個編號）都有一行 `N. 已修／未修／改壞了`（只答一半不算數）。
@@ -59,28 +59,35 @@ watch() { local pid=$1 t=0; while kill -0 "$pid" 2>/dev/null; do [ "$t" -ge "${A
 if [ "${1:-}" = "--report" ]; then
   [ -s "$LEDGER" ] || { echo "帳本是空的（${LEDGER}）"; exit 0; }
   python3 - "$LEDGER" "$TRIAL_N" "$MIN_VERIFIED" "$MAX_FP" "$MAX_WAIT_P90" <<'ZZPY'
-import json, sys, math
+import json, sys, math, re, os
+# 帳本是索引，檔案才是證據：每一個數字都從檔案重算，帳本只提供「哪一次算數」「花了幾秒」「順序」。
+# 跟腳本的 answered()／--judge 是同一把尺，寫在這裡是因為 report 要在沒有 bash 狀態的情況下重驗。
 rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 N, MINV, MAXFP, MAXP90 = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-rev = [r for r in rows if r.get("kind") == "review"]
-import re, os
-def file_ok(i, m, rnd):   # 跟腳本的 answered() 同一把尺：帳本說答過還不夠，檔案要在、要答完整
+TAG = r"(?m)^\s*(?:[-*]|\d+[.)])?\s*\[%s\]"
+def read(i, m, rnd):
     f = f".local/archive-review/{i}/r{rnd}/{m}.md"
-    if not os.path.isfile(f): return False
-    txt = open(f, encoding="utf-8").read()
-    tag = lambda k: len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])?\s*\[%s\]" % k, txt))
-    if rnd == 1:
-        m1 = re.search(r"(?m)^結論[：:].*$", txt)
-        return bool(m1) and [int(x) for x in re.findall(r"\d+", m1.group(0))] == [tag("需修正"), tag("可接受風險"), tag("誤報候選")]
-    return bool(re.search(r"(?m)^\s*\d+[.)]\s*(已修|未修|改壞了)", txt))
-broken = []
-r1ok = {}                                             # id → {model: 最早回答了的第一輪 row}；之後的重跑不算
+    return open(f, encoding="utf-8").read() if os.path.isfile(f) else None
+def tags(txt): return {k: len(re.findall(TAG % k, txt)) for k in ("需修正", "可接受風險", "誤報候選")}
+def r1_ok(txt):   # 結論那一行的三個數字＝明細的標籤數
+    if txt is None: return False
+    m1 = re.search(r"(?m)^結論[：:].*$", txt)
+    return bool(m1) and [int(x) for x in re.findall(r"\d+", m1.group(0))] == list(tags(txt).values())
+def r2_line(txt, n): return re.search(r"(?m)^\s*%d[.)]\s*(已修|未修|改壞了)" % n, txt)
+def r2_ok(txt, n):  # 1..n 每一號都有答
+    return txt is not None and (n == 0 or all(r2_line(txt, k) for k in range(1, n + 1)))
+rev = [r for r in rows if r.get("kind") == "review"]
+led = {}                                              # (id, round, model) → 最早 ok 的 row；之後的重跑不算
 for r in rev:
-    if r["round"] == 1 and r.get("ok", True):           # 舊 row 沒有 ok 欄：當時只有回答了才會寫 row
-        if file_ok(r["id"], r["model"], 1): r1ok.setdefault(r["id"], {}).setdefault(r["model"], r)
-        else: broken.append(f"{r['id']}/{r['model']}")
-seen = [r["id"] for r in rev if r["round"] == 1]; seen = list(dict.fromkeys(seen))
-done = {i: max(r1ok[i][m]["ts"] for m in ("codex", "gemini")) for i in seen if {"codex", "gemini"} <= set(r1ok.get(i, {}))}
+    if r.get("ok", True): led.setdefault((r["id"], r["round"], r["model"]), r)   # 舊 row 沒有 ok 欄：當時只有回答了才會寫 row
+broken, r1 = [], {}                                   # r1[id][model] = (row, tags)
+for (i, rnd, m), r in led.items():
+    if rnd != 1: continue
+    txt = read(i, m, 1)
+    if r1_ok(txt): r1.setdefault(i, {})[m] = (r, tags(txt))
+    else: broken.append(f"{i}/{m}")
+seen = list(dict.fromkeys(r["id"] for r in rev if r["round"] == 1))
+done = {i: max(r1[i][m][0]["ts"] for m in ("codex", "gemini")) for i in seen if {"codex", "gemini"} <= set(r1.get(i, {}))}
 both = sorted(done, key=done.get)                      # 樣本順序＝兩個模型都答齊的時間，補跑沒回答的那個不會插隊
 half = [i for i in seen if i not in done]
 cohort = both[:N]
@@ -90,23 +97,34 @@ if broken: print(f"帳本說答過、檔案卻不在或不完整（不算）：{
 if not cohort: print("還沒有任何雙模型樣本"); sys.exit(0)
 def p90(xs):
     xs = sorted(xs); return xs[max(0, math.ceil(0.9 * len(xs)) - 1)]
+nf = {i: {m: r1[i][m][1]["需修正"] for m in ("codex", "gemini")} for i in cohort}
 for m in ("codex", "gemini"):
-    rs = [r1ok[i][m] for i in cohort]
-    print(f"{m}：需修正 {sum(r['need_fix'] for r in rs)}／可接受風險 {sum(r['risk'] for r in rs)}／誤報候選 {sum(r['fp'] for r in rs)}；等待 P50 {sorted(r['seconds'] for r in rs)[(len(rs)-1)//2]} 秒、P90 {p90([r['seconds'] for r in rs])} 秒")
-total_nf = sum(r1ok[i][m]["need_fix"] for i in cohort for m in ("codex", "gemini"))
-judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in r1ok.get(r["id"], {})
-        and 1 <= r["finding"] <= r1ok[r["id"]][r["model"]]["need_fix"]]   # 判到帳本上沒有的那一條，不算
-ok = sum(1 for j in judg if j["verdict"] == "已修")
+    tg = [r1[i][m][1] for i in cohort]; secs = sorted(r1[i][m][0]["seconds"] for i in cohort)
+    print(f"{m}：需修正 {sum(x['需修正'] for x in tg)}／可接受風險 {sum(x['可接受風險'] for x in tg)}／誤報候選 {sum(x['誤報候選'] for x in tg)}；等待 P50 {secs[(len(secs)-1)//2]} 秒、P90 {p90(secs)} 秒")
+total_nf = sum(nf[i][m] for i in cohort for m in ("codex", "gemini"))
+judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in nf[r["id"]]
+        and 1 <= r["finding"] <= nf[r["id"]][r["model"]]]                   # 判到檔案上沒有的那一條，不算
+# 「已修」要回頭驗第二輪證據：那個模型第二輪有 ok row、1..N 全答、對應那一號寫的是「已修」。證據不成立就不能下結論。
+def fixed_ok(j):
+    i, m = j["id"], j["model"]; n = nf[i]["codex"] + nf[i]["gemini"]
+    if (i, 2, m) not in led: return False
+    txt = read(i, m, 2)
+    if not r2_ok(txt, n): return False
+    g = j["finding"] + (nf[i]["codex"] if m == "gemini" else 0)
+    ln = r2_line(txt, g); return bool(ln) and ln.group(1) == "已修"
+ok = sum(1 for j in judg if j["verdict"] == "已修" and fixed_ok(j))
+bad_fixed = [f"{j['id']}/{j['model']}#{j['finding']}" for j in judg if j["verdict"] == "已修" and not fixed_ok(j)]
 ok_norere = sum(1 for j in judg if j["verdict"] == "已驗證")
 fp = sum(1 for j in judg if j["verdict"] == "誤報")
 pending = total_nf - len(judg)
-waits = [max(r1ok[i][m]["seconds"] for m in ("codex", "gemini")) for i in cohort]
-w90 = p90(waits)
+w90 = p90([max(r1[i][m][0]["seconds"] for m in ("codex", "gemini")) for i in cohort])
 fprate = (fp / len(judg) * 100) if judg else None
 print(f"需修正共 {total_nf} 條：已修 {ok}、已驗證但沒修 {ok_norere}、誤報 {fp}、**還沒判定 {pending}**"
       f"；誤報率 {'—' if fprate is None else f'{fprate:.0f}%'}；每個 change 的等待 P90 {w90} 秒")
+if bad_fixed: print(f"標了「已修」但第二輪證據不成立（沒有 ok 的第二輪、沒答完、或那一號不是已修）：{', '.join(bad_fixed)}")
 if len(cohort) < N:            verdict = f"樣本還沒滿（{len(cohort)}/{N}）"
 elif pending > 0:              verdict = f"不能下結論：還有 {pending} 條需修正沒判定（--judge）"
+elif bad_fixed:                verdict = f"不能下結論：{len(bad_fixed)} 條「已修」的第二輪證據不成立"
 elif ok >= MINV and fprate is not None and fprate <= MAXFP and w90 <= MAXP90: verdict = "**條件全部成立，可以討論升阻塞**"
 else:                          verdict = "不成立 → 拆：刪這支、prompts/06 與帳本，不留空殼"
 print(f"結論：{verdict}")

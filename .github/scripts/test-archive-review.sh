@@ -95,15 +95,16 @@ expect_grep "app-c10-x）" "補跑不插隊：樣本仍是 c1–c10" report
 out="$(report)"; echo "$out" | grep -q "app-half-x）" && bad "補跑不插隊：app-half-x 不在樣本裡" || ok "補跑不插隊：app-half-x 不在樣本裡"
 
 echo "── archive-review：--judge 與升阻塞 ──"
-r1md app-c1-x codex 1
+# app-c1-x：codex 第一輪 1 條（helper 產的檔對得上帳本）
 expect_rc 2 "--judge 第 2 條不存在被擋"                       $AR app-c1-x --judge codex 2 誤報
 expect_rc 2 "--judge 沒回審不能標「已修」"                     $AR app-c1-x --judge codex 1 已修
 expect_rc 0 "--judge 已驗證（還沒修）收下"                     $AR app-c1-x --judge codex 1 已驗證
 expect_rc 2 "--judge 同一條不能判兩次"                         $AR app-c1-x --judge codex 1 誤報
 expect_grep "已驗證但沒修 1" "已驗證記進報告" report
 expect_grep "不成立" "只有已驗證、沒有已修 → 不成立" report
-# 有回審、而且那個模型對那一號說「已修」，才能標已修（第二輪的編號：codex 的在前、gemini 的在後）
-mkdir -p .local/archive-review/app-c2-x/r1 .local/archive-review/app-c2-x/r2; r1md app-c2-x codex 2; r1md app-c2-x gemini 1
+# app-c2-x：codex 2 條、gemini 1 條（第二輪編號 1、2 是 codex 的，3 是 gemini 的）
+r1md app-c2-x codex 2; r1md app-c2-x gemini 1
+mkdir -p .local/archive-review/app-c2-x/r2
 printf '1. 未修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
 printf '1. 已修\n2. 已修\n3. 未修\n' > .local/archive-review/app-c2-x/r2/gemini.md
 expect_rc 2 "--judge 第二輪檔案在、帳本沒說算數 → 不能標「已修」"  $AR app-c2-x --judge codex 2 已修
@@ -117,22 +118,10 @@ expect_rc 2 "--judge 第二輪說「未修」的不能標「已修」"          
 expect_rc 0 "--judge 第二輪說「已修」的可以標「已修」"           $AR app-c2-x --judge codex 2 已修
 expect_rc 2 "--judge gemini 第 1 條對到第二輪第 3 號（未修）"    $AR app-c2-x --judge gemini 1 已修
 expect_rc 0 "--judge 說未修的那條還是可以標誤報"                 $AR app-c2-x --judge codex 1 誤報
-# codex 第一輪 0 條需修正時，gemini 的編號從 1 起算（grep -c 找不到時 exit 1 的雷）
-mkdir -p .local/archive-review/app-c4-x/r1 .local/archive-review/app-c4-x/r2; r1md app-c4-x codex 0; r1md app-c4-x gemini 1
-printf '1. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md; row app-c4-x gemini 2 10 0 true "$(ts 4 2)"
-expect_rc 0 "--judge codex 0 條時 gemini 第 1 條對到第 1 號"       $AR app-c4-x --judge gemini 1 已修
-judge app-c2-x gemini 1 誤報
-# 帳本裡 c2 的需修正是 0（上面的 row），手動補成 codex 2、gemini 1 讓 pending 對得上
-python3 - <<'ZZPY'
-import json,pathlib
-p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
-for r in rows:
-    if r.get("kind")=="review" and r["id"]=="app-c2-x": r["need_fix"]={"codex":2,"gemini":1}[r["model"]]
-p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
-ZZPY
-expect_grep "已修 1、已驗證但沒修 1、誤報 2、\*\*還沒判定 0\*\*" "三種判定各算各的" report
+expect_rc 0 "--judge gemini 那條標誤報"                          $AR app-c2-x --judge gemini 1 誤報
+expect_grep "已修 1、已驗證但沒修 1、誤報 2、\*\*還沒判定 0\*\*" "三種判定各算各的（數字從檔案來）" report
 expect_grep "不成立" "已修 1 < 門檻 → 不成立" report
-# 再一條已修 → 已修 2、誤報 2/4=50% → 仍不成立（誤報率）
+# 帳本裡把 app-c1-x 的已驗證改成已修，但沒有第二輪證據 → report 拒絕下結論
 python3 - <<'ZZPY'
 import json,pathlib
 p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
@@ -140,8 +129,14 @@ for r in rows:
     if r.get("kind")=="judge" and r["id"]=="app-c1-x": r["verdict"]="已修"
 p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
 ZZPY
+expect_grep "第二輪證據不成立.*app-c1-x/codex#1" "帳本說已修、沒有第二輪證據 → report 點名" report
+expect_grep "不能下結論" "已修證據不成立 → 不下結論" report
+# 補上證據 → 已修 2、誤報 2/4=50% → 仍不成立（誤報率）
+mkdir -p .local/archive-review/app-c1-x/r2; printf '1. 已修\n' > .local/archive-review/app-c1-x/r2/codex.md; printf '1. 已修\n' > .local/archive-review/app-c1-x/r2/gemini.md
+row app-c1-x codex 2 10 0 true "$(ts 4 3)"; row app-c1-x gemini 2 10 0 true "$(ts 4 3)"
 expect_grep "誤報率 50%" "誤報率算對" report
 expect_grep "不成立" "誤報率超過 → 不成立" report
+# 判定改成全部已修、第二輪檔案也改成全部已修 → 成立
 python3 - <<'ZZPY'
 import json,pathlib
 p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
@@ -149,7 +144,34 @@ for r in rows:
     if r.get("kind")=="judge" and r["verdict"]=="誤報": r["verdict"]="已修"
 p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
 ZZPY
-expect_grep "條件全部成立" "全部已修、樣本滿、等待在門檻內 → 成立" report
+expect_grep "不能下結論" "判定改了、第二輪檔案還說未修 → 不能下結論" report
+printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md; cp .local/archive-review/app-c2-x/r2/codex.md .local/archive-review/app-c2-x/r2/gemini.md
+expect_grep "條件全部成立" "全部已修、有證據、樣本滿、等待在門檻內 → 成立" report
+# 判定寫進帳本之後，把第二輪檔案截短 → report 要退回不能下結論（證據是檔案，不是帳本）
+printf '1. 已修\n' > .local/archive-review/app-c1-x/r2/codex.md; printf '' > .local/archive-review/app-c2-x/r2/codex.md
+expect_grep "不能下結論" "判定後第二輪檔案被截短 → 不能下結論" report
+printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+# 第一輪檔案內部一致、但數量跟帳本不同 → report 用檔案的數字（多出一條沒判定 → 不能下結論）
+r1md app-c5-x codex 1
+expect_grep "還沒判定 1" "第一輪檔案的數量才算數，不是帳本的" report
+r1md app-c5-x codex 0
+expect_grep "條件全部成立" "改回去 → 成立" report
+# codex 第一輪 0 條需修正時，gemini 的編號從 1 起算（grep -c 找不到時 exit 1 的雷）
+mkdir -p .local/archive-review/app-c4-x/r2; r1md app-c4-x codex 0; r1md app-c4-x gemini 1
+printf '1. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md; row app-c4-x gemini 2 10 0 true "$(ts 4 2)"
+expect_rc 0 "--judge codex 0 條時 gemini 第 1 條對到第 1 號"       $AR app-c4-x --judge gemini 1 已修
+# 已修的證據要三件齊：第二輪 ok row、1..N 全答、那一號寫已修 —— 各缺一件都要被 report 點名
+python3 - <<'ZZPY'
+import json,pathlib
+p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+rows=[r for r in rows if not (r.get("kind")=="review" and r["id"]=="app-c4-x" and r["round"]==2)]
+p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in rows)+"\n")
+ZZPY
+expect_grep "第二輪證據不成立.*app-c4-x/gemini#1" "第二輪 ok row 不在 → 已修證據不成立" report
+row app-c4-x gemini 2 10 0 true "$(ts 4 2)"
+r1md app-c4-x codex 1; printf '2. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md   # N=2，只答了自己那一號
+expect_grep "第二輪證據不成立.*app-c4-x/gemini#1" "第二輪沒答完（1..N）→ 已修證據不成立" report
+r1md app-c4-x codex 0; printf '1. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md
 
 echo "── archive-review：答過的不重跑、樣本凍結、diff fail-closed ──"
 python3 -c 'import os;os.remove(".local/archive-review/app-c1-x/r1/gemini.md")'   # helper 產的那份拿掉，模擬有人移走
