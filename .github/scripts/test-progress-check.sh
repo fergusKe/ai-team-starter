@@ -851,6 +851,40 @@ baseline
 mkchange app-c01-api app-c01-ui
 run_all_has "同一個 ID 開了兩個 change：列上看得出來" "+1"
 
+# **拆成多個 change 這件事要在終端機看得見**，不只是 `--json`。
+# 一項變兩個 change 是正常的（WBS ID 是交付意圖不是架構單元），
+# 但正常不等於可以隱形 —— 沒有這一段的話，人看到的只是聚合狀態。
+baseline
+mkchange app-c01-api app-c01-ui
+run_all_has "一個 ID 對多個 change：終端機列出「工作拆分」" "APP-C01 → app-c01-api、app-c01-ui"
+run 0 "一個 ID 對多個 change 是正常的，--check 綠" ""
+
+# ── 孤兒 change（2026-09-12 起是違規）────────────────────────────
+#
+# 有地圖的專案裡，一個 change 開了、id 對不上任何 WBS ID、CI 綠 ——
+# 地圖就這樣靜靜過期。這條以前只印紅字，不影響退出碼；紅字在綠燈的 CI log
+# 裡沒有人看。升成違規之後，spec/<id> 的 PR 在規格階段就紅，逼人先改地圖。
+baseline
+mkchange zzz-q01-x
+run 1 "有 WBS、change 對不上任何 ID → 紅" "對不上任何 WBS ID"
+run_json_has "孤兒 change 也進 --json 的 violations"
+
+# 封存的孤兒一樣要報 —— 地圖漏掉一項已經做完的工作，比漏掉未來的更難發現。
+baseline
+mkarchived zzz-q01-x
+run 1 "封存的孤兒 change 一樣紅" "zzz-q01-x"
+
+# 沒有 WBS 就沒有東西可以對：舊專案不會因為這條升嚴而變紅（migration 相容）。
+baseline
+hide_wbs
+mkchange zzz-q01-x
+run 0 "沒有 WBS 時孤兒不算違規（沒有地圖就沒有孤兒）" ""
+
+# 前綴要對得**準**：`app-c01` 對 `APP-C01`，`app-c010-x` 不對。
+baseline
+mkchange app-c010-x
+run 1 "ID 前綴只是字面相似（app-c010）不算對上" "app-c010-x"
+
 # **change 清單要排序，不要靠字典的插入順序。** `changes` 是先塞 active
 # 再塞 archived，所以「第一個」剛好永遠是 active 的那個 —— 聚合與「只看第一個」
 # 在那種資料上同解，差別觀察不到。排序之後順序跟狀態無關。

@@ -1,10 +1,33 @@
-# 01 需求探索
+# 01 一個工作項目的探索
 
-我要開始一個新功能。請先讀 `AGENTS.md` 與 `CONTEXT.md`。
+我要開始做地圖上的**一個工作項目**。請先讀 `AGENTS.md` 與 `CONTEXT.md`。
 
 **現在不要寫任何程式碼，也不要開 change。**
 
-請逐步問我：產品目標、使用者角色、主要流程、domain model、business rules、
+還沒有 `docs/WBS.md`？那這個專案還沒有地圖 —— **先跑 `00`**，不要從一個功能開始。
+每個功能各自探索、各自規劃，最後串不起來，是這個模板要防的第一件事。
+
+## 先在地圖上找到它
+
+```bash
+bash .github/scripts/progress.sh --all     # 整張地圖：這一項在哪、週次、擋在誰後面
+bash .github/scripts/arch-view.sh          # 現在已經有哪些 capability、誰引用誰、邊界的狀態
+```
+
+1. **選定 WBS ID**。這一項要有週次（`—` 表示現在做不了，不要替它開 change）。
+2. 看它的**阻塞欄**與依賴：擋住它的裁決有沒有期限、期限過了沒。
+3. 看它**已經有哪些 change**（同一個 ID 可以有多個 change，正常）。
+4. 看 `arch-view.sh` 列出的既有 capability：這一項要**引用**哪些既有能力，
+   不要重做一份。
+
+**找不到對應的 ID，或發現交付結果／順序／依賴要改** → 停下來，不開 change，
+先開 `governance/` PR 改 `docs/WBS.md`（規則在 `AGENTS.md`〈改 `docs/WBS.md` 之前〉）。
+**不要現場發明一個 id**：對不上任何 WBS ID 的 change，`progress.sh --check` 會判違規，
+`spec/` 的 PR 在規格階段就紅。
+
+## 再探索這一項
+
+請逐步問我：這一項的使用者要達成什麼結果、主要流程、domain model、business rules、
 資料所有權、權限、edge cases、錯誤情境、安全、限制、明確不做的事、未來擴充。
 
 一次問三到五題，等我答完再問下一輪。我答得模糊就追問，不要自己補完。
@@ -21,8 +44,9 @@
 
 最後一定要問一次：**剛才講定的東西，有哪些還沒寫進任何檔案？**
 
-穩定下來的詞彙整理進 `CONTEXT.md`。難逆轉且有取捨的決策，
-依 `docs/adr/_template.md` 開一份 ADR（Status: Proposed）。
+穩定下來的詞彙整理進 `CONTEXT.md`。難逆轉且有取捨的**系統邊界**，
+依 `docs/adr/_template.md` 開一份 ADR（Status: Proposed），標 `邊界狀態` 與 `證據`。
+交付順序與依賴進 WBS。**三者不要互抄。**
 
 問到我說夠了，再進 `02`。
 
