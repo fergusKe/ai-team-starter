@@ -167,6 +167,12 @@ jobs:
       - name: Arch view tests
         run: bash .github/scripts/test-arch-view.sh
 
+      # 同上：`archive-review.sh` 是影子審查，不是閘門；但它的 `--report` 會被拿去決定
+      # 「升阻塞還是拆掉」，報告可以被做出來的數字（沒判定就下結論、單模型算樣本、
+      # 樣本不凍結、已驗證當已修）各有一條測試守著。
+      - name: Archive review tests
+        run: bash .github/scripts/test-archive-review.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——

@@ -310,6 +310,45 @@ bash .github/scripts/check-scenario-coverage.sh
 delta 一起掃的話會鎖死流程：`spec/` 分支依設計不能加測試，第一個 spec PR 就
 會紅（實測過）。
 
+### archive 前的雙模型影子審查（**是影子，不是閘門**）
+
+```bash
+bash .github/scripts/archive-review.sh <change-id>            # tasks.md 全勾之後、/opsx:archive 之前；放背景跑
+bash .github/scripts/archive-review.sh <change-id> --rereview # 修完回審，只准一次
+bash .github/scripts/archive-review.sh --report               # 帳本結算：升阻塞的條件成不成立
+```
+
+把一個 change 的**全部**（origin/main 上凍結的規格、WBS 那一項、DECISIONS 裡提到它的整節、
+每個 slice PR 的 diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不算 —— 與 PR 說明）
+打成一包，平行送兩個不是寫它的模型，各自獨立審一次。
+第一輪兩個模型**彼此不講話**（第二輪的 bundle 會把兩個模型的需修正一起編號給雙方回審）：
+讀兩份結果、決定信哪一份、動手修的是原本那個 session。
+提示在 `prompts/06-archive-review.md`；結果與帳本在 `.local/archive-review*`（gitignore）。
+slice 的認定是 **PR 的分支名**（`feat/<id>--…`、`fix/<id>--…`），diff 從 PR 拿 ——
+不是 commit 訊息（同一個 WBS ID 可以有多個 change，grep 會把兄弟 change 混進來），
+也不是 merge commit（只有 squash 合併時它才等於整個 PR）。
+
+**為什麼單位是 change 不是 PR。** 當每個 slice 都由同一個作者寫、逐個 PR 合併，
+單一 slice 的 review 看不出跨 slice 的不一致、規格說了但沒有任何 slice 做的缺口；
+而 change 比 PR 少一個量級 —— 審 change 才付得起兩個模型的等待。
+
+**為什麼不是閘門。** 它還沒證明自己抓得到東西。標「需修正」的必須指得出規格位置、
+檔案位置與驗證方法，給不出就是「誤報候選」；每一條由人 `--judge`（誤報／已驗證／已修），
+帳本記下來；「已修」要那個模型第二輪對那一號真的寫了「已修」。
+**升成阻塞的條件只定義在腳本頂端那幾個常數**（樣本數、「已修」的發現數、
+誤報率、等待 P90），`--report` 會把條件與結果一起印出來。報告不給人做數字的空間：
+還有需修正沒判定就不下結論；只有兩個模型都回答的 change 才是樣本，樣本是最早的 N 個；
+「答過」＝帳本 ok 且檔案**答完整**（第一輪結論的數字對得上明細、第二輪每一號都有答），答過就不重送，
+補跑沿用同一輪的 bundle；兩個模型的第一輪都答完才能回審；「只准一次」看的是兩個模型都答過第二輪，
+不是 `r2/` 目錄在不在。**帳本是索引，檔案才是證據**：`--report` 每個數字都從回答檔重算，帳本只提供
+順序與秒數；每一條「已修」回頭驗第二輪（有 ok 的 row、1..N 每一號恰好一次、那一號寫的是已修），
+證據不成立就不下結論；樣本照帳本凍結，哪一份檔案壞了就不下結論、不遞補。
+**信任邊界**：帳本與回答檔在本機、負責人自己可以改 —— 守的是誤操作與半成品（含逾時殘留、同時跑兩次、
+打錯模式、格式不對），不防惡意竄改（拒絕過 digest 鏈，見 DECISIONS）。不成立就刪這支、`prompts/06` 與帳本 ——
+**不留一個大家都會跳過的空殼閘門。**
+
+**回審只准一次。** 第三輪代表這套流程在製造等待；腳本直接拒絕，人工處理。
+
 ### 架構視圖（**推導出來的，不是維護出來的**）
 
 ```bash

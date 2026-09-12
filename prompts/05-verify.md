@@ -35,6 +35,18 @@ npm run lint && npm run typecheck && npm test && npm run build
 沒有未完成項。** 兩者只有先打勾才同時成立 —— 先 archive 再打勾會紅在
 「archive 不是原封不動的搬移」。純規格的 change 也一樣。
 
+### archive 之前：讓第二、第三個模型把整個 change 看一次（影子試跑）
+
+```
+bash .github/scripts/archive-review.sh <change-id>
+```
+
+它把 origin/main 上凍結的規格、WBS 那一項、DECISIONS 裡提到它的整節、每個 slice PR 的 diff（排除 lockfile 與 archive 目錄；任一個拿不到就整輪不算）與 PR 說明打成一包，
+平行送兩個不是寫它的模型（**放背景跑**；等待上限腳本會印，回來看 `.local/archive-review/<id>/r1/`），結果只有三種標籤：
+需修正／可接受風險／誤報候選。**不阻塞** —— 標「需修正」而且你重現得了的，在這個 session 修好、合併，
+再 `--rereview` 一次（兩個模型第一輪都答完才能開；兩個都答過第二輪就不准第三輪；沒答完整的可以補跑）；每一條需修正判定後 `--judge`（誤報／已驗證／已修 —— 「已修」要那個模型第二輪對那一號寫了已修才收）。
+為什麼是這裡不是每個 PR、什麼時候升成阻塞、什麼時候整套拆掉：寫在那支腳本開頭與 `AGENTS.md`。
+
 ### 這個 change 的 Scenario 要到 archive 之後才會出現在缺口報告裡
 
 缺口報告只掃 `openspec/specs/`，而 archive 才會把 delta 折進去。所以**在
