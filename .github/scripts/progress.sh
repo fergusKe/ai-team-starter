@@ -1366,8 +1366,8 @@ for wid in order:
 # **沒有 WBS 的時候不做這件事** —— 沒有東西可以對，把每個 change 都說成
 # 「命名錯誤」是錯的訊號；舊專案沒有地圖也不會因此變紅（migration 相容）。
 #
-# 這是 rc 凍結「不得新增 gate」的一個具名例外，理由與範圍記在
-# `docs/DECISIONS.md`〈孤兒 change 是違規〉。**不要拿這個例外當先例**。
+# 這是一條新的閘門，憑什麼加（繞法在測試 repo 跑得出來）記在
+# `docs/DECISIONS.md`〈地圖先於 change〉。下一條閘門一樣要先跑一次繞法。
 _matched = {c for w in order for c in changes_for(w)}
 orphan = sorted(set(changes) - _matched) if wbs else []
 for _c in orphan:
