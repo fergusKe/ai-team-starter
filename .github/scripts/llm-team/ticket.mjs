@@ -20,6 +20,7 @@ import {
   changedFiles,
   parseArgs,
   CLEAN_GIT_ENV,
+  isSafeCommand,
 } from './lib.mjs'
 import { main as writeMain } from './write.mjs'
 import { main as councilMain, parseVerdicts } from './council.mjs'
@@ -106,6 +107,7 @@ export function main(argv, deps = {}) {
   const changedFilesFn = deps.changedFiles || changedFiles
   const testFn = deps.runTest || runTest
   const spawnFn = deps.spawn || spawnSync
+  const isSafeCommandFn = deps.isSafeCommand || isSafeCommand
 
   if (sub === 'run') {
     const a = parseArgs(rest, ['allow'])
@@ -126,6 +128,16 @@ export function main(argv, deps = {}) {
     if (!VALID_BRANCH_PREFIXES.some((p) => a.branch.startsWith(p))) {
       console.error(
         `🔴 分支名 '${a.branch}' 不合法，必須以前綴之一開頭：${VALID_BRANCH_PREFIXES.join(' ')}`
+      )
+      return 2
+    }
+
+    if (!isSafeCommandFn(a.test, config)) {
+      console.error(
+        `🔴 --test 不在寫手的 allow 內，寫手最後一步會被拒而整輪靜默中止：${a.test}`
+      )
+      console.error(
+        '把指令頭加進 .github/scripts/llm-team/config.json 的 allowCommandHeads，或改用 node --test／node --check'
       )
       return 2
     }

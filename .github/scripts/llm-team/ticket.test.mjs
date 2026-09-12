@@ -715,6 +715,94 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary2.tierEscalatedBy, undefined, 'riskDomains: [] 時不應有 tierEscalatedBy')
     assert.equal(summary2.review.tier, 'standard', 'summary.review.tier 應維持 standard')
   })
+
+  test('T17 --test 不在 allow 內：--test "bash -n x.sh" ⇒ run 回 2、writeMain 沒被呼叫、stderr 含 allowCommandHeads', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試票\n內容')
+
+    let writeCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        writeCalled = true
+        return 0
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't17',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t17--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'bash -n x.sh',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `不安全的 --test 時 run 應回 2，實際得到 ${code}`)
+    assert.equal(writeCalled, false, 'writeMain 不應被呼叫')
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /allowCommandHeads/, `stderr 應包含 allowCommandHeads，實際：${errOutput}`)
+  })
+
+  test('T18 陽性對照：--test "node --test x.test.mjs && node --check x.mjs" ⇒ 通過這道檢查（run 繼續往下、writeMain 被呼叫）', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試票\n內容')
+
+    let writeCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        writeCalled = true
+        return 0
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't18',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t18--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'node --test x.test.mjs && node --check x.mjs',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(writeCalled, true, 'writeMain 應被呼叫')
+    assert.equal(code, 0, `run 應成功執行完畢，實際 exit code 為 ${code}`)
+  })
 })
 
 describe('setup.mjs 設定對帳測試', () => {
