@@ -33,7 +33,9 @@ git add -A && git commit -qm "spec" && git remote add origin "$W/repo"
 cat > "$W/bin/gh" <<'GHEOF'
 #!/bin/bash
 case "$1 $2" in
-  "pr list") sha=$(git rev-parse HEAD); printf '[{"number":7,"headRefName":"%s","mergeCommit":{"oid":"%s"},"mergedAt":"2026-01-01T00:00:00Z","body":"PR 說明"}]\n' "$GH_BRANCH" "$sha" ;;
+  "pr list") sha=$(git rev-parse HEAD)
+    if [ "$(cat "$GH_MODE")" = many ]; then python3 -c 'import json;print(json.dumps([{"number":n,"headRefName":"feat/other","mergeCommit":{"oid":"0"*40},"mergedAt":"2026-01-01T00:00:00Z","body":""} for n in range(1000)]))'
+    else printf '[{"number":7,"headRefName":"%s","mergeCommit":{"oid":"%s"},"mergedAt":"2026-01-01T00:00:00Z","body":"PR 說明"}]\n' "$GH_BRANCH" "$sha"; fi ;;
   "pr diff") [ "$(cat "$GH_MODE")" = ok ] && printf 'diff --git a/x.ts b/x.ts\n+1\n' || { echo boom >&2; exit 1; } ;;
   *) exit 0 ;;
 esac
@@ -69,6 +71,7 @@ expect_rc 2 "change id 帶路徑字元被擋"            $AR 'app-c01/../x'
 expect_rc 2 "change id 大寫被擋"                  $AR 'APP-C01-x'
 expect_rc 2 "--judge 模型名不在兩個之內被擋"       $AR app-c01-x --judge claude 1 誤報
 expect_rc 2 "--judge 判定不在三種之內被擋"         $AR app-c01-x --judge codex 1 可能
+expect_rc 2 "--judge 第幾條寫「0」被擋"                 $AR app-c01-x --judge codex 0 誤報
 
 echo "── archive-review：--report 的樣本 ──"
 : > "$L"
@@ -111,6 +114,7 @@ expect_rc 2 "--judge 第 2 條不存在被擋"                       $AR app-c1-
 expect_rc 2 "--judge 沒回審不能標「已修」"                     $AR app-c1-x --judge codex 1 已修
 expect_rc 0 "--judge 已驗證（還沒修）收下"                     $AR app-c1-x --judge codex 1 已驗證
 expect_rc 2 "--judge 同一條不能判兩次"                         $AR app-c1-x --judge codex 1 誤報
+expect_rc 2 "--judge 第幾條寫「01」被擋（不然繞得過「判過了」）" $AR app-c1-x --judge codex 01 誤報
 expect_grep "已驗證但沒修 1" "已驗證記進報告" report
 expect_grep "不成立" "只有已驗證、沒有已修 → 不成立" report
 # app-c2-x：codex 2 條、gemini 1 條（第二輪編號 1、2 是 codex 的，3 是 gemini 的）
@@ -168,6 +172,21 @@ printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/c
 printf '1. 已修\n' > .local/archive-review/app-c1-x/r2/codex.md; printf '' > .local/archive-review/app-c2-x/r2/codex.md
 expect_grep "不能下結論" "判定後第二輪檔案被截短 → 不能下結論" report
 printf '1. 已修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
+# 同一條在帳本裡出現兩筆判定（手改的）→ 不能下結論
+judge app-c2-x codex 2 已修
+expect_grep "被判了不只一次.*app-c2-x/codex#2" "同一條兩筆判定 → 點名" report
+expect_grep "不能下結論" "同一條兩筆判定 → 不下結論" report
+python3 - <<'ZZPY'
+import json,pathlib
+p=pathlib.Path(".local/archive-review.jsonl"); rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+seen=set(); out=[]
+for r in rows:
+    k=(r.get("kind"),r.get("id"),r.get("model"),r.get("finding"))
+    if r.get("kind")=="judge" and k in seen: continue
+    seen.add(k); out.append(r)
+p.write_text("\n".join(json.dumps(r,ensure_ascii=False) for r in out)+"\n")
+ZZPY
+expect_grep "條件全部成立" "去掉重複那筆 → 成立" report
 # 第一輪檔案內部一致、但數量跟帳本不同 → report 用檔案的數字（多出一條沒判定 → 不能下結論）
 r1md app-c5-x codex 1
 expect_grep "還沒判定 1" "第一輪檔案的數量才算數，不是帳本的" report
@@ -199,6 +218,8 @@ expect_grep "都答過了" "兩個都答過 → 拒絕重跑、指向 --rereview
 python3 -c 'open(".local/archive-review.jsonl","w").close()'
 mkdir -p openspec/changes/app-c3-x; echo "# p" > openspec/changes/app-c3-x/proposal.md; git add -A && git commit -qm spec3
 export GH_BRANCH="feat/app-c3-x--a"
+echo many > "$GH_MODE"
+expect_grep "可能被截斷" "gh pr list 剛好 1000 筆 → 清單可能截斷 → 整輪不算數" $AR app-c3-x
 echo fail > "$GH_MODE"
 expect_grep "拿不到 PR #7 的 diff" "PR diff 拿不到 → 整輪不算數" $AR app-c3-x
 [ ! -s "$L" ] && ok "diff 拿不到 → 沒寫帳本" || bad "diff 拿不到 → 沒寫帳本"

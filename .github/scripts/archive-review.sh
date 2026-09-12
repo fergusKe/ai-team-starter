@@ -113,6 +113,8 @@ for m in ("codex", "gemini"):
 total_nf = sum(nf[i][m] for i in cohort for m in ("codex", "gemini"))
 judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in nf[r["id"]]
         and 1 <= r["finding"] <= nf[r["id"]][r["model"]]]                   # 判到檔案上沒有的那一條，不算
+keys = [(j["id"], j["model"], j["finding"]) for j in judg]
+dup = sorted({f"{i}/{m}#{n}" for k in set(keys) if keys.count(k) > 1 for (i, m, n) in [k]})
 # 「已修」要回頭驗第二輪證據：那個模型第二輪有 ok row、1..N 全答、對應那一號寫的是「已修」。證據不成立就不能下結論。
 def fixed_ok(j):
     i, m = j["id"], j["model"]; n = nf[i]["codex"] + nf[i]["gemini"]
@@ -131,7 +133,9 @@ fprate = (fp / len(judg) * 100) if judg else None
 print(f"需修正共 {total_nf} 條：已修 {ok}、已驗證但沒修 {ok_norere}、誤報 {fp}、**還沒判定 {pending}**"
       f"；誤報率 {'—' if fprate is None else f'{fprate:.0f}%'}；每個 change 的等待 P90 {w90} 秒")
 if bad_fixed: print(f"標了「已修」但第二輪證據不成立（沒有 ok 的第二輪、沒答完、或那一號不是已修）：{', '.join(bad_fixed)}")
+if dup: print(f"同一條被判了不只一次（帳本被手改過？）：{', '.join(dup)}")
 if len(cohort) < N:            verdict = f"樣本還沒滿（{len(cohort)}/{N}）"
+elif dup:                      verdict = f"不能下結論：{len(dup)} 條被判了不只一次"
 elif pending > 0:              verdict = f"不能下結論：還有 {pending} 條需修正沒判定（--judge）"
 elif bad_fixed:                verdict = f"不能下結論：{len(bad_fixed)} 條「已修」的第二輪證據不成立"
 elif ok >= MINV and fprate is not None and fprate <= MAXFP and w90 <= MAXP90: verdict = "**條件全部成立，可以討論升阻塞**"
@@ -155,6 +159,7 @@ if [ "${1:-}" = "--judge" ]; then
   [ $# -ge 4 ] || { echo "用法：--judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]" >&2; exit 2; }
   case "$2" in codex|gemini) ;; *) echo "模型只能是 codex 或 gemini" >&2; exit 2;; esac
   case "$4" in 誤報|已驗證|已修) ;; *) echo "判定只能是 誤報、已驗證（重現了但還沒修）或 已修（重現了、修了、回審過）" >&2; exit 2;; esac
+  [[ "$3" =~ ^[1-9][0-9]*$ ]] || { echo "✗ 第幾條要是正整數（1、2、3…），不是「$3」" >&2; exit 2; }   # 「01」會繞過「判過了」的檢查
   # 「已修」是升阻塞數的那個 —— 要有證據：那個模型第二輪**算數**（帳本 ok）而且**對這一條**寫了「已修」。
   # 第二輪 bundle 把上一輪的需修正逐條編號（codex 的在前、gemini 的在後），模型照編號答；這裡查對應那一號。
   if [ "$4" = 已修 ]; then
@@ -216,9 +221,11 @@ WBS="$(printf '%s' "$WBS_JSON" | python3 -c 'import json,sys;s=sys.stdin.read().
 PRS="$(gh pr list --state merged --base main --limit 1000 --json number,headRefName,mergeCommit,mergedAt,body 2>/dev/null | python3 -c '
 import json,sys,re
 pat=re.compile(r"^(feat|fix)/%s(--|$)" % re.escape(sys.argv[1]))
-ps=[p for p in json.load(sys.stdin) if pat.match(p["headRefName"]) and p.get("mergeCommit")]
+allp=json.load(sys.stdin)
+if len(allp) >= 1000: sys.exit("✗ 合併的 PR 已達 gh pr list 的 --limit 1000，清單可能被截斷、舊的 slice 會漏 —— 這一輪不算數（提高 limit 或改分頁）")
+ps=[p for p in allp if pat.match(p["headRefName"]) and p.get("mergeCommit")]
 ps.sort(key=lambda p:p["mergedAt"])
-print(json.dumps(ps, ensure_ascii=False))' "$ID")" || { echo "✗ 拿不到合併的 PR 清單（gh 沒登入？離線？）—— 這一輪不算數" >&2; exit 2; }
+print(json.dumps(ps, ensure_ascii=False))' "$ID" 2>&1)" || { echo "✗ 拿不到合併的 PR 清單（gh 沒登入？離線？）—— 這一輪不算數"; echo "$PRS"; exit 2; } >&2
 # diff 從 PR 拿（`gh pr diff`），不是 merge commit 的 `git show` —— 只有 squash 合併時後者才等於整個 PR。
 # 排除 lockfile 與 archive 目錄（人不讀、佔 bundle）；圖片等二進位 diff 本來就只有一行。
 # **任何一個 PR 的 diff 拿不到，整輪不算數**（exit 2，不寫帳本）—— 少了實作內容的 bundle 不能進樣本。
@@ -282,7 +289,9 @@ if not hit: print("（沒有）")' "$ID" "$WBS"
 } > "$OUT/bundle.md.tmp" && mv "$OUT/bundle.md.tmp" "$OUT/bundle.md"
 fi
 SIZE=$(wc -c < "$OUT/bundle.md" | tr -d " ")
-[ "$SIZE" -lt 700000 ] || { echo "✗ bundle ${SIZE} bytes，超過命令列能塞的量 —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
+# 上限 250 KB：gemini 的 prompt（bundle＋第二輪時再加上一輪回答）要走命令列參數（agy 不吃 stdin），
+# Linux 單一參數上限 128 KB、macOS 整條命令列 1 MB；codex 走 stdin 沒這問題。超過就是 change 太大，人工拆開審。
+[ "$SIZE" -lt 250000 ] || { echo "✗ bundle ${SIZE} bytes，超過 250 KB —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
 echo "bundle：$OUT/bundle.md（$SIZE bytes）；等待上限 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒／模型，放背景跑"
 
 # ── 平行送出 ──────────────────────────────────────────────────────────────────────────────────────
@@ -295,9 +304,9 @@ run_codex() {
   ! has_answer codex "$ROUND" || { echo "（codex 第 $ROUND 輪已經答過，不重送）"; return; }
   command -v "$CODEX_BIN" >/dev/null || { echo "（跳過 codex：找不到 ${CODEX_BIN}）" | tee "$OUT/codex.md"; row codex "$t0" 127; return; }
   if [ "$ROUND" = 2 ] && SESSION="$(python3 -c 'import json,sys;print([json.loads(l) for l in open(sys.argv[1]) if l.strip() and json.loads(l).get("kind")=="review" and json.loads(l)["id"]==sys.argv[2] and json.loads(l)["model"]=="codex" and json.loads(l).get("session")][-1]["session"])' "$LEDGER" "$ID" 2>/dev/null)" && [ -n "$SESSION" ]; then
-    "$CODEX_BIN" exec --skip-git-repo-check resume "$SESSION" "$(cat "$OUT/bundle.md")" < /dev/null > "$OUT/codex.md" 2> "$OUT/codex.err" &
+    "$CODEX_BIN" exec --skip-git-repo-check resume "$SESSION" - < "$OUT/bundle.md" > "$OUT/codex.md" 2> "$OUT/codex.err" &
   else
-    "$CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -m "$CODEX_MODEL" -c model_reasoning_effort="high" "$(cat "$OUT/bundle.md")" < /dev/null > "$OUT/codex.md" 2> "$OUT/codex.err" &
+    "$CODEX_BIN" exec --sandbox read-only --skip-git-repo-check -m "$CODEX_MODEL" -c model_reasoning_effort="high" - < "$OUT/bundle.md" > "$OUT/codex.md" 2> "$OUT/codex.err" &
   fi
   local rc=0; watch $! || rc=$?
   row codex "$t0" "$rc" "$(grep -o 'session id: [0-9a-f-]*' "$OUT/codex.err" | tail -1 | cut -d' ' -f3)"
@@ -307,6 +316,7 @@ run_gemini() {
   ! has_answer gemini "$ROUND" || { echo "（gemini 第 $ROUND 輪已經答過，不重送）"; return; }
   command -v "$GEMINI_BIN" >/dev/null || { echo "（跳過 gemini：找不到 ${GEMINI_BIN}）" | tee "$OUT/gemini.md"; row gemini "$t0" 127; return; }
   { [ "$ROUND" = 2 ] && { echo "## 你上一輪的回答"; cat "$DIR/r1/gemini.md"; echo; }; cat "$OUT/bundle.md"; } > "$OUT/gemini.prompt.md"
+  [ "$(wc -c < "$OUT/gemini.prompt.md" | tr -d ' ')" -lt 300000 ] || { echo "（跳過 gemini：prompt 超過 300 KB，命令列塞不下）" | tee "$OUT/gemini.md"; row gemini "$t0" 7; return; }
   "$GEMINI_BIN" --print "$(cat "$OUT/gemini.prompt.md")" --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m > "$OUT/gemini.md" 2> "$OUT/gemini.err" &
   local rc=0; watch $! || rc=$?
   row gemini "$t0" "$rc"
