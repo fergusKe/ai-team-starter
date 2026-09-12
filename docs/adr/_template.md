@@ -3,6 +3,9 @@
 - **Status**: Proposed | Accepted | Superseded by NNNN
 - **Date**: YYYY-MM-DD
 - **Deciders**: <誰拍板>
+<!-- 只有「系統之間的邊界」才加下面兩行；量測紀錄、技術選型不用。三種狀態見 README.md -->
+- **邊界狀態**: 已強制 | 僅約定 | 已知缺口
+- **證據**: <tests/…:行、src/…:行；已強制至少一條要是測試>
 
 ## 背景
 

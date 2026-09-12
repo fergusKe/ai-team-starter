@@ -163,6 +163,10 @@ jobs:
       - name: Scenario report tests
         run: bash .github/scripts/test-scenario-coverage.sh
 
+      # 同上：`arch-view.sh` 是推導出來的架構視圖，不是閘門；它的測試留著。
+      - name: Arch view tests
+        run: bash .github/scripts/test-arch-view.sh
+
   # 工程品質那四關**刻意跟 ci 分成兩個 job**。
   #
   # 因為模板附的 package.json 裡那四個 script 是**刻意會失敗的佔位** ——
