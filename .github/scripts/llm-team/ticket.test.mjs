@@ -358,6 +358,363 @@ describe('ticket.mjs 票流程測試', () => {
     const titleIdx = prCall.args.indexOf('--title')
     assert.equal(prCall.args[titleIdx + 1], 'feat: custom title')
   })
+
+  test('T7 publish 誘餌：worktree 有未追蹤檔 decoy.txt（不在 summary.changed）⇒ publish 回 2、注入的 git 沒收到 commit／push、stderr 含 decoy.txt', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't7')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'edited')
+    fs.writeFileSync(path.join(worktreePath, 'decoy.txt'), 'decoy')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't7')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't7',
+      branch: 'feat/t7--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: { tier: 'standard', members: [], anyEmpty: false },
+      coordinatorTurns: null,
+      startedAt: '2026-09-13T00:00:00Z',
+      finishedAt: '2026-09-13T00:05:00Z',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const gitCalls = []
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt', 'decoy.txt'],
+      git: (cwd, args) => {
+        gitCalls.push({ cwd, args })
+        return ''
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't7'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `有未追蹤誘餌時 publish 應回 2，實際得到 ${code}`)
+    assert.ok(
+      !gitCalls.some((c) => c.args[0] === 'commit'),
+      'git 呼叫不應包含 commit'
+    )
+    assert.ok(
+      !gitCalls.some((c) => c.args[0] === 'push'),
+      'git 呼叫不應包含 push'
+    )
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /decoy\.txt/, `stderr 應包含 decoy.txt，實際：${errOutput}`)
+  })
+
+  test('T8 陽性對照：沒有誘餌 ⇒ publish 回 0，且注入的 git 收到的 add 引數逐字等於 summary.changed（不含 -A）', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't8')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file1.txt'), 'content1')
+    fs.writeFileSync(path.join(worktreePath, 'file2.txt'), 'content2')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't8')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't8',
+      branch: 'feat/t8--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file1.txt', 'file2.txt'],
+      verifyExit: 0,
+      review: { tier: 'standard', members: [], anyEmpty: false },
+      coordinatorTurns: null,
+      startedAt: '2026-09-13T00:00:00Z',
+      finishedAt: '2026-09-13T00:05:00Z',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const gitCalls = []
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file1.txt', 'file2.txt'],
+      git: (cwd, args) => {
+        gitCalls.push({ cwd, args })
+        return ''
+      },
+      spawn: (cmd, args) => {
+        if (cmd === 'gh' && args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+        if (cmd === 'gh' && args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/123' }
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't8'], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `publish exit 應為 0，實際為 ${code}`)
+    const addCall = gitCalls.find((c) => c.args[0] === 'add')
+    assert.ok(addCall, '應有 git add 呼叫')
+    assert.ok(!addCall.args.includes('-A'), 'git add 不應包含 -A')
+    assert.deepEqual(addCall.args.slice(2), summary.changed, 'add 傳入的檔案清單應逐字等於 summary.changed')
+    assert.deepEqual(addCall.args, ['add', '--', ...summary.changed], 'add 引數應為 [add, --, ...summary.changed]')
+  })
+
+  test('T9 非法 --tier：--tier blcok ⇒ run 回 2、writeMain 沒被呼叫', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試票\n內容')
+
+    let writeCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        writeCalled = true
+        return 0
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't9',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t9--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+          '--tier',
+          'blcok',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `非法 --tier 時 run 應回 2，實際得到 ${code}`)
+    assert.equal(writeCalled, false, 'writeMain 不應被呼叫')
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /用法：run/, `stderr 應包含用法，實際：${errOutput}`)
+  })
+
+  test('T10 run 清舊複審：<outDir>/review/opus.txt 預先放「整份：不簽」殘留、councilMain 這輪產「整份：簽」⇒ summary 是「簽」（證明清過）', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 清舊複審票\n內容')
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't10')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't10', 'review')
+
+    // 預先在 <outDir>/review/ 放殘留的 opus.txt（不簽）
+    fs.mkdirSync(reviewOutDir, { recursive: true })
+    const opusPath = path.join(reviewOutDir, 'opus.txt')
+    fs.writeFileSync(opusPath, 'Q1：不簽｜殘留舊資料｜需修正\n整份：不簽\nQ6：舊殘留')
+
+    let existsBeforeCouncilMain = null
+
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'ok')
+        return 0
+      },
+      councilMain: () => {
+        existsBeforeCouncilMain = fs.existsSync(opusPath)
+        fs.mkdirSync(reviewOutDir, { recursive: true })
+        fs.writeFileSync(opusPath, 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok')
+        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't10',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t10--slice',
+          '--allow',
+          'file.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `run exit 應為 0，實際為 ${code}`)
+    assert.equal(existsBeforeCouncilMain, false, '呼叫 council 前舊的 opus.txt 應已被清空')
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't10', 'summary.json')
+    assert.ok(fs.existsSync(summaryFile), 'summary.json 應存在')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    const opus = summary.review.members.find((m) => m.name === 'opus')
+    assert.ok(opus, 'summary 應包含 opus')
+    assert.equal(opus.overall, '簽', 'opus overall 應為「簽」，證明舊的「不簽」殘留已被清除')
+  })
+
+  test('T11 riskDomains 升級：config riskDomains: [金流]、brief 含「金流」、--tier standard ⇒ councilMain 收到 --tier block、summary.tierEscalatedBy 是 [金流]；riskDomains: [] ⇒ 仍是 standard', () => {
+    // 1. riskDomains: ['金流'] ⇒ 升級 block
+    const repo1 = makeRepo({ riskDomains: ['金流'] })
+    const briefFile1 = path.join(tmpdir('brief1-'), 'brief.md')
+    fs.writeFileSync(briefFile1, '# 涉及金流模組之修改\n包含金流交易處理')
+
+    const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't11-escalate')
+    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't11-escalate', 'review')
+
+    let receivedCouncilArgs1 = null
+    const deps1 = {
+      repoRoot: repo1.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath1, 'pay.txt'), 'pay')
+        return 0
+      },
+      councilMain: (args) => {
+        receivedCouncilArgs1 = args
+        fs.mkdirSync(reviewOutDir1, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir1, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir1, 'gemini.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir1, 'codex.txt'), '整份：簽\n')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs1 = []
+    const origLog = console.log
+    console.log = (m) => outs1.push(String(m))
+    let code1
+    try {
+      code1 = ticketMain(
+        [
+          'run',
+          '--name',
+          't11-escalate',
+          '--brief',
+          briefFile1,
+          '--branch',
+          'feat/t11--slice',
+          '--allow',
+          'pay.txt',
+          '--test',
+          'true',
+          '--tier',
+          'standard',
+        ],
+        deps1
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code1, 0, `run exit 應為 0，實際為 ${code1}`)
+    const tierIdx1 = receivedCouncilArgs1.indexOf('--tier')
+    assert.notEqual(tierIdx1, -1, 'councilMain 參數應包含 --tier')
+    assert.equal(receivedCouncilArgs1[tierIdx1 + 1], 'block', 'councilMain 應收到 --tier block')
+
+    const summaryFile1 = path.join(repo1.dir, '.local', 'llm-team', 't11-escalate', 'summary.json')
+    const summary1 = JSON.parse(fs.readFileSync(summaryFile1, 'utf8'))
+    assert.deepEqual(summary1.tierEscalatedBy, ['金流'], 'summary.tierEscalatedBy 應為 [金流]')
+    assert.equal(summary1.review.tier, 'block', 'summary.review.tier 應為 block')
+
+    // 2. riskDomains: [] ⇒ 仍為 standard
+    const repo2 = makeRepo({ riskDomains: [] })
+    const briefFile2 = path.join(tmpdir('brief2-'), 'brief.md')
+    fs.writeFileSync(briefFile2, '# 涉及金流模組之修改\n包含金流交易處理')
+
+    const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't11-standard')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't11-standard', 'review')
+
+    let receivedCouncilArgs2 = null
+    const deps2 = {
+      repoRoot: repo2.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath2, 'pay.txt'), 'pay')
+        return 0
+      },
+      councilMain: (args) => {
+        receivedCouncilArgs2 = args
+        fs.mkdirSync(reviewOutDir2, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir2, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir2, 'gemini.txt'), '整份：簽\n')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs2 = []
+    console.log = (m) => outs2.push(String(m))
+    let code2
+    try {
+      code2 = ticketMain(
+        [
+          'run',
+          '--name',
+          't11-standard',
+          '--brief',
+          briefFile2,
+          '--branch',
+          'feat/t11-std--slice',
+          '--allow',
+          'pay.txt',
+          '--test',
+          'true',
+          '--tier',
+          'standard',
+        ],
+        deps2
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code2, 0, `run exit 應為 0，實際為 ${code2}`)
+    const tierIdx2 = receivedCouncilArgs2.indexOf('--tier')
+    assert.notEqual(tierIdx2, -1, 'councilMain 參數應包含 --tier')
+    assert.equal(receivedCouncilArgs2[tierIdx2 + 1], 'standard', 'councilMain 應收到 --tier standard')
+
+    const summaryFile2 = path.join(repo2.dir, '.local', 'llm-team', 't11-standard', 'summary.json')
+    const summary2 = JSON.parse(fs.readFileSync(summaryFile2, 'utf8'))
+    assert.equal(summary2.tierEscalatedBy, undefined, 'riskDomains: [] 時不應有 tierEscalatedBy')
+    assert.equal(summary2.review.tier, 'standard', 'summary.review.tier 應維持 standard')
+  })
 })
 
 describe('setup.mjs 設定對帳測試', () => {
@@ -462,5 +819,51 @@ describe('setup.mjs 設定對帳測試', () => {
       // noop
     }
     assert.equal(missingCode, 2, `設定檔不存在時 exit 應為 2，實際為 ${missingCode}`)
+  })
+
+  test('T12 setup --check：透過 AGY_SETTINGS 環境變數指到 tmp 假檔（缺 regex）⇒ exit 1、stdout 含 command(regex:；且 token 永不洩漏', () => {
+    const repo = makeRepo()
+    const tmpSettingsDir = tmpdir('setup-settings-env-')
+    const badSettingsFile = path.join(tmpSettingsDir, 'bad-settings.json')
+    const rootSlash = repo.dir.endsWith('/') ? repo.dir : repo.dir + '/'
+    fs.writeFileSync(
+      badSettingsFile,
+      JSON.stringify(
+        {
+          token: 'SHOULD-NOT-PRINT-T12',
+          permissions: {
+            allow: ['read_file(' + rootSlash + ')'],
+          },
+          trustedWorkspaces: [repo.dir],
+        },
+        null,
+        2
+      )
+    )
+
+    // 透過 deps.env 傳入 AGY_SETTINGS（不傳 settingsFile）
+    const badOuts = []
+    const badErrs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => badOuts.push(String(m))
+    console.error = (m) => badErrs.push(String(m))
+    let badCode
+    try {
+      badCode = setupMain(['--check'], {
+        repoRoot: repo.dir,
+        env: { ...process.env, AGY_SETTINGS: badSettingsFile },
+      })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+
+    assert.equal(badCode, 1, `透過 AGY_SETTINGS 缺 regex 時 exit 應為 1，實際為 ${badCode}`)
+    const badOutText = badOuts.join('\n')
+    const badErrText = badErrs.join('\n')
+    assert.match(badOutText, /command\(regex:/, `stdout 應包含 command(regex:，實際：${badOutText}`)
+    assert.ok(!badOutText.includes('SHOULD-NOT-PRINT-T12'), 'stdout 絕對不應包含 token')
+    assert.ok(!badErrText.includes('SHOULD-NOT-PRINT-T12'), 'stderr 絕對不應包含 token')
   })
 })

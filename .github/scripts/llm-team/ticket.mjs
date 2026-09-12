@@ -62,6 +62,14 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
     `write exit: ${summary.writeExit} (共 ${summary.rounds} 輪) | verify exit: ${summary.verifyExit !== null ? summary.verifyExit : '-'}`,
   ]
 
+  if (summary.tierEscalatedBy && summary.tierEscalatedBy.length > 0) {
+    lines.push(`tierEscalatedBy: ${summary.tierEscalatedBy.join(', ')}`)
+  }
+
+  if (summary.review?.exit !== undefined && summary.review?.exit !== null) {
+    lines.push(`🔴 council exit=${summary.review.exit}`)
+  }
+
   for (const m of reviewMembers) {
     lines.push(...formatReviewerSummary(m))
   }
@@ -108,6 +116,13 @@ export function main(argv, deps = {}) {
       return 2
     }
 
+    if (a.tier !== undefined && a.tier !== 'standard' && a.tier !== 'block') {
+      console.error(
+        '用法：run --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main]'
+      )
+      return 2
+    }
+
     if (!VALID_BRANCH_PREFIXES.some((p) => a.branch.startsWith(p))) {
       console.error(
         `🔴 分支名 '${a.branch}' 不合法，必須以前綴之一開頭：${VALID_BRANCH_PREFIXES.join(' ')}`
@@ -117,7 +132,7 @@ export function main(argv, deps = {}) {
 
     const startedAt = new Date().toISOString()
     const base = a.base || 'main'
-    const tier = a.tier === 'block' ? 'block' : 'standard'
+    let tier = a.tier || 'standard'
     const worktreeRoot = config.worktreeRoot || '.claude/worktrees'
     const worktree = path.resolve(repoRoot, worktreeRoot, a.name)
     const outBaseDir = config.outDir || '.local/llm-team'
@@ -158,6 +173,29 @@ export function main(argv, deps = {}) {
     const briefContent = fs.readFileSync(path.resolve(a.brief), 'utf8')
     fs.writeFileSync(path.join(outDir, 'brief.md'), briefContent)
 
+    // riskDomains 升級複審（tier => block，不直接判罪）
+    const riskDomains = Array.from(
+      new Set((Array.isArray(config.riskDomains) ? config.riskDomains : []).filter(Boolean))
+    )
+    const briefLower = briefContent.toLowerCase()
+    const allowLower = (a.allow || []).map((al) => String(al).toLowerCase())
+    const matchedRiskDomains = []
+    for (const rd of riskDomains) {
+      const rdLower = String(rd).toLowerCase()
+      if (!rdLower) continue
+      const hitBrief = briefLower.includes(rdLower)
+      const hitAllow = allowLower.some((al) => al.includes(rdLower))
+      if (hitBrief || hitAllow) {
+        matchedRiskDomains.push(rd)
+      }
+    }
+
+    let tierEscalatedBy = null
+    if (tier !== 'block' && matchedRiskDomains.length > 0) {
+      tier = 'block'
+      tierEscalatedBy = matchedRiskDomains
+    }
+
     // b. 呼叫 write.main
     const writeMainFn = deps.writeMain || writeMain
     const writeArgs = [
@@ -189,6 +227,9 @@ export function main(argv, deps = {}) {
     if (changed.length > 0) {
       const t = testFn(a.test, worktree)
       verifyExit = t.exit
+
+      fs.rmSync(reviewOutDir, { recursive: true, force: true })
+      fs.mkdirSync(reviewOutDir, { recursive: true })
 
       const councilMainFn = deps.councilMain || councilMain
       const councilArgs = [
@@ -253,6 +294,15 @@ export function main(argv, deps = {}) {
     }
 
     // d. 寫 summary.json
+    const reviewObj = {
+      tier,
+      members: reviewMembers.map(({ name, model, overall, q }) => ({ name, model, overall, q })),
+      anyEmpty,
+    }
+    if (councilExit !== null && councilExit !== 0 && councilExit !== 3) {
+      reviewObj.exit = councilExit
+    }
+
     const summary = {
       schemaVersion: 1,
       project: path.basename(repoRoot),
@@ -263,11 +313,8 @@ export function main(argv, deps = {}) {
       rounds,
       changed,
       verifyExit,
-      review: {
-        tier,
-        members: reviewMembers.map(({ name, model, overall, q }) => ({ name, model, overall, q })),
-        anyEmpty,
-      },
+      ...(tierEscalatedBy ? { tierEscalatedBy } : {}),
+      review: reviewObj,
       coordinatorTurns: null,
       startedAt,
       finishedAt: new Date().toISOString(),
@@ -280,6 +327,7 @@ export function main(argv, deps = {}) {
     const receiptLines = buildReceiptSummaryLines(summary, reviewMembers, summaryPath)
     console.log(receiptLines.join('\n'))
 
+    if (councilExit !== null && councilExit !== 0 && councilExit !== 3) return councilExit
     if (anyEmpty) return 3
     return 0
   }
@@ -310,9 +358,28 @@ export function main(argv, deps = {}) {
       return 2
     }
 
-    const changed = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
-    if (changed.length === 0) {
+    const relOutDir = path.relative(worktree, outDir)
+    const isOutDirInside = !relOutDir.startsWith('..') && !path.isAbsolute(relOutDir)
+    const outDirPrefix = isOutDirInside ? (relOutDir.endsWith('/') ? relOutDir : relOutDir + '/') : null
+
+    const isIgnored = (f) => {
+      if (f === '.agy-write' || f.startsWith('.agy-write/')) return true
+      if (outDirPrefix && (f === relOutDir || f.startsWith(outDirPrefix))) return true
+      if (outBaseDir && (f === outBaseDir || f.startsWith(outBaseDir + '/'))) return true
+      return false
+    }
+
+    const currentFiles = changedFilesFn(worktree).filter((f) => !isIgnored(f))
+    if (currentFiles.length === 0) {
       console.error(`🔴 worktree 無任何改動：${worktree}`)
+      return 2
+    }
+
+    const summaryChanged = Array.isArray(summary.changed) ? summary.changed : []
+    const summaryChangedSet = new Set(summaryChanged)
+    const unexpected = currentFiles.filter((f) => !summaryChangedSet.has(f))
+    if (unexpected.length > 0) {
+      console.error(`🔴 publish：worktree 有 run 之後才出現的檔，不准夾帶：${unexpected.join(', ')}`)
       return 2
     }
 
@@ -331,8 +398,8 @@ export function main(argv, deps = {}) {
       title = firstLine ? firstLine.replace(/^#+\s*/, '').trim() : `feat: ${a.name}`
     }
 
-    // git add -A
-    gitFn(worktree, ['add', '-A'])
+    // git add -- <summary.changed 逐一>
+    gitFn(worktree, ['add', '--', ...summaryChanged])
     // git commit
     gitFn(worktree, ['commit', '-m', title])
     // git push
