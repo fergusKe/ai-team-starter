@@ -72,7 +72,8 @@ for m in ("codex", "gemini"):
     rs = [r1ok[i][m] for i in cohort]
     print(f"{m}：需修正 {sum(r['need_fix'] for r in rs)}／可接受風險 {sum(r['risk'] for r in rs)}／誤報候選 {sum(r['fp'] for r in rs)}；等待 P50 {sorted(r['seconds'] for r in rs)[(len(rs)-1)//2]} 秒、P90 {p90([r['seconds'] for r in rs])} 秒")
 total_nf = sum(r1ok[i][m]["need_fix"] for i in cohort for m in ("codex", "gemini"))
-judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in r1ok.get(r["id"], {})]
+judg = [r for r in rows if r.get("kind") == "judge" and r["id"] in cohort and r["model"] in r1ok.get(r["id"], {})
+        and 1 <= r["finding"] <= r1ok[r["id"]][r["model"]]["need_fix"]]   # 判到帳本上沒有的那一條，不算
 ok = sum(1 for j in judg if j["verdict"] == "已修")
 ok_norere = sum(1 for j in judg if j["verdict"] == "已驗證")
 fp = sum(1 for j in judg if j["verdict"] == "誤報")
@@ -92,6 +93,11 @@ ZZPY
 fi
 
 ID="${1:?用法見檔頭}"; shift
+# 「答過」＝那一輪帳本有 ok 的 row **而且** 檔案有照格式回答。只看檔案不行：CLI 非零／逾時可能留下格式完整的半成品；
+# 只看帳本不行：帳本說答過、檔案卻被移走，那是有人想重跑。兩者不一致 → 拒絕，不猜。
+file_ok()    { [ "$(answered 0 ".local/archive-review/$ID/r$2/$1.md" "$2" 2>/dev/null)" = true ]; }
+in_ledger()  { grep "\"kind\": \"review\", \"id\": \"$ID\", \"round\": $2, \"model\": \"$1\"," "$LEDGER" 2>/dev/null | grep -qv '"ok": false'; }
+has_answer() { in_ledger "$1" "$2" && file_ok "$1" "$2"; }
 # change id 會拿去組路徑、篩分支，先驗文法（跟 check-pr-branch.sh 的 ID_RE 同一條）。
 [[ "$ID" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "✗ change id '${ID}' 格式不合（小寫英數與單一連字號）" >&2; exit 2; }
 DIR=".local/archive-review/$ID"
@@ -100,11 +106,12 @@ if [ "${1:-}" = "--judge" ]; then
   [ $# -ge 4 ] || { echo "用法：--judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]" >&2; exit 2; }
   case "$2" in codex|gemini) ;; *) echo "模型只能是 codex 或 gemini" >&2; exit 2;; esac
   case "$4" in 誤報|已驗證|已修) ;; *) echo "判定只能是 誤報、已驗證（重現了但還沒修）或 已修（重現了、修了、回審過）" >&2; exit 2;; esac
-  # 「已修」是升阻塞數的那個 —— 要有證據：那個模型第二輪**對這一條**寫了「已修」。
+  # 「已修」是升阻塞數的那個 —— 要有證據：那個模型第二輪**算數**（帳本 ok）而且**對這一條**寫了「已修」。
   # 第二輪 bundle 把上一輪的需修正逐條編號（codex 的在前、gemini 的在後），模型照編號答；這裡查對應那一號。
   if [ "$4" = 已修 ]; then
-    G=$3; [ "$2" != gemini ] || G=$(( $(grep -Ec "${TAG}\[需修正\]" "$DIR/r1/codex.md" 2>/dev/null || echo 0) + $3 ))
-    grep -Eq "^[[:space:]]*${G}[.)][[:space:]]*已修" "$DIR/r2/$2.md" 2>/dev/null || { echo "✗ 要標「已修」，$2 的第二輪回答（$DIR/r2/$2.md）要有「${G}. 已修」這一行 —— 沒回審過、或它說未修，就只能標「已驗證」" >&2; exit 2; }
+    has_answer "$2" 2 || { echo "✗ 要標「已修」先 --rereview，而且 $2 的第二輪要算數（帳本 ok、$DIR/r2/$2.md 有逐條回答）" >&2; exit 2; }
+    G=$3; if [ "$2" = gemini ]; then C=$(count "$DIR/r1/codex.md" 需修正); G=$(( ${C:-0} + $3 )); fi   # grep -c 找不到時 exit 1，不能 `|| echo 0`
+    grep -Eq "^[[:space:]]*${G}[.)][[:space:]]*已修" "$DIR/r2/$2.md" 2>/dev/null || { echo "✗ 要標「已修」，$2 的第二輪回答（$DIR/r2/$2.md）要有「${G}. 已修」這一行 —— 它說未修就只能標「已驗證」" >&2; exit 2; }
   fi
   # 只能判真的存在的那一條，而且一條只判一次 —— 不然精確率是編出來的。
   N=$(grep -Ec "${TAG}\[需修正\]" "$DIR/r1/$2.md" 2>/dev/null || true)
@@ -121,24 +128,26 @@ MAIN="$(git rev-parse origin/main)"
 SPEC_FILES="$(git ls-tree -r --name-only "$MAIN" -- "openspec/changes/$ID" | grep '\.md$' || true)"
 [ -n "$SPEC_FILES" ] || { echo "✗ origin/main 上沒有 openspec/changes/$ID —— 已經封存了？還是 spec PR 還沒合併？這支要在 /opsx:archive **之前**跑。" >&2; exit 2; }
 
-# 答過的不重送：一個模型的第一輪答案就是它在樣本裡的那一份。帳本說它答過、檔案卻不在 → 有人移走 r1 想重跑，拒絕。
-# 重跑只補沒回答的那個模型（CLI 不在、逾時），樣本順序以兩個都答齊的時間算，補跑不會插隊。
-has_answer() { [ "$(answered 0 "$DIR/r$2/$1.md" "$2" 2>/dev/null)" = true ]; }
-in_ledger() { grep -q "\"kind\": \"review\", \"id\": \"$ID\", \"round\": $2, \"model\": \"$1\"," "$LEDGER" 2>/dev/null && grep "\"id\": \"$ID\", \"round\": $2, \"model\": \"$1\"," "$LEDGER" | grep -qv '"ok": false'; }
+# 答過的不重送：一個模型的答案就是它在樣本裡的那一份。帳本說它答過、檔案卻不在 → 有人移走想重跑，拒絕。
+# 重跑只補沒答的那個模型（CLI 不在、逾時、diff 拿不到），沿用同一份 bundle；樣本順序以兩個都答齊的時間算，補跑不插隊。
+# 「只准一次」看的是**兩個模型都答過第二輪**，不是 r2/ 目錄存不存在 —— 目錄在失敗時也會留下。
 if [ "${1:-}" = "--rereview" ]; then
-  ROUND=2; [ -s "$DIR/r1/main.sha" ] || { echo "✗ 沒有第一輪，先跑 bash .github/scripts/archive-review.sh $ID" >&2; exit 2; }
-  [ ! -d "$DIR/r2" ] || { echo "✗ 回審只准一次（$DIR/r2 已存在）。還要一輪就是這套流程在製造等待 —— 人工處理，不要第三輪。" >&2; exit 2; }
+  ROUND=2; [ -s "$DIR/r1/main.sha" ] && { has_answer codex 1 || has_answer gemini 1; } || { echo "✗ 第一輪沒有任何一個模型答過，先跑 bash .github/scripts/archive-review.sh $ID" >&2; exit 2; }
 else
   ROUND=1
-  for m in codex gemini; do ! in_ledger "$m" 1 || has_answer "$m" 1 || { echo "✗ 帳本說 $m 第一輪答過了，$DIR/r1/$m.md 卻不在 —— 不要移走 r1 重跑；答過的那份就是樣本。" >&2; exit 2; }; done
-  ! { has_answer codex 1 && has_answer gemini 1; } || { echo "✗ 兩個模型第一輪都答過了（$DIR/r1）。要回審用 --rereview。" >&2; exit 2; }
+fi
+for m in codex gemini; do ! in_ledger "$m" "$ROUND" || file_ok "$m" "$ROUND" || { echo "✗ 帳本說 $m 第 $ROUND 輪答過了，$DIR/r$ROUND/$m.md 卻不在或不完整 —— 不要移走它重跑；答過的那份就是樣本。" >&2; exit 2; }; done
+if has_answer codex "$ROUND" && has_answer gemini "$ROUND"; then
+  [ "$ROUND" = 1 ] && echo "✗ 兩個模型第一輪都答過了（$DIR/r1）。要回審用 --rereview。" >&2 \
+                   || echo "✗ 回審只准一次（兩個模型第二輪都答過了）。還要一輪就是這套流程在製造等待 —— 人工處理，不要第三輪。" >&2
+  exit 2
 fi
 OUT="$DIR/r$ROUND"; mkdir -p "$OUT"
-# 補跑沒回答的那個模型時，**沿用第一輪的 bundle 與 main.sha**：兩個模型要看同一份東西，不然不是同一個樣本。
-if [ "$ROUND" = 1 ] && [ -s "$OUT/bundle.md" ] && [ -s "$OUT/main.sha" ]; then
-  MAIN="$(cat "$OUT/main.sha")"; echo "沿用第一輪的 bundle（main $(git rev-parse --short "$MAIN")）：$OUT/bundle.md"
+# 補跑沒回答的那個模型時，**沿用這一輪已經組好的 bundle 與 main.sha**：兩個模型要看同一份東西，不然不是同一個樣本。
+if [ -s "$OUT/bundle.md" ] && [ -s "$OUT/main.sha" ]; then
+  MAIN="$(cat "$OUT/main.sha")"; echo "沿用第 $ROUND 輪已組好的 bundle（main $(git rev-parse --short "$MAIN")）：$OUT/bundle.md"
 else
-printf '%s\n' "$MAIN" > "$OUT/main.sha"
+printf '%s\n' "$MAIN" > "$OUT/main.sha"    # 失敗會留下它，但沿用的條件是 bundle.md 也在；bundle 只在全部組完才落地
 
 # ── bundle ────────────────────────────────────────────────────────────────────────────────────────
 # WBS 的對應**跟 progress.sh --json 要**（AGENTS：不要自己再解析一次 docs/WBS.md）。對不到就明說 —— 那本身是 --check 違規。
@@ -218,7 +227,7 @@ if not hit: print("（沒有）")' "$ID" "$WBS"
     n=0; while IFS=$'\t' read -r sha pr; do [ -n "$sha" ] || continue; n=$((n+1)); echo; show_slice "$sha" "$pr"; done <<< "$SLICES"
     [ "$n" -gt 0 ] || echo "（上一輪之後沒有任何 ${ID} 的 PR 合併 —— 那就沒有東西可回審）"
   fi
-} > "$OUT/bundle.md"
+} > "$OUT/bundle.md.tmp" && mv "$OUT/bundle.md.tmp" "$OUT/bundle.md"
 fi
 SIZE=$(wc -c < "$OUT/bundle.md" | tr -d " ")
 [ "$SIZE" -lt 700000 ] || { echo "✗ bundle ${SIZE} bytes，超過命令列能塞的量 —— 這個 change 太大，人工拆開審。" >&2; exit 2; }

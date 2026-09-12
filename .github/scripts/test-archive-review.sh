@@ -50,7 +50,7 @@ row() { # row <id> <model> <round> <seconds> <need_fix> <ok> <ts>
 judge() { printf '{"kind": "judge", "id": "%s", "model": "%s", "finding": %s, "verdict": "%s", "note": "", "ts": "2026-01-02T00:00:00+00:00"}\n' "$1" "$2" "$3" "$4" >> "$L"; }
 ts() { printf '2026-01-01T%02d:%02d:00+00:00' "$1" "$2"; }
 r1md() { # r1md <id> <model> <n 條需修正>
-  mkdir -p ".local/archive-review/$1/r1"; { for i in $(seq 1 "$3"); do echo "[需修正] APP-C01-S0$i — a.ts:1 — x — 驗證：y"; done; echo "結論：需修正 $3 條／可接受風險 0 條／誤報候選 0 條"; } > ".local/archive-review/$1/r1/$2.md"
+  mkdir -p ".local/archive-review/$1/r1"; { i=0; while [ "$i" -lt "$3" ]; do i=$((i+1)); echo "[需修正] APP-C01-S0$i — a.ts:1 — x — 驗證：y"; done; echo "結論：需修正 $3 條／可接受風險 0 條／誤報候選 0 條"; } > ".local/archive-review/$1/r1/$2.md"
 }
 report() { $AR --report 2>&1; }
 expect_rc() { # expect_rc <rc> <label> <cmd...>
@@ -95,10 +95,18 @@ expect_grep "不成立" "只有已驗證、沒有已修 → 不成立" report
 mkdir -p .local/archive-review/app-c2-x/r1 .local/archive-review/app-c2-x/r2; r1md app-c2-x codex 2; r1md app-c2-x gemini 1
 printf '1. 未修\n2. 已修\n3. 已修\n' > .local/archive-review/app-c2-x/r2/codex.md
 printf '1. 已修\n2. 已修\n3. 未修\n' > .local/archive-review/app-c2-x/r2/gemini.md
+expect_rc 2 "--judge 第二輪檔案在、帳本沒說算數 → 不能標「已修」"  $AR app-c2-x --judge codex 2 已修
+row app-c2-x codex 2 10 0 false "$(ts 4 0)"
+expect_rc 2 "--judge 第二輪帳本 ok=false（半成品）→ 不能標「已修」" $AR app-c2-x --judge codex 2 已修
+row app-c2-x codex 2 10 0 true "$(ts 4 1)"; row app-c2-x gemini 2 10 0 true "$(ts 4 1)"
 expect_rc 2 "--judge 第二輪說「未修」的不能標「已修」"           $AR app-c2-x --judge codex 1 已修
 expect_rc 0 "--judge 第二輪說「已修」的可以標「已修」"           $AR app-c2-x --judge codex 2 已修
 expect_rc 2 "--judge gemini 第 1 條對到第二輪第 3 號（未修）"    $AR app-c2-x --judge gemini 1 已修
 expect_rc 0 "--judge 說未修的那條還是可以標誤報"                 $AR app-c2-x --judge codex 1 誤報
+# codex 第一輪 0 條需修正時，gemini 的編號從 1 起算（grep -c 找不到時 exit 1 的雷）
+mkdir -p .local/archive-review/app-c4-x/r1 .local/archive-review/app-c4-x/r2; r1md app-c4-x codex 0; r1md app-c4-x gemini 1
+printf '1. 已修\n' > .local/archive-review/app-c4-x/r2/gemini.md; row app-c4-x gemini 2 10 0 true "$(ts 4 2)"
+expect_rc 0 "--judge codex 0 條時 gemini 第 1 條對到第 1 號"       $AR app-c4-x --judge gemini 1 已修
 judge app-c2-x gemini 1 誤報
 # 帳本裡 c2 的需修正是 0（上面的 row），手動補成 codex 2、gemini 1 讓 pending 對得上
 python3 - <<'ZZPY'
@@ -130,7 +138,7 @@ ZZPY
 expect_grep "條件全部成立" "全部已修、樣本滿、等待在門檻內 → 成立" report
 
 echo "── archive-review：答過的不重跑、樣本凍結、diff fail-closed ──"
-expect_grep "不要移走 r1" "帳本說 gemini 答過、r1/gemini.md 不在 → 拒絕" $AR app-c1-x
+expect_grep "不要移走" "帳本說 gemini 答過、r1/gemini.md 不在 → 拒絕" $AR app-c1-x
 r1md app-c1-x gemini 0
 expect_grep "都答過了" "兩個都答過 → 拒絕重跑、指向 --rereview" $AR app-c1-x
 # 新的 change：第一次跑（兩個模型都「找不到 CLI」→ 都不算數，但 bundle 與 main.sha 留下）
@@ -146,9 +154,23 @@ grep -q "^+1$" .local/archive-review/app-c3-x/r1/bundle.md && ok "bundle 含 PR 
 grep -q "^# p$" .local/archive-review/app-c3-x/r1/bundle.md && ok "規格從 main 讀進 bundle" || bad "規格從 main 讀進 bundle"
 SHA1="$(cat .local/archive-review/app-c3-x/r1/main.sha)"
 echo "改了" >> openspec/changes/app-c3-x/proposal.md; git commit -qam "main 動了"
-expect_grep "沿用第一輪的 bundle" "補跑沒回答的模型 → 沿用第一輪 bundle" $AR app-c3-x
+expect_grep "沿用第 1 輪已組好的 bundle" "補跑沒回答的模型 → 沿用第一輪 bundle" $AR app-c3-x
 [ "$(cat .local/archive-review/app-c3-x/r1/main.sha)" = "$SHA1" ] && ok "補跑不改 main.sha" || bad "補跑不改 main.sha"
 grep -q "改了" .local/archive-review/app-c3-x/r1/bundle.md && bad "補跑不重建 bundle" || ok "補跑不重建 bundle"
+# CLI 非零但留下格式完整的半成品：帳本 ok=false → 不算答過，補跑要重送（模型不在 → 印跳過，而不是「已經答過」）
+{ echo "[需修正] x"; echo "結論：需修正 1 條／可接受風險 0 條／誤報候選 0 條"; } > .local/archive-review/app-c3-x/r1/codex.md
+expect_grep "跳過 codex" "帳本 ok=false 的半成品不算答過 → 重送" $AR app-c3-x
+out="$($AR app-c3-x 2>&1)"; echo "$out" | grep -q "codex 第 1 輪已經答過" && bad "半成品不該被當成答過" || ok "半成品不該被當成答過"
+# 第二輪也一樣：diff 失敗留下 r2/ 不能變成「第三輪」；兩個都答過第二輪才是只准一次
+row app-c3-x codex 1 10 1 true "$(ts 5 0)"; r1md app-c3-x codex 1   # 上一步重送把檔案蓋掉了，補回一份算數的
+echo fail > "$GH_MODE"
+expect_grep "拿不到 PR #7 的 diff" "第二輪 diff 拿不到 → 這輪不算數" $AR app-c3-x --rereview
+echo ok > "$GH_MODE"
+expect_grep "跳過 codex" "第二輪 diff 失敗過之後還能再跑（不是第三輪）" $AR app-c3-x --rereview
+grep -q "^1\. " .local/archive-review/app-c3-x/r2/bundle.md && ok "第二輪 bundle 把需修正編號" || bad "第二輪 bundle 把需修正編號"
+printf '1. 已修\n' > .local/archive-review/app-c3-x/r2/codex.md; printf '1. 已修\n' > .local/archive-review/app-c3-x/r2/gemini.md
+row app-c3-x codex 2 10 0 true "$(ts 6 0)"; row app-c3-x gemini 2 10 0 true "$(ts 6 0)"
+expect_grep "回審只准一次" "兩個都答過第二輪 → 第三輪拒絕" $AR app-c3-x --rereview
 
 echo
 echo "通過 $PASS / 失敗 $FAIL / 共 $((PASS+FAIL))"
