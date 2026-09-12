@@ -101,7 +101,8 @@ mutual = sorted({tuple(sorted((a, b))) for a, g in graph.items() for b in g["ref
 # 衍生專案實測的寫法：`## D1｜`、`## D1.`、`## D1：`、`## D1 ——`、`## D1 標題`，`##` 與 `###`
 # 兩層都有（174 條在 `##`、95 條在 `###`），編號有 `D2b` 這種。全部認；認不出的才報。
 # 同一份檔裡同一個編號再出現、標題以「補記」開頭 → 是那條的補記，不是新決策。
-DEC = re.compile(r"^#{2,3}\s*D(\d+[a-z]?)(?:\s*[｜|.:：、\-–—]+\s*|\s+)(\S.*?)\s*$")
+# 標題第一個字不可以是分隔符：不然 `## D1｜｜` 會回溯成標題「｜」。
+DEC = re.compile(r"^#{2,3}\s*D(\d+[a-z]?)(?:\s*[｜|.:：、\-–—]+\s*|\s+)([^\s｜|.:：、\-–—].*?)\s*$")
 SUSPECT = re.compile(r"^#{2,3}\s*D\d+")
 SUP = re.compile(r"^\s*-?\s*\*\*Supersedes\*\*\s*[:：]\s*([A-Za-z0-9._-]+)/D(\d+)\s*$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
@@ -118,8 +119,11 @@ for f in design_files:
             md = DEC.match(line)
             if md:
                 key = f"{change}/D{md.group(1)}"
-                if key in by_key and md.group(2).startswith("補記"):
-                    by_key[key]["notes"].append(md.group(2)); cur = by_key[key]; continue
+                if md.group(2).startswith("補記"):
+                    if key in by_key:
+                        by_key[key]["notes"].append(md.group(2)); cur = by_key[key]; continue
+                    bad(f"{f}:{i} D{md.group(1)} 的補記出現在原決策之前（或沒有原決策）—— 補記要掛在 {key} 底下")
+                    cur = None; continue
                 cur = {"change": change, "n": md.group(1), "title": md.group(2), "notes": [],
                        "file": f"{f}:{i}", "archived": archived, "supersedes": None}
                 if key in by_key:
@@ -172,8 +176,8 @@ for f in sorted(adr_dir.glob("[0-9][0-9][0-9][0-9]-*.md")) if adr_dir.is_dir() e
         bad(f"{f} 標了邊界狀態「{a['state']}」卻沒有 **證據** 欄位")
     for e in a["evidence"]:
         path = e.split(":", 1)[0]
-        if not pathlib.Path(path).exists():
-            bad(f"{f} 證據 {e}：路徑不存在")
+        if not pathlib.Path(path).is_file():   # 目錄不算：`tests/` 存在證明不了任何測試存在
+            bad(f"{f} 證據 {e}：路徑不存在或不是檔案")
     # 已強制：證據裡**至少一條**要是測試或 .github/scripts/ 的檢查。其他條可以是 src／spec，
     # 那是「在哪裡」；測試那條才是「違反了會紅」。
     if a["state"] == "已強制" and not any(ENFORCED_OK.search(e.split(":", 1)[0]) for e in a["evidence"]):

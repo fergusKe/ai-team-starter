@@ -15,14 +15,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="$ROOT/.github/scripts/arch-view.sh"
 [ -f "$TOOL" ] || { echo "✗ 找不到 $TOOL"; exit 1; }
 
-W="$(mktemp -d "${TMPDIR:-/tmp}/arch-view-test.XXXXXXXX")"
+# mktemp 失敗（唯讀沙箱、TMPDIR 不存在）要**立刻停**：沒有 set -e，放過去的話 W 是空字串，
+# setup 會對 "/repo" 做刪除與 mkdir —— codex 2026-09-12 在唯讀沙箱裡實際踩到。
+W="$(mktemp -d "${TMPDIR:-/tmp}/arch-view-test.XXXXXXXX")" || { echo "✗ mktemp 失敗，量不到"; exit 2; }
+[ -n "$W" ] && [ -d "$W" ] || { echo "✗ 暫存目錄不對：'${W}'"; exit 2; }
 PASS=0
 FAIL=0
 
 # 一個「什麼都對」的假 repo：兩個 capability 互相引用、一份 design 有兩條決策、
 # 一份 ADR 標了狀態與證據。每個 case 從這裡出發，再壞掉一件事。
 setup() {
-  rm -rf "$W/repo"
+  rm -rf "${W:?}/repo"
   mkdir -p "$W/repo/openspec/specs/cap-alpha" "$W/repo/openspec/specs/cap-beta" \
            "$W/repo/openspec/changes/archive/2026-01-01-c1" \
            "$W/repo/openspec/changes/c2" \
@@ -194,6 +197,76 @@ setup
 ( cd "$W/repo/openspec/specs" && mv cap-alpha/spec.md cap-alpha/README.md && mv cap-beta/spec.md cap-beta/README.md )
 run 2 "openspec/specs/ 存在但一份 spec.md 都沒有 → 2"
 
+# ── 以下是 codex 2026-09-12 對抗審查列出的「靜態可證存活突變」，每一條配一個 case ──
+
+setup
+rep "$W/repo/docs/adr/0001-example.md" 'tests/example.test.ts' 'tests/'
+run 1 "「已強制」的證據是 tests/ 目錄不是檔案 → 1（目錄冒充不了測試）" "tests/"
+
+setup
+rep "$W/repo/docs/adr/0001-example.md" 'tests/example.test.ts' 'docs/adr/0001-example.md、openspec/specs/cap-alpha/spec.md'
+run 1 "「已強制」兩條證據都是文件 → 1（不是只看第一條或只在剛好一條時檢查）" "已強制"
+
+setup
+rep "$W/repo/docs/adr/0001-example.md" 'tests/example.test.ts' 'tests/example.test.ts、tests/nope.test.ts'
+run 1 "兩條證據裡第二條不存在 → 1" "tests/nope.test.ts"
+
+setup
+rep "$W/repo/docs/adr/0001-example.md" '- **證據**: tests/example.test.ts
+' ''
+run 1 "標了邊界狀態卻沒有證據欄 → 1" "沒有 **證據**"
+
+setup
+mkdir -p "$W/repo/openspec/specs/cap-gamma"
+run 1 "某個 capability 目錄沒有 spec.md（其他都有）→ 1" "cap-gamma/ 沒有 spec.md"
+
+setup
+rep "$W/repo/openspec/specs/cap-alpha/spec.md" 'cap-alpha 存在是因為 `cap-beta` 需要它。' 'cap-alpha 存在是因為 `cap-beta` 需要它。
+第二行提到 `cap-delta`。'
+run 1 "Purpose 第二行的懸空引用也要抓 → 1" "cap-delta" "spec.md:5"
+
+setup
+printf '\n### D4\n\n## D5｜｜\n' >> "$W/repo/openspec/changes/c2/design.md"
+run 1 "### 層無標題、以及只有分隔符的標題 → 都報" "D4" "D5"
+
+setup
+printf '\n## D1｜archive 裡同一個編號又出現\n' >> "$W/repo/openspec/changes/archive/2026-01-01-c1/design.md"
+run 1 "archive 裡的重複也要報 → 1" "c1/D1 出現不只一次"
+
+setup
+rep "$W/repo/openspec/changes/c2/design.md" 'c1/D2' 'ghost/D2'
+run 1 "Supersedes 的 change id 不存在（即使別的 change 有 D2）→ 1" "ghost/D2"
+
+setup
+printf '\n## D3｜三節點循環的第三個\n\n- **Supersedes**: c1/D1\n' >> "$W/repo/openspec/changes/c2/design.md"
+rep "$W/repo/openspec/changes/archive/2026-01-01-c1/design.md" '## D1｜第一條決策
+
+理由。' '## D1｜第一條決策
+
+- **Supersedes**: c2/D3
+
+理由。'
+rep "$W/repo/openspec/changes/c2/design.md" '- **Supersedes**: c1/D2' '- **Supersedes**: c1/D1'
+run 1 "三節點的 Supersedes 循環 → 1" "循環"
+
+setup
+printf '\n### D7 補記：沒有 D7 的補記\n' >> "$W/repo/openspec/changes/c2/design.md"
+run 1 "沒有原決策的「補記」→ 1，不是安靜變成一條新決策" "D7" "補記"
+
+setup
+( cd "$W/repo" && out="$(bash "$TOOL" --json 2>/dev/null)" && printf '%s' "$out" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+assert "cap-alpha" in d["capabilities"] and d["capabilities"]["cap-alpha"]["refs"]==["cap-beta"], d["capabilities"]
+assert len(d["decisions"])==4 and d["findings"]==[] and d["adrs"][0]["state"]=="已強制", (len(d["decisions"]), d["findings"], d["adrs"])' ) \
+  && { PASS=$((PASS + 1)); echo "  ✓ --json 的內容跟文字模式一致（引用、決策數、ADR 狀態、findings）"; } \
+  || { FAIL=$((FAIL + 1)); echo "  ✗ --json 內容不對"; }
+
+setup
+rm -rf "${W:?}/repo/openspec/specs"
+( cd "$W/repo" && bash "$TOOL" --json >/dev/null 2>&1; [ $? = 2 ] ) && ( cd "$W/repo" && bash "$TOOL" --html >/dev/null 2>&1; [ $? = 2 ] ) \
+  && { PASS=$((PASS + 1)); echo "  ✓ --json／--html 量不到時一樣回 2"; } \
+  || { FAIL=$((FAIL + 1)); echo "  ✗ --json 或 --html 在沒有 specs 時沒有回 2"; }
+
 setup
 ( cd "$W/repo" && bash "$TOOL" --html >/dev/null 2>&1 && [ -s docs/arch.html ] \
   && grep -qF "cap-alpha" docs/arch.html && grep -qF "c2 · D1" docs/arch.html ) \
@@ -207,7 +280,7 @@ else
   FAIL=$((FAIL + 1)); echo "  ✗ docs/arch.html 不在 .gitignore 裡 —— 產物會被 commit 進去然後漂"
 fi
 
-rm -rf "$W"
+rm -rf "${W:?}"
 echo
 echo "通過 ${PASS}，失敗 ${FAIL}"
 [ "$FAIL" = 0 ]

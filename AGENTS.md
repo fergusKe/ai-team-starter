@@ -311,7 +311,7 @@ bash .github/scripts/arch-view.sh --html --open    # 同一份資料的網頁版
 | `openspec/changes/**/design.md` 的 `## D<n>` | 全部設計決策，搜尋用 | 架構摘要。大多是局部實作選擇 |
 
 接續一個 change 之前先看它的鄰域（`prompts/04-implement.md`）。**「亂掉」的實際形狀**是在
-衍生專案量出來的：三個系統邊界在實作中決定、寫在 spec 的 Purpose 裡、沒有 ADR；271 條決策
+衍生專案量出來的：三個系統邊界跟 WBS 原規劃不同，決定寫在各自 change 的 proposal 與 spec 的 Purpose 裡、沒有 ADR；271 條決策
 埋在 49 份帶日期前綴的 design.md 裡；`config.yaml` 寫「重大決策要留 ADR」而引用 ADR 的只有
 5 處。規則沒人執行，因為沒有東西讓「沒執行」看得見。
 

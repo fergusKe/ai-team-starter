@@ -11,7 +11,7 @@ bash .github/scripts/arch-view.sh        # 這個 capability 引用誰、被誰�
 
 把該 change 的 `design.md` 每一條 `D<n>` 對照現在的程式碼。**對不上的先報再做** ——
 接手的人在過期的 design 上繼續寫，是衍生專案實際發生過的漂移方式
-（三個邊界決定在實作中做了、事後才補 ADR）。
+（三個系統邊界在 change 裡決定了、跟 WBS 原規劃不同，而 WBS 與 ADR 都沒跟上）。
 
 ```
 /opsx:apply
