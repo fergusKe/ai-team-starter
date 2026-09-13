@@ -23,5 +23,6 @@ docs/arch.html
 /.local/archive-review/
 /.local/archive-review.jsonl
 
-# 多模型派工與票流程的產物與台帳（`.github/scripts/llm-team/`）。**不進版控** ——
+# 多模型派工與票流程的產物與台帳（`.agents/skills/llm-team/`）。**不進版控** ——
 /.local/llm-team/
+/.claude/worktrees/

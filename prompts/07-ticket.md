@@ -63,10 +63,10 @@
 
 ```bash
 # 0. 第一次開工前：對帳 settings.json（全對 exit 0；有缺印 JSON 片段 exit 1；不自動改設定）
-node .github/scripts/llm-team/setup.mjs --check
+node .agents/skills/llm-team/setup.mjs --check
 
 # 1. 第一回合：起跑（建立 worktree、寫手實作、自動跑測試與多模型複審）
-node .github/scripts/llm-team/ticket.mjs run \
+node .agents/skills/llm-team/ticket.mjs run \
   --name add-runner-check \
   --brief prompts/briefs/add-runner-check.md \
   --branch feat/runner-check--impl \
@@ -80,7 +80,7 @@ node .github/scripts/llm-team/ticket.mjs run \
 # 3. 統整者親自坐實每位複審者的 Q6（只准一件關鍵核實事項）。
 
 # 4. 第二回合：確認無誤後發布 Draft PR（永不自動 merge，留給人或統整者核准）
-node .github/scripts/llm-team/ticket.mjs publish \
+node .agents/skills/llm-team/ticket.mjs publish \
   --name add-runner-check \
   --title "feat: handle denied permissions in runner"
 ```
@@ -106,12 +106,12 @@ node .github/scripts/llm-team/ticket.mjs publish \
 
 ---
 
-## 五、跟模板對帳
-
-衍生專案定期對帳模板，更新不宣稱自動同步，升級由人決定：
+## 五、跟真源對帳
+ 
+模板只放唯讀快照，以 manifest 驗證完整性：
 ```bash
-node .github/scripts/llm-team/setup.mjs --sync-check <starterRoot>
+node .agents/skills/llm-team/setup.mjs --sync-check
 ```
-- 對帳符號：`=`（逐字相同）、`≠`（漂移）、`−`（本專案缺）、`+`（模板缺）。
-- `config.json` 刻意不在母體中（專案專屬配置，不對帳）。
-- 全同 exit 0，有漂移 exit 1（只報告不覆蓋，升級由人手動複製）。
+- 快照**不准手改**——要改程式去真源改、重新 export；`SOURCE.json` 記來源 commit。
+- 全同 exit 0，有漂移 exit 1（報告漂移檔案清單，不覆蓋）。
+- 若缺少快照或 MANIFEST.sha256 則 exit 2。

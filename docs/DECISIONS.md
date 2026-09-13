@@ -1396,7 +1396,7 @@ diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不�
 
 2026-09-13 三方共識（agy opus-4-6／Gemini 3.1 Pro／codex sol）。
 
-**決定**：多模型派工與票流程腳本（`lib.mjs`、`write.mjs`、`council.mjs`、`ticket.mjs`、`setup.mjs`）直接進模板 `.github/scripts/llm-team/` 目錄出貨。
+**決定**：多模型派工與票流程腳本（`lib.mjs`、`write.mjs`、`council.mjs`、`ticket.mjs`、`setup.mjs`）直接進模板（舊：`.github/scripts/llm-team/`）目錄出貨。
 
 **拒絕的替代**：
 1. **獨立 npm 套件**：發布到 npm 會引入打包構建、版本相依與安裝門檻，且這套工具目前僅在真實專案跑過三張票，過早承諾套件 API 與語意版本維護是負擔不是資產。
@@ -1407,3 +1407,19 @@ diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不�
 - **零相依、複製即用**：只用 Node.js 內建模組（`node:fs`、`node:path`、`node:child_process`），無需額外 npm install 即可運作。
 - **更新怎麼傳**：模板 repo 是單一真源，衍生專案以「逐字拿」方式同步腳本檔案。專案特有設定（模型 ID、指令白名單、worktree 路徑等）全部集中在 `config.json`，那是專案唯一該修改的設定檔。
 - **治理白名單決定**：同時將 `.claude/skills/` 納入 `check-pr-branch.sh` 的 `governance/*` 白名單。理由：它與 `prompts/` 同性質，皆為給 LLM 的操作規則（模板出貨的一部分），修改 skill 同屬改動流程與治理層，應允許在 governance PR 中維護。
+
+### 2026-09-13 修正：程式真源移到維護者的 config repo，模板只放唯讀快照
+
+三方三輪共識、Fergus 定案。llm-team 的程式只有一份可編輯真源（維護者私人 config repo `home/skills/llm-team/`）；模板放的是唯讀快照 `.agents/skills/llm-team/`（舊：`.github/scripts/llm-team/`），由真源的 `export.mjs` 產生，帶 `VERSION`、`SOURCE.json`（記來源 commit）與 `MANIFEST.sha256`。
+
+**決定**：
+- **快照＋manifest＋export**：程式真源在維護者私人 repo，模板只收唯讀快照與 manifest；CI 與 `test-llm-team.sh` 以 `setup.mjs --sync-check` 驗 manifest 完整性（零漂移 exit 0、漂移 exit 1、缺快照 exit 2），防人手手動修改快照。
+- **Harness 中立位置**：agy 找 `.agents/skills/<name>/SKILL.md`，Claude Code 找 `.claude/skills/<name>/`。正本放 harness 中立的 `.agents/skills/llm-team/`，`.claude/skills/llm-team` 建 symlink 指過去。專案設定在 repo 根 `llm-team.config.json`。
+
+**拒絕的替代**：
+1. **(a) 模板不放程式只指向私人 repo**：衍生專案與其他人 clone 後無法直接使用，破壞「開箱即用、零相依」。
+2. **(b) 先 merge 再搬**：分兩步會產生「舊程式已刪、快照未到」的空窗期；必須在同一個 PR 內原子切換。
+3. **(c) 雙向同步**：允許多處修改再 merge 會重演狀態發散與版本漂移；堅持單一真源、單向 export。
+
+**沒有的**：
+- **CI 不會自動拉真源**：export 由維護者手動在真源執行後 commit 快照進模板，CI 只驗快照與 manifest 一致性，不發任何連外請求。

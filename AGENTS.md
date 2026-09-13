@@ -391,10 +391,13 @@ ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）�
 
 ### 多模型分工的票流程（**是寫手的自我約束，不是 repo 的門**）
 
+`.agents/skills/llm-team/` 放的是唯讀快照，以 `node .agents/skills/llm-team/setup.mjs --sync-check` 驗 manifest。
+快照**不准手改**——要改程式去真源改、重新 export；`SOURCE.json` 記來源 commit。
+
 ```bash
-node .github/scripts/llm-team/setup.mjs --check              # 對帳 settings.json
-node .github/scripts/llm-team/ticket.mjs run --name <n> ...   # 寫手實作＋雙模型複審
-node .github/scripts/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
+node .agents/skills/llm-team/setup.mjs --check              # 對帳 settings.json
+node .agents/skills/llm-team/ticket.mjs run --name <n> ...   # 寫手實作＋雙模型複審
+node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
 ```
 
 **為什麼分工。** 統整者（Claude）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型（Gemini 3.8 Flash）
