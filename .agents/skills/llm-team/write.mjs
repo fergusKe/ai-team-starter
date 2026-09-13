@@ -32,9 +32,14 @@ import {
   assertSettingsAllowRegex,
   CLEAN_GIT_ENV,
   isDirectRun,
+  BASE_COMMAND_HEADS,
 } from './lib.mjs'
 
-export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback }) {
+export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads }) {
+  const allowedLine =
+    allowedHeads && allowedHeads.length
+      ? [`     你只准跑這些指令頭：${allowedHeads.join('、')}。其他任何指令一跑整輪就被殺、你的改動作廢——需要清單外的指令就停下回報。`]
+      : []
   const head = [
     `工作目錄（絕對路徑，所有檔案操作只准在這棵樹內）：${worktree}`,
     '🔴 硬規則（違反任一條就停下來回報，不要自己變通）：',
@@ -42,6 +47,7 @@ export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback 
     '  2. 每次只執行【一個】指令；禁止用 `;`、`&&`、`||`、管線串接；禁止 rm、git commit/push/checkout/reset/stash/clean、curl、安裝相依。',
     '     `node -e "…"` 裡的程式碼也不准含 `;`、`&&`、`|`、`$`、反引號（權限規則把它們當串接，整輪會被中止）；要做實驗就寫進測試檔用 node --test 跑。',
     '     不要 `ps`、不要等背景任務——所有指令都同步跑完再看結果。',
+    ...allowedLine,
     '  3. 需要碰清單外的檔、或需要清單外的指令 ⇒ 立刻停止，在回覆裡說明「需要什麼、為什麼」。',
     '  4. 最後一段回覆要列：改了哪些檔（相對路徑）、跑了哪些指令、測試結果、還有什麼沒做。',
     '',
@@ -174,9 +180,13 @@ export function main(argv, deps = {}) {
   let feedback = ''
   let conversationId = null
 
+  const allowedHeads = [
+    ...BASE_COMMAND_HEADS,
+    ...(config.allowCommandHeads || []),
+  ]
   let toolErrorRetries = 0
   for (let round = 1; round <= maxRounds; round++) {
-    const prompt = buildWriterPrompt({ brief, worktree, allowlist, round, feedback })
+    const prompt = buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads })
     const extraArgs = round === 1 ? [] : ['--conversation', conversationId]
     let r = run({
       model,

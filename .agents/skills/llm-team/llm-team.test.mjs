@@ -13,7 +13,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 import {
   CLEAN_GIT_ENV,
   loadConfig,
@@ -353,6 +353,60 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
     assert.match(p, /安裝相依/)
     assert.doesNotMatch(p, /pnpm install/)
     assert.doesNotMatch(p, /\nB$/)
+  })
+  test('buildWriterPrompt 輸出含 allowedHeads（npm test 與 node --test），且 round 2 也含', () => {
+    const allowedHeads = ['pwd', 'node --test', 'npm test']
+    const p1 = buildWriterPrompt({ brief: 'B', worktree: '/w', allowlist: ['a.ts'], round: 1, allowedHeads })
+    assert.match(p1, /npm test/)
+    assert.match(p1, /node --test/)
+    assert.match(p1, /你只准跑這些指令頭：/)
+
+    const p2 = buildWriterPrompt({ brief: 'B', worktree: '/w', allowlist: ['a.ts'], round: 2, feedback: 'FAIL', allowedHeads })
+    assert.match(p2, /npm test/)
+    assert.match(p2, /node --test/)
+    assert.match(p2, /你只准跑這些指令頭：/)
+  })
+  test('main 級陽性對照：config allowCommandHeads 傳入 write.main ⇒ deps.runAgy 攔到的 prompt 含 npm test 與 node --test', () => {
+    const repo = makeRepo({ allowCommandHeads: ['npm test'] })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(repo.dir, '.agy-write')
+
+    let capturedPrompt = null
+    const deps = {
+      assertSettings: () => true,
+      runAgy: (args) => {
+        capturedPrompt = args.prompt
+        fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
+        return {
+          exit: 0,
+          stdout: '',
+          stderr: '',
+          denied: [],
+          result: { response: 'ok', conversation_id: 'conv-allowed-heads' },
+          steps: [],
+          conversationId: 'conv-allowed-heads',
+        }
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = writeMain(
+        ['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `main() 應回 0，實際為 ${code}`)
+    assert.ok(capturedPrompt, 'deps.runAgy 應攔截到 prompt')
+    assert.match(capturedPrompt, /npm test/, 'prompt 應包含自訂的 npm test 指令頭')
+    assert.match(capturedPrompt, /node --test/, 'prompt 應包含內建基底的 node --test 指令頭')
   })
   test('installCommand 非空時於第 1 輪前在 worktree 執行並寫入台帳 installExit', () => {
     const repo = makeRepo({ installCommand: 'echo installed > install.txt' })
@@ -943,7 +997,7 @@ describe('isDirectRun：symlink 下判斷直接執行', () => {
   test('陽性對照（真的跑子行程）：在 tmp 目錄建 symlink export-link.mjs → 真實 export.mjs', () => {
     const tmp = tmpdir('export-link-')
     const linkPath = path.join(tmp, 'export-link.mjs')
-    const realExport = path.resolve('home/skills/llm-team/export.mjs')
+    const realExport = fileURLToPath(new URL('./export.mjs', import.meta.url))
     fs.symlinkSync(realExport, linkPath)
 
     const tmpTarget = tmpdir('export-target-')

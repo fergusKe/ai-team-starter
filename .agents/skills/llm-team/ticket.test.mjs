@@ -293,7 +293,15 @@ describe('ticket.mjs 票流程測試', () => {
       rounds: 1,
       changed: ['file.txt'],
       verifyExit: 0,
-      review: { tier: 'standard', members: [], anyEmpty: false },
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified',
       coordinatorTurns: null,
       startedAt: '2026-09-13T00:00:00Z',
       finishedAt: '2026-09-13T00:05:00Z',
@@ -377,7 +385,15 @@ describe('ticket.mjs 票流程測試', () => {
       rounds: 1,
       changed: ['file.txt'],
       verifyExit: 0,
-      review: { tier: 'standard', members: [], anyEmpty: false },
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified',
       coordinatorTurns: null,
       startedAt: '2026-09-13T00:00:00Z',
       finishedAt: '2026-09-13T00:05:00Z',
@@ -436,7 +452,15 @@ describe('ticket.mjs 票流程測試', () => {
       rounds: 1,
       changed: ['file1.txt', 'file2.txt'],
       verifyExit: 0,
-      review: { tier: 'standard', members: [], anyEmpty: false },
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified',
       coordinatorTurns: null,
       startedAt: '2026-09-13T00:00:00Z',
       finishedAt: '2026-09-13T00:05:00Z',
@@ -801,6 +825,884 @@ describe('ticket.mjs 票流程測試', () => {
 
     assert.equal(writeCalled, true, 'writeMain 應被呼叫')
     assert.equal(code, 0, `run 應成功執行完畢，實際 exit code 為 ${code}`)
+  })
+
+  test('T19 writeMain 回 3、changed 空 ⇒ run 回 3（陽性對照：把第 1 點拿掉就回 0）', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T19\n內容')
+
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => 3,
+      changedFiles: () => [],
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't19',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t19--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 3, `writeMain 回 3 時 run 應回 3，實際得到 ${code}`)
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't19', 'summary.json')
+    assert.ok(fs.existsSync(summaryFile), 'summary.json 應存在')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    assert.equal(summary.writeExit, 3)
+    assert.deepEqual(summary.changed, [])
+  })
+
+  test('T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T20\n內容')
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't20')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't20', 'review')
+
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'changed')
+        return 0
+      },
+      runTest: () => ({ exit: 1, out: 'test failed' }),
+      councilMain: () => {
+        fs.mkdirSync(reviewOutDir, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        return 0
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't20',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t20--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 3, `verifyExit 非零時 run 應回 3，實際得到 ${code}`)
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't20', 'summary.json')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    assert.equal(summary.verifyExit, 1)
+  })
+
+  test('T21 全綠 ⇒ 0', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T21\n內容')
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't21')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't21', 'review')
+
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+      councilMain: () => {
+        fs.mkdirSync(reviewOutDir, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        return 0
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't21',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t21--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `全綠時 run 應回 0，實際得到 ${code}`)
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't21', 'summary.json')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    assert.equal(summary.writeExit, 0)
+    assert.equal(summary.verifyExit, 0)
+    assert.equal(summary.review.anyEmpty, false)
+  })
+
+  test('T22 publish：summary verifyExit:1 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't22')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't22')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't22',
+      branch: 'feat/t22--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 1,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't22'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `verifyExit: 1 時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /verifyExit/)
+  })
+
+  test('T23 publish：summary anyEmpty:true ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't23')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't23')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't23',
+      branch: 'feat/t23--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: true,
+      },
+      q6Receipt: 'verified',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't23'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `anyEmpty: true 時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /anyEmpty/)
+  })
+
+  test('T24 publish：一位 overall:\'不簽\' 且無 dispositions ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't24')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't24')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't24',
+      branch: 'feat/t24--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '不簽', q: { Q1: '不簽' } },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't24'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `有不簽且無 disposition 時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /不簽/)
+  })
+
+  test('T25 同上但 accept --disposition 標了 rejected ＋ --q6 ⇒ publish 走到 gh', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't25')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't25')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't25',
+      branch: 'feat/t25--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '不簽', q: { Q1: '不簽' } },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          if (args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+          if (args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/456' }
+        }
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    // 1. accept 寫入 disposition 與 q6
+    const acceptCode = ticketMain(
+      ['accept', '--name', 't25', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'opus:Q1=rejected:"範圍縮減裁決"'],
+      deps
+    )
+    assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
+
+    const updatedSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(updatedSummary.q6Receipt, '已確認 Q1 不影響主流程')
+    assert.equal(updatedSummary.dispositions.length, 1)
+    assert.equal(updatedSummary.dispositions[0].disposition, 'rejected')
+
+    // 2. publish 通過
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let publishCode
+    try {
+      publishCode = ticketMain(['publish', '--name', 't25'], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(publishCode, 0, `disposition 與 q6Receipt 齊全時 publish 應回 0，實際為 ${publishCode}`)
+    assert.equal(ghCalled, true, 'gh 應被呼叫')
+  })
+
+  test('T26 publish：沒 q6Receipt ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't26')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't26')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't26',
+      branch: 'feat/t26--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      // 缺 q6Receipt
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't26'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `缺少 q6Receipt 時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /q6Receipt/)
+  })
+
+  test('T27 lifecycle：跑完 run 後 lifecycle.ndjson 至少有 run-start、writer-done、review-done 三行、順序正確、每行有 harness；設 LLM_TEAM_HARNESS=agy 時 harness 為 agy', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T27\n內容')
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't27')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't27', 'review')
+
+    const deps = {
+      repoRoot: repo.dir,
+      env: { LLM_TEAM_HARNESS: 'agy' },
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+      councilMain: () => {
+        fs.mkdirSync(reviewOutDir, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        return 0
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't27',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t27--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `run 應回 0，實際為 ${code}`)
+
+    const lifecyclePath = path.join(repo.dir, '.local', 'llm-team', 't27', 'lifecycle.ndjson')
+    assert.ok(fs.existsSync(lifecyclePath), 'lifecycle.ndjson 應存在')
+    const lines = fs
+      .readFileSync(lifecyclePath, 'utf8')
+      .trim()
+      .split('\n')
+
+    assert.deepStrictEqual(lines.map((l) => JSON.parse(l).event), ['run-start', 'writer-done', 'review-done'])
+
+    const parsed = lines.map((l) => JSON.parse(l))
+    for (const item of parsed) {
+      assert.equal(item.harness, 'agy', '每行 lifecycle 的 harness 應為 agy')
+      assert.equal(item.ticket, 't27')
+      assert.ok(item.at, '每行應有時間戳記 at')
+    }
+    assert.equal(parsed[1].writeExit, 0, 'writer-done 應包含 writeExit: 0')
+    assert.equal(parsed[2].anyEmpty, false, 'review-done 應包含 anyEmpty: false')
+
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't27', 'summary.json')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    assert.equal(summary.harness, 'agy')
+    assert.equal(summary.lifecycle, 'lifecycle.ndjson')
+    assert.equal(summary.comparable, false)
+  })
+
+  test('T28 summary --name：印出 harness、q6Receipt（有無）、dispositions 數', () => {
+    const repo = makeRepo()
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't28')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't28',
+      branch: 'feat/t28--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['a.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [{ name: 'opus', overall: '簽' }],
+        anyEmpty: false,
+      },
+      harness: 'agy',
+      q6Receipt: 'verified ok',
+      dispositions: [{ member: 'opus', q: 'Q1', disposition: 'rejected', note: 'n', by: 'c', at: '2026' }],
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['summary', '--name', 't28'], { repoRoot: repo.dir })
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0)
+    const outText = outs.join('\n')
+    assert.match(outText, /harness: agy/)
+    assert.match(outText, /q6Receipt: 有/)
+    assert.match(outText, /dispositions: 1/)
+  })
+
+  test('T29 lifecycle：writeMain 回 3 失敗時 lifecycle 恰有 run-start 與 writer-done 兩行（無 review-done）', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T29\n內容')
+
+    let councilCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      writeMain: () => 3,
+      councilMain: () => {
+        councilCalled = true
+        return 0
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't29',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t29--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 3, `writeMain 回 3 且 changed 為空時 run 應回 3，實際為 ${code}`)
+    assert.equal(councilCalled, false, 'council 不應被呼叫')
+
+    const lifecyclePath = path.join(repo.dir, '.local', 'llm-team', 't29', 'lifecycle.ndjson')
+    assert.ok(fs.existsSync(lifecyclePath), 'lifecycle.ndjson 應存在')
+    const lines = fs.readFileSync(lifecyclePath, 'utf8').trim().split('\n')
+    assert.deepStrictEqual(
+      lines.map((l) => JSON.parse(l).event),
+      ['run-start', 'writer-done']
+    )
+  })
+
+  test('T30 publish：summary writeExit:3 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't30')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't30')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't30',
+      branch: 'feat/t30--slice',
+      base: 'main',
+      writeExit: 3,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified ok',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't30'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `writeExit: 3 時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /writeExit 為 3/)
+  })
+
+  test('T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't31')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't31')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't31',
+      branch: 'feat/t31--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [{ name: 'opus', overall: '簽' }],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified ok',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't31'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `review.members 少於 2 位時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /複審成員少於 2 位/)
+  })
+
+  test('T32 publish：同成員兩題不簽只處置一題 ⇒ publish 回 2 且 gh 未呼叫', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't32')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't32')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't32',
+      branch: 'feat/t32--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'block',
+        members: [
+          { name: 'opus', overall: '簽' },
+          { name: 'codex', overall: '不簽', q: { Q1: '不簽', Q6: '不簽' } },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified ok',
+      dispositions: [
+        { member: 'codex', q: 'Q1', disposition: 'rejected', note: 'Q1 裁決', by: 'coordinator', at: '2026-09-13' },
+      ],
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd) => {
+        if (cmd === 'gh') ghCalled = true
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(['publish', '--name', 't32'], deps)
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `同成員兩題不簽只處置一題時 publish 應回 2，實際為 ${code}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /codex 之 Q6 不簽且未處置/)
+  })
+
+  test('T33 publish：整份不簽無逐題時給 q:Q3 仍回 2，給 q:overall 且 accept 寫入後 publish 通過', () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't33')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't33')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'test-proj',
+      ticket: 't33',
+      branch: 'feat/t33--slice',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: [
+          { name: 'opus', overall: '不簽', q: {} },
+          { name: 'gemini', overall: '簽' },
+        ],
+        anyEmpty: false,
+      },
+      q6Receipt: 'verified ok',
+      dispositions: [
+        // 給了 Q3 disposition，但 member 只有整份不簽無逐題，只認 overall
+        { member: 'opus', q: 'Q3', disposition: 'rejected', note: '無效的逐題處置', by: 'coordinator', at: '2026-09-13' },
+      ],
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          if (args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+          if (args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/789' }
+        }
+        return { status: 0, stdout: '' }
+      },
+    }
+
+    // 1. 給了 q: 'Q3' 的 disposition ⇒ publish 仍回 2 且 gh 沒呼叫
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code1
+    try {
+      code1 = ticketMain(['publish', '--name', 't33'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code1, 2, `整份不簽無逐題給了 Q3 disposition 時 publish 應回 2，實際為 ${code1}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errs.join('\n'), /opus 整份不簽且未處置/)
+
+    // 2. 測試 accept --disposition opus:overall=rejected:"..." 寫入
+    const acceptCode = ticketMain(
+      ['accept', '--name', 't33', '--q6', '親自坐實', '--disposition', 'opus:overall=rejected:"整體風險已控制"'],
+      deps
+    )
+    assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
+
+    const updatedSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    const overallDisp = updatedSummary.dispositions.find((d) => d.member === 'opus' && d.q === 'overall')
+    assert.ok(overallDisp, 'summary.dispositions 應包含 q === overall 的處置')
+    assert.equal(overallDisp.disposition, 'rejected')
+    assert.equal(overallDisp.note, '整體風險已控制')
+
+    // 3. 給了 q: 'overall' ⇒ publish 通過
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code2
+    try {
+      code2 = ticketMain(['publish', '--name', 't33'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code2, 0, `處置 overall 後 publish 應回 0，實際為 ${code2}`)
+    assert.equal(ghCalled, true, 'gh 應被呼叫')
   })
 })
 

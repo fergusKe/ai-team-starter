@@ -84,11 +84,43 @@ function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** 內建基底（不包含特定專案工具如 pnpm、npx vitest、node tools/）。 */
-export const BASE_SAFE_HEAD =
-  'pwd|ls|cat|head|tail|wc|grep|rg|find|echo|sed -n|awk|sort|uniq|diff|tr|cut|date|which' +
-  '|node --test|node --check|node -e|node -v|cd' +
-  '|git (status|diff|log|ls-files|rev-parse|blame|show|grep)'
+export const BASE_COMMAND_HEADS = [
+  'pwd',
+  'ls',
+  'cat',
+  'head',
+  'tail',
+  'wc',
+  'grep',
+  'rg',
+  'find',
+  'echo',
+  'sed -n',
+  'awk',
+  'sort',
+  'uniq',
+  'diff',
+  'tr',
+  'cut',
+  'date',
+  'which',
+  'node --test',
+  'node --check',
+  'node -e',
+  'node -v',
+  'cd',
+  'git status',
+  'git diff',
+  'git log',
+  'git ls-files',
+  'git rev-parse',
+  'git blame',
+  'git show',
+  'git grep',
+]
+
+/** 內建基底（不包含特定專案工具如 pnpm、npx vitest、node tools/）。由 BASE_COMMAND_HEADS 單一來源組出。 */
+export const BASE_SAFE_HEAD = BASE_COMMAND_HEADS.map(escapeRegex).join('|')
 
 /**
  * 寫手在無頭模式准跑的指令：內建基底 ＋ config 的 allowCommandHeads。

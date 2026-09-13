@@ -57,11 +57,29 @@ function formatReviewerSummary(m) {
   return lines
 }
 
+function appendLifecycle(outDir, entry, env = process.env) {
+  const lifecycleFile = path.join(outDir, 'lifecycle.ndjson')
+  const base = {
+    at: new Date().toISOString(),
+    event: entry.event,
+    ticket: entry.ticket,
+    harness: (env && env.LLM_TEAM_HARNESS) || 'unknown',
+    conversationId: (env && env.LLM_TEAM_CONVERSATION_ID) || null,
+  }
+  const full = { ...base, ...entry }
+  fs.mkdirSync(outDir, { recursive: true })
+  fs.appendFileSync(lifecycleFile, JSON.stringify(full) + '\n')
+}
+
 function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
+  const harness = summary.harness || 'unknown'
+  const q6 = summary.q6Receipt ? '有' : '無'
+  const dispCount = Array.isArray(summary.dispositions) ? summary.dispositions.length : 0
   const lines = [
     `=== 收貨摘要：${summary.ticket} (${summary.branch}) ===`,
     `改動檔: ${summary.changed.join(', ') || '(無)'}`,
     `write exit: ${summary.writeExit} (共 ${summary.rounds} 輪) | verify exit: ${summary.verifyExit !== null ? summary.verifyExit : '-'}`,
+    `harness: ${harness} | q6Receipt: ${q6} | dispositions: ${dispCount}`,
   ]
 
   if (summary.tierEscalatedBy && summary.tierEscalatedBy.length > 0) {
@@ -81,11 +99,14 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
 }
 
 export function main(argv, deps = {}) {
-  const parsedAll = parseArgs(argv, ['allow'])
+  const env = deps.env || process.env
+  const harness = (env && env.LLM_TEAM_HARNESS) || 'unknown'
+  const conversationId = (env && env.LLM_TEAM_CONVERSATION_ID) || null
+  const parsedAll = parseArgs(argv, ['allow', 'disposition'])
   const sub = parsedAll._[0]
   const rest = argv.slice(argv.indexOf(sub) + 1)
-  if (!sub || !['run', 'publish', 'summary'].includes(sub)) {
-    console.error('用法：node ticket.mjs run|publish|summary ...')
+  if (!sub || !['run', 'publish', 'summary', 'accept'].includes(sub)) {
+    console.error('用法：node ticket.mjs run|publish|summary|accept ...')
     return 2
   }
 
@@ -189,6 +210,7 @@ export function main(argv, deps = {}) {
     fs.mkdirSync(outDir, { recursive: true })
     const briefContent = fs.readFileSync(path.resolve(a.brief), 'utf8')
     fs.writeFileSync(path.join(outDir, 'brief.md'), briefContent)
+    appendLifecycle(outDir, { event: 'run-start', ticket: a.name }, env)
 
     // riskDomains 升級複審（tier => block，不直接判罪）
     const riskDomains = Array.from(
@@ -230,6 +252,7 @@ export function main(argv, deps = {}) {
     if (configFile) writeArgs.push('--config', configFile)
 
     const writeExit = writeMainFn(writeArgs, deps)
+    appendLifecycle(outDir, { event: 'writer-done', ticket: a.name, writeExit }, env)
 
     // c. write 回 2 ⇒ 直接 exit 2 不複審
     if (writeExit === 2) {
@@ -301,6 +324,7 @@ export function main(argv, deps = {}) {
         })
       }
       if (councilExit === 3) anyEmpty = true
+      appendLifecycle(outDir, { event: 'review-done', ticket: a.name, anyEmpty }, env)
     }
 
     // 計算 rounds
@@ -335,6 +359,9 @@ export function main(argv, deps = {}) {
       ...(tierEscalatedBy ? { tierEscalatedBy } : {}),
       review: reviewObj,
       coordinatorTurns: null,
+      harness,
+      lifecycle: 'lifecycle.ndjson',
+      comparable: false,
       startedAt,
       finishedAt: new Date().toISOString(),
     }
@@ -346,6 +373,10 @@ export function main(argv, deps = {}) {
     const receiptLines = buildReceiptSummaryLines(summary, reviewMembers, summaryPath)
     console.log(receiptLines.join('\n'))
 
+    // 🔴 2026-09-13 事故：寫手第 1 輪被拒（write exit 3、改動 0 檔）run 仍 exit 0 假綠；陽性對照 ticket.test.mjs「T19 writeMain 回 3、changed 空 ⇒ run 回 3（陽性對照：把第 1 點拿掉就回 0）」；停止條件：run 流程改為事件驅動狀態機且能原生傳播子程序 exit code 時重審
+    if (writeExit !== 0) return 3
+    // 🔴 2026-09-13 事故：模板票 verify 紅（exit 1）run 仍 exit 0 假綠；陽性對照 ticket.test.mjs「T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3」；停止條件：run 流程改為事件驅動狀態機且能原生傳播驗收 exit code 時重審
+    if (verifyExit !== null && verifyExit !== 0) return 3
     if (councilExit !== null && councilExit !== 0 && councilExit !== 3) return councilExit
     if (anyEmpty) return 3
     return 0
@@ -399,6 +430,75 @@ export function main(argv, deps = {}) {
     const unexpected = currentFiles.filter((f) => !summaryChangedSet.has(f))
     if (unexpected.length > 0) {
       console.error(`🔴 publish：worktree 有 run 之後才出現的檔，不准夾帶：${unexpected.join(', ')}`)
+      return 2
+    }
+
+    // Fail-closed 檢查
+    // 🔴 2026-09-13 事故：寫手失敗（writeExit 非 0）時若帶有髒改動可能被誤開 PR；陽性對照 ticket.test.mjs「T30 publish：summary writeExit:3 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或 publish 改為吃不可篡改之寫手證明時重審
+    if (summary.writeExit !== 0) {
+      console.error(`🔴 publish：writeExit 為 ${summary.writeExit}（非 0），不得開 PR`)
+      return 2
+    }
+
+    // 🔴 2026-09-13 事故：verify 失敗（verifyExit 非 0 或 null）被誤開 PR 造成破壞性合入；陽性對照 ticket.test.mjs「T22 publish：summary verifyExit:1 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或 publish 改為驗收憑據強簽名時重審
+    if (summary.verifyExit === null || summary.verifyExit !== 0) {
+      console.error(`🔴 publish：verifyExit 為 ${summary.verifyExit}（未通過驗收），不得開 PR`)
+      return 2
+    }
+
+    // 🔴 2026-09-13 事故：複審成員被 headless 權限靜默拒絕零輸出（anyEmpty）仍被誤判通過；陽性對照 ticket.test.mjs「T23 publish：summary anyEmpty:true ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或 council 輸出改為嚴格 schema 驗證不可為空時重審
+    if (summary.review?.anyEmpty === true) {
+      console.error('🔴 publish：複審有成員零輸出（anyEmpty === true），不得開 PR')
+      return 2
+    }
+
+    // 🔴 2026-09-13 事故：複審成員少於 2 位不足法定人數（quorum 崩潰）被單方開 PR；陽性對照 ticket.test.mjs「T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或三方仲裁協議改版時重審
+    const reviewMembersList = summary.review?.members || []
+    if (!Array.isArray(reviewMembersList) || reviewMembersList.length < 2) {
+      console.error(`🔴 publish：複審成員少於 2 位（${reviewMembersList.length} 位），不得開 PR`)
+      return 2
+    }
+
+    // 🔴 2026-09-13 事故：複審成員不簽卻因 disposition 遺漏或比對漏洞被直接放行開 PR；陽性對照 ticket.test.mjs「T24 publish：一位 overall:'不簽' 且無 dispositions ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或引入去中心化裁決合約時重審
+    const dispositions = Array.isArray(summary.dispositions) ? summary.dispositions : []
+    for (const m of reviewMembersList) {
+      if (m.overall !== '簽') {
+        const unsignedQs = Object.entries(m.q || {}).filter(([_, verdict]) => verdict === '不簽').map(([qn]) => qn)
+        if (unsignedQs.length === 0) {
+          const hasDisp = dispositions.some(
+            (d) =>
+              d.member === m.name &&
+              d.q === 'overall' &&
+              ['rejected', 'confirmed-fixed'].includes(d.disposition) &&
+              d.note &&
+              d.by
+          )
+          if (!hasDisp) {
+            console.error(`🔴 publish：複審成員 ${m.name} 整份不簽且未處置，不得開 PR`)
+            return 2
+          }
+        } else {
+          for (const qn of unsignedQs) {
+            const hasDisp = dispositions.some(
+              (d) =>
+                d.member === m.name &&
+                d.q === qn &&
+                ['rejected', 'confirmed-fixed'].includes(d.disposition) &&
+                d.note &&
+                d.by
+            )
+            if (!hasDisp) {
+              console.error(`🔴 publish：複審成員 ${m.name} 之 ${qn} 不簽且未處置，不得開 PR`)
+              return 2
+            }
+          }
+        }
+      }
+    }
+
+    // 🔴 2026-09-13 事故：統整者未親自坐實審查意見（缺少 q6Receipt）即盲目開 PR；陽性對照 ticket.test.mjs「T26 publish：沒 q6Receipt ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或 Q6 查核改為強制雙人簽章時重審
+    if (!summary.q6Receipt || !String(summary.q6Receipt).trim()) {
+      console.error('🔴 publish：缺少 q6Receipt（統整者親自坐實 Q6 的證據），不得開 PR')
       return 2
     }
 
@@ -471,7 +571,9 @@ export function main(argv, deps = {}) {
       return prRes.status || 1
     }
 
-    console.log((prRes.stdout || '').trim())
+    const prUrl = (prRes.stdout || '').trim()
+    appendLifecycle(outDir, { event: 'published', ticket: a.name, prUrl, url: prUrl }, env)
+    console.log(prUrl)
     return 0
   }
 
@@ -507,6 +609,98 @@ export function main(argv, deps = {}) {
 
     const receiptLines = buildReceiptSummaryLines(summary, reviewMembers, summaryPath)
     console.log(receiptLines.join('\n'))
+    return 0
+  }
+
+  if (sub === 'accept') {
+    const a = parseArgs(rest, ['disposition'])
+    if (!a.name) {
+      console.error('用法：accept --name <n> --q6 "<receipt>" [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...')
+      return 2
+    }
+    if (!a.q6 || !String(a.q6).trim()) {
+      console.error('🔴 accept：--q6 必填且不可為空')
+      return 2
+    }
+
+    const outBaseDir = config.outDir || '.local/llm-team'
+    const outDir = path.resolve(repoRoot, outBaseDir, a.name)
+    const summaryPath = path.join(outDir, 'summary.json')
+    if (!fs.existsSync(summaryPath)) {
+      console.error(`🔴 summary.json 不存在：${summaryPath}`)
+      return 2
+    }
+
+    let summary
+    try {
+      summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+    } catch (e) {
+      console.error(`🔴 summary.json 解析失敗：${e.message}`)
+      return 2
+    }
+
+    const now = new Date().toISOString()
+    const rawDispositions = Array.isArray(a.disposition)
+      ? a.disposition
+      : a.disposition
+      ? [a.disposition]
+      : []
+
+    const newDispositions = []
+    for (const raw of rawDispositions) {
+      const eqIdx = raw.indexOf('=')
+      if (eqIdx === -1) {
+        console.error(`🔴 disposition 格式不合法（缺少 =）：${raw}`)
+        return 2
+      }
+      const left = raw.slice(0, eqIdx).trim()
+      const right = raw.slice(eqIdx + 1).trim()
+      const colonMemberQ = left.indexOf(':')
+      if (colonMemberQ === -1) {
+        console.error(`🔴 disposition 格式不合法（缺少 member:Qn 或 member:overall）：${raw}`)
+        return 2
+      }
+      const member = left.slice(0, colonMemberQ).trim()
+      const q = left.slice(colonMemberQ + 1).trim()
+
+      const colonDispNote = right.indexOf(':')
+      const disposition = (colonDispNote === -1 ? right : right.slice(0, colonDispNote)).trim()
+      let note = (colonDispNote === -1 ? '' : right.slice(colonDispNote + 1)).trim()
+      if ((note.startsWith('"') && note.endsWith('"')) || (note.startsWith("'") && note.endsWith("'"))) {
+        note = note.slice(1, -1)
+      }
+
+      if (!member || !q || !['rejected', 'confirmed-fixed'].includes(disposition)) {
+        console.error(`🔴 disposition 格式不合法（disposition 必須為 rejected 或 confirmed-fixed）：${raw}`)
+        return 2
+      }
+      newDispositions.push({
+        member,
+        q,
+        disposition,
+        note,
+        by: 'coordinator',
+        at: now,
+      })
+    }
+
+    const existingDispositions = Array.isArray(summary.dispositions) ? summary.dispositions : []
+    const dispMap = new Map()
+    for (const d of existingDispositions) {
+      dispMap.set(`${d.member}:${d.q}`, d)
+    }
+    for (const d of newDispositions) {
+      dispMap.set(`${d.member}:${d.q}`, d)
+    }
+
+    summary.q6Receipt = String(a.q6).trim()
+    summary.dispositions = Array.from(dispMap.values())
+    summary.acceptedAt = now
+
+    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
+    appendLifecycle(outDir, { event: 'accepted', ticket: a.name }, env)
+
+    console.log(`✅ 已裁決 accept：${a.name}（q6Receipt 有，dispositions 共 ${summary.dispositions.length} 筆）`)
     return 0
   }
 
