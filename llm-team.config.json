@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "models": {
+    "writer": "gemini-3.8-flash-high",
+    "reviewers": [
+      "claude-opus-4-6-thinking",
+      "gemini-3.1-pro-high"
+    ],
+    "codex": "gpt-5.6-sol"
+  },
+  "allowCommandHeads": [
+    "npm test",
+    "npm run",
+    "npx openspec validate",
+    "bash .github/scripts/test-"
+  ],
+  "worktreeRoot": ".claude/worktrees",
+  "installCommand": "",
+  "maxRounds": 3,
+  "riskDomains": [],
+  "outDir": ".local/llm-team"
+}
