@@ -15,7 +15,7 @@
     "bash .github/scripts/test-"
   ],
   "worktreeRoot": ".claude/worktrees",
-  "installCommand": "",
+  "installCommand": "npm ci --no-audit --no-fund",
   "maxRounds": 3,
   "riskDomains": [],
   "outDir": ".local/llm-team"
