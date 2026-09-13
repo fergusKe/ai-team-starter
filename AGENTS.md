@@ -400,8 +400,8 @@ node .agents/skills/llm-team/ticket.mjs run --name <n> ...   # 寫手實作＋�
 node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
 ```
 
-**為什麼分工。** 統整者（Claude）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型（Gemini 3.8 Flash）
-動手寫，再由兩位獨立模型（Opus 4.6、Gemini 3.1 Pro，block 級加 Codex）複審。省的是統整者回合，
+**為什麼分工。** 統整者（Claude 或 agy，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
+動手寫，再由兩位獨立模型複審（寫手與複審名單**只住 `llm-team.config.json`**，本檔不寫死模型名）。省的是統整者回合，
 作者≠審核者避免「自己寫自己審」的盲區。
 
 **寫手 wrapper 的自我約束（G1–G6 各擋什麼）。**
