@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { CLEAN_GIT_ENV, buildSafeCommandRegex } from './lib.mjs'
 import { main as ticketMain } from './ticket.mjs'
 import { main as setupMain } from './setup.mjs'
+import { EXPORT_FILES } from './export.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -2401,7 +2402,7 @@ describe('setup.mjs 設定對帳測試', () => {
     const snapshotDir = path.join(repo.dir, '.agents', 'skills', 'llm-team')
     fs.mkdirSync(snapshotDir, { recursive: true })
 
-    const testFiles = ['lib.mjs', 'write.mjs', 'VERSION']
+    const testFiles = EXPORT_FILES
     const manifestLines = []
     for (const f of testFiles) {
       const p = path.join(snapshotDir, f)
@@ -2438,7 +2439,7 @@ describe('setup.mjs 設定對帳測試', () => {
     const snapshotDir = path.join(repo.dir, '.agents', 'skills', 'llm-team')
     fs.mkdirSync(snapshotDir, { recursive: true })
 
-    const testFiles = ['lib.mjs', 'VERSION']
+    const testFiles = EXPORT_FILES
     const manifestLines = []
     for (const f of testFiles) {
       const p = path.join(snapshotDir, f)
@@ -2447,6 +2448,10 @@ describe('setup.mjs 設定對帳測試', () => {
       const hash = crypto.createHash('sha256').update(content).digest('hex')
       manifestLines.push(`${hash}  ${f}`)
     }
+    const sourceContent = JSON.stringify({ version: '1', sourceCommit: '12345678', exportedAt: '2026-09-13T00:00:00.000Z' }) + '\n'
+    fs.writeFileSync(path.join(snapshotDir, 'SOURCE.json'), sourceContent)
+    const sourceHash = crypto.createHash('sha256').update(sourceContent).digest('hex')
+    manifestLines.push(`${sourceHash}  SOURCE.json`)
     manifestLines.sort()
     fs.writeFileSync(path.join(snapshotDir, 'MANIFEST.sha256'), manifestLines.join('\n') + '\n')
 

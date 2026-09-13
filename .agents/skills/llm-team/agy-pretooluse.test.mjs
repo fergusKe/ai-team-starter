@@ -6,7 +6,12 @@ import path from 'node:path'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { GIT_ENV_VARS, CLEAN_GIT_ENV } from './lib.mjs'
-import { resolveGuardPath, getGuardCandidates } from './setup.mjs'
+import { resolveGuardPath, guardCandidates } from './setup.mjs'
+
+export function shouldSkipGuardIntegration(env, guardPath) {
+  if (guardPath) return false
+  return env?.CI === 'true' || env?.CI === '1'
+}
 
 const ADAPTER_PATH = fileURLToPath(new URL('./agy-pretooluse.sh', import.meta.url))
 
@@ -241,18 +246,51 @@ describe('agy-pretooluse.sh 轉接器測試（假守門）', () => {
   })
 })
 
+describe('shouldSkipGuardIntegration 判定測試', () => {
+  test('{ CI: "true" }, null ⇒ true', () => {
+    assert.equal(shouldSkipGuardIntegration({ CI: 'true' }, null), true)
+  })
+
+  test('{ CI: "1" }, null ⇒ true', () => {
+    assert.equal(shouldSkipGuardIntegration({ CI: '1' }, null), true)
+  })
+
+  test('{}, null ⇒ false（不能 skip，要 fail）', () => {
+    assert.equal(shouldSkipGuardIntegration({}, null), false)
+  })
+
+  test('{ CI: "false" }, null ⇒ false（不能 skip）', () => {
+    assert.equal(shouldSkipGuardIntegration({ CI: 'false' }, null), false)
+  })
+
+  test('{ CI: "0" }, null ⇒ false（不能 skip）', () => {
+    assert.equal(shouldSkipGuardIntegration({ CI: '0' }, null), false)
+  })
+
+  test('{ CI: "true" }, "/x" ⇒ false', () => {
+    assert.equal(shouldSkipGuardIntegration({ CI: 'true' }, '/x'), false)
+  })
+})
+
 describe('agy-pretooluse.sh 真守門整合測試', () => {
   const realGuard = resolveGuardPath(process.env, import.meta.url)
-  const candidates = getGuardCandidates(process.env, import.meta.url)
+  const candidates = guardCandidates(process.env, import.meta.url)
   const skipMsg = `沒有任何守門副本（CI 這種沒 agy 的環境）：${candidates.join(', ')}`
-  const shouldSkip = !realGuard
+  const shouldSkip = shouldSkipGuardIntegration(process.env, realGuard)
+
+  if (!realGuard && !shouldSkip) {
+    assert.fail(`這台不是 CI 卻沒有任何守門副本：${candidates.join(', ')}`)
+  }
 
   const baseDir = tmpdir('real-guard-cwd-')
 
   test('真守門整合：rm -rf /tmp/x ⇒ deny 含 BLOCKED', { skip: shouldSkip ? skipMsg : false }, (t) => {
-    if (shouldSkip) {
-      t.skip(skipMsg)
-      return
+    if (!realGuard) {
+      if (shouldSkip) {
+        t.skip(skipMsg)
+        return
+      }
+      assert.fail(`這台不是 CI 卻沒有任何守門副本：${candidates.join(', ')}`)
     }
     const payload = makePayload('rm -rf /tmp/x', baseDir)
     const res = runAdapter(payload, { LLM_TEAM_GUARD: realGuard })
@@ -262,9 +300,12 @@ describe('agy-pretooluse.sh 真守門整合測試', () => {
   })
 
   test('真守門整合：git status ⇒ ask', { skip: shouldSkip ? skipMsg : false }, (t) => {
-    if (shouldSkip) {
-      t.skip(skipMsg)
-      return
+    if (!realGuard) {
+      if (shouldSkip) {
+        t.skip(skipMsg)
+        return
+      }
+      assert.fail(`這台不是 CI 卻沒有任何守門副本：${candidates.join(', ')}`)
     }
     const payload = makePayload('git status', baseDir)
     const res = runAdapter(payload, { LLM_TEAM_GUARD: realGuard })
@@ -273,9 +314,12 @@ describe('agy-pretooluse.sh 真守門整合測試', () => {
   })
 
   test('真守門整合：子目錄未 commit 含 rm -rf 之 x.sh ⇒ deny（驗證 cd Cwd 讓相對路徑掃描有效）', { skip: shouldSkip ? skipMsg : false }, (t) => {
-    if (shouldSkip) {
-      t.skip(skipMsg)
-      return
+    if (!realGuard) {
+      if (shouldSkip) {
+        t.skip(skipMsg)
+        return
+      }
+      assert.fail(`這台不是 CI 卻沒有任何守門副本：${candidates.join(', ')}`)
     }
     const repoDir = tmpdir('real-repo-')
     execFileSync('git', ['init', '-q', repoDir], { env: CLEAN_GIT_ENV })

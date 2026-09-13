@@ -10,6 +10,7 @@
 //   3. 永不讀出或印出 settings 裡任何看起來像 token 的欄位值。
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseArgs } from 'node:util'
@@ -27,17 +28,16 @@ import {
 } from './lib.mjs'
 import { verifySnapshot } from './export.mjs'
 
-export function resolveGuardPath(env = process.env, importMetaUrl = import.meta.url, cwd = process.cwd()) {
-  // 1. env.LLM_TEAM_GUARD（存在才算）
+export function guardCandidates(env = process.env, importMetaUrl = import.meta.url, cwd = process.cwd()) {
+  const list = []
+
+  // 1. env.LLM_TEAM_GUARD
   if (env?.LLM_TEAM_GUARD) {
     let g = env.LLM_TEAM_GUARD
     if (g.startsWith('~/') && env?.HOME) {
       g = path.join(env.HOME, g.slice(2))
     }
-    const abs = path.resolve(g)
-    if (fs.existsSync(abs)) {
-      return abs
-    }
+    list.push(path.resolve(g))
   }
 
   // 2. <repoRoot>/scripts/claude-hooks/block-dangerous.sh（repoRoot 由 git rev-parse --show-toplevel，cwd）
@@ -58,88 +58,35 @@ export function resolveGuardPath(env = process.env, importMetaUrl = import.meta.
   if (!repoRoot && cwd && fs.existsSync(path.join(cwd, 'scripts', 'claude-hooks', 'block-dangerous.sh'))) {
     repoRoot = cwd
   }
-  if (repoRoot) {
-    const candidate2 = path.resolve(repoRoot, 'scripts', 'claude-hooks', 'block-dangerous.sh')
-    if (fs.existsSync(candidate2)) {
-      return candidate2
-    }
-  }
+  const rootForScripts = repoRoot || cwd || process.cwd()
+  list.push(path.resolve(rootForScripts, 'scripts', 'claude-hooks', 'block-dangerous.sh'))
 
   // 3. path.join(env.HOME, '.claude', 'hooks', 'block-dangerous.sh')
-  if (env?.HOME) {
-    const candidate3 = path.resolve(env.HOME, '.claude', 'hooks', 'block-dangerous.sh')
-    if (fs.existsSync(candidate3)) {
-      return candidate3
-    }
-  }
+  const homeDir = env?.HOME || process.env.HOME || os.homedir()
+  list.push(path.resolve(homeDir, '.claude', 'hooks', 'block-dangerous.sh'))
 
   // 4. new URL('../../hooks/block-dangerous.sh', importMetaUrl)
   if (importMetaUrl) {
     try {
-      const candidate4 = fileURLToPath(new URL('../../hooks/block-dangerous.sh', importMetaUrl))
-      if (fs.existsSync(candidate4)) {
-        return path.resolve(candidate4)
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return null
-}
-
-export function getGuardCandidates(env = process.env, importMetaUrl = import.meta.url, cwd = process.cwd()) {
-  const list = []
-  if (env?.LLM_TEAM_GUARD) {
-    let g = env.LLM_TEAM_GUARD
-    if (g.startsWith('~/') && env?.HOME) {
-      g = path.join(env.HOME, g.slice(2))
-    }
-    list.push(path.resolve(g))
-  } else {
-    list.push('env.LLM_TEAM_GUARD(未設定)')
-  }
-
-  let repoRoot = null
-  try {
-    const r = spawnSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: cwd || process.cwd(),
-      env: cleanGitEnv(env || process.env),
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    if (r.status === 0 && r.stdout) {
-      repoRoot = r.stdout.trim()
-    }
-  } catch {
-    repoRoot = null
-  }
-  if (!repoRoot && cwd && fs.existsSync(path.join(cwd, 'scripts', 'claude-hooks', 'block-dangerous.sh'))) {
-    repoRoot = cwd
-  }
-  if (repoRoot) {
-    list.push(path.resolve(repoRoot, 'scripts', 'claude-hooks', 'block-dangerous.sh'))
-  } else {
-    list.push('<repoRoot>/scripts/claude-hooks/block-dangerous.sh')
-  }
-
-  if (env?.HOME) {
-    list.push(path.resolve(env.HOME, '.claude', 'hooks', 'block-dangerous.sh'))
-  } else {
-    list.push('<HOME>/.claude/hooks/block-dangerous.sh')
-  }
-
-  if (importMetaUrl) {
-    try {
       list.push(fileURLToPath(new URL('../../hooks/block-dangerous.sh', importMetaUrl)))
     } catch {
-      list.push('../../hooks/block-dangerous.sh')
+      list.push(path.resolve(cwd || process.cwd(), '../../hooks/block-dangerous.sh'))
     }
   } else {
-    list.push('../../hooks/block-dangerous.sh')
+    list.push(path.resolve(cwd || process.cwd(), '../../hooks/block-dangerous.sh'))
   }
 
   return list
+}
+
+export function resolveGuardPath(env = process.env, importMetaUrl = import.meta.url, cwd = process.cwd()) {
+  const candidates = guardCandidates(env, importMetaUrl, cwd)
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) {
+      return c
+    }
+  }
+  return null
 }
 
 
@@ -397,10 +344,11 @@ export function main(argv, deps = {}) {
 
   console.log(`[守門] ${hasGuard ? `✓ (${guardPath})` : '✗ 缺少'}`)
 
+  // 🔴 2026-09-13 事故：快照 export 到 web-agency-system 後 test.sh 整套紅（整合測試找不到守門）；陽性對照 llm-team.test.mjs「LLM_TEAM_GUARD 指到不存在的檔、HOME 是空 tmp ⇒ exit 1 且 stderr 含「守門」」；停止條件：真源自帶守門副本、候選縮成一項時拆掉本檢查
   let missingGuard = false
   if (!hasGuard) {
     missingGuard = true
-    const candidates = getGuardCandidates(env, importMetaUrl, repoRoot)
+    const candidates = guardCandidates(env, importMetaUrl, repoRoot)
     console.error(
       `🔴 找不到任何守門腳本 block-dangerous.sh（這台會跑 agy，沒有守門＝閘不存在；候選：${candidates.join(', ')}）`
     )

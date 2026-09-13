@@ -34,10 +34,6 @@ export const MANIFEST_REQUIRED = [...EXPORT_FILES, 'SOURCE.json'].sort()
  * 回傳：{ ok, missing: [], changed: [], extra: [], unlisted: [], malformed: [], duplicate: [] }
  */
 export function verifySnapshot(snapshotDir, options = {}) {
-  const manifestRequired =
-    options.manifestRequired ||
-    (options.exportFiles ? [...options.exportFiles, 'SOURCE.json'].sort() : MANIFEST_REQUIRED)
-
   const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
   if (!fs.existsSync(manifestPath)) {
     return {
@@ -49,6 +45,8 @@ export function verifySnapshot(snapshotDir, options = {}) {
       sourceNew: [],
       malformed: [],
       duplicate: [],
+      manuallyDeleted: [],
+      legacyNoFiles: [],
     }
   }
 
@@ -75,19 +73,62 @@ export function verifySnapshot(snapshotDir, options = {}) {
     }
   }
 
+  const sourceJsonPath = path.join(snapshotDir, 'SOURCE.json')
+  const sourceJsonExists = fs.existsSync(sourceJsonPath)
+  let sourceFiles = null
+  let hasSourceFilesField = false
+  if (sourceJsonExists) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(sourceJsonPath, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        if (!malformed.includes('SOURCE.json')) malformed.push('SOURCE.json')
+      } else if ('files' in parsed) {
+        if (Array.isArray(parsed.files) && parsed.files.every((f) => typeof f === 'string')) {
+          hasSourceFilesField = true
+          sourceFiles = new Set(parsed.files)
+        } else {
+          if (!malformed.includes('SOURCE.json')) malformed.push('SOURCE.json')
+        }
+      }
+    } catch {
+      if (!malformed.includes('SOURCE.json')) malformed.push('SOURCE.json')
+    }
+  }
+
+  const hasExplicitSource = Boolean(options.manifestRequired || options.exportFiles)
+  const base =
+    options.manifestRequired ||
+    (options.exportFiles ? [...options.exportFiles, 'SOURCE.json'] : MANIFEST_REQUIRED)
+  const manifestRequired = (hasSourceFilesField
+    ? [...new Set([...base, ...sourceFiles, 'SOURCE.json'])]
+    : [...new Set(base)]
+  ).sort()
+
   const missing = []
   const changed = []
   const extra = []
   const unlisted = []
   const sourceNew = []
+  const manuallyDeleted = []
+  const legacyNoFiles = []
 
   for (const req of manifestRequired) {
     if (!manifestEntries.has(req)) {
       const fullPath = path.join(snapshotDir, req)
       if (fs.existsSync(fullPath)) {
         unlisted.push(req)
+      } else if (hasSourceFilesField) {
+        if (sourceFiles.has(req)) {
+          missing.push(req)
+          manuallyDeleted.push(req)
+        } else {
+          sourceNew.push(req)
+        }
+      } else if (hasExplicitSource) {
+        missing.push(req)
+        legacyNoFiles.push(req)
       } else {
-        sourceNew.push(req)
+        missing.push(req)
       }
     }
   }
@@ -138,6 +179,8 @@ export function verifySnapshot(snapshotDir, options = {}) {
   extra.sort()
   unlisted.sort()
   sourceNew.sort()
+  manuallyDeleted.sort()
+  legacyNoFiles.sort()
   malformed.sort()
   duplicate.sort()
 
@@ -146,11 +189,10 @@ export function verifySnapshot(snapshotDir, options = {}) {
     changed.length === 0 &&
     extra.length === 0 &&
     unlisted.length === 0 &&
-    sourceNew.length === 0 &&
     malformed.length === 0 &&
     duplicate.length === 0
 
-  return { ok, missing, changed, extra, unlisted, malformed, duplicate, sourceNew }
+  return { ok, missing, changed, extra, unlisted, malformed, duplicate, sourceNew, manuallyDeleted, legacyNoFiles }
 }
 
 /**
@@ -193,7 +235,18 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
         if (v.unlisted.length > 0) parts.push(`unlisted:\n  ${v.unlisted.join('\n  ')}`)
         if (v.malformed.length > 0) parts.push(`malformed:\n  ${v.malformed.join('\n  ')}`)
         if (v.duplicate.length > 0) parts.push(`duplicate:\n  ${v.duplicate.join('\n  ')}`)
-        console.error(`🔴 快照已被修改（手動漂移），不准覆蓋：\n  ${parts.join('\n  ')}`)
+
+        let deleteWarning = ''
+        if (v.manuallyDeleted && v.manuallyDeleted.length > 0) {
+          deleteWarning = `\n🔴 目標曾有此檔，現在連 manifest 都沒有＝手動刪除，不准靜默補回：${v.manuallyDeleted.join(', ')}`
+        }
+
+        let legacyWarning = ''
+        if (v.legacyNoFiles && v.legacyNoFiles.length > 0) {
+          legacyWarning = `\n🔴 舊版快照沒有 files 欄，無法分辨來源新增與目標刪檔；確認目標未手刪後用 --force 一次性升級：${v.legacyNoFiles.join(', ')}`
+        }
+
+        console.error(`🔴 快照已被修改（手動漂移），不准覆蓋：\n  ${parts.join('\n  ')}${deleteWarning}${legacyWarning}`)
         return { ok: false, status: 2, verify: v, changed: v.changed }
       }
     }
@@ -224,6 +277,7 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
     sourceCommit,
     sourceDirty,
     exportedAt,
+    files: [...exportFiles],
   }
 
   fs.mkdirSync(targetDir, { recursive: true })

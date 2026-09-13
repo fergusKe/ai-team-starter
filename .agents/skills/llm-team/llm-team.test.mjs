@@ -35,7 +35,7 @@ import {
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
 import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
-import { main as setupMain, matcherCovers } from './setup.mjs'
+import { main as setupMain, matcherCovers, guardCandidates, resolveGuardPath } from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -1630,6 +1630,83 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     const logOutput = logs.join('\n')
     assert.match(logOutput, /\[守門\] ✓/)
     assert.ok(logOutput.includes(expectedGuardPath))
+  })
+
+  test('guardCandidates 候選順序逐字斷言（設了 ⇒ 四項、未設 ⇒ 三項，全部為絕對路徑）', () => {
+    const fakeRepo = fs.realpathSync(tmpdir('repo-for-candidates-'))
+    execFileSync('git', ['init', '-q', fakeRepo], { env: CLEAN_GIT_ENV })
+    const fakeHome = fs.realpathSync(tmpdir('home-for-candidates-'))
+    const fakeGuard = path.join(fs.realpathSync(tmpdir('guard-')), 'custom-guard.sh')
+    const fakeMeta = pathToFileURL(path.join(fakeRepo, 'home', 'skills', 'llm-team', 'setup.mjs')).href
+
+    // 1. 設了 LLM_TEAM_GUARD ⇒ 恰四項且全是絕對路徑
+    const envSet = {
+      HOME: fakeHome,
+      LLM_TEAM_GUARD: fakeGuard,
+    }
+
+    const candidatesSet = guardCandidates(envSet, fakeMeta, fakeRepo)
+    assert.equal(candidatesSet.length, 4, '設了 LLM_TEAM_GUARD 時候選清單應恰好為四項')
+
+    for (const c of candidatesSet) {
+      assert.equal(path.isAbsolute(c), true, `候選路徑應為絕對路徑：${c}`)
+    }
+
+    const expected = [
+      path.resolve(fakeGuard),
+      path.resolve(fakeRepo, 'scripts', 'claude-hooks', 'block-dangerous.sh'),
+      path.resolve(fakeHome, '.claude', 'hooks', 'block-dangerous.sh'),
+      fileURLToPath(new URL('../../hooks/block-dangerous.sh', fakeMeta)),
+    ]
+    assert.deepEqual(candidatesSet, expected)
+
+    // 2. 未設 LLM_TEAM_GUARD ⇒ 恰三項且全是絕對路徑（不推假路徑）
+    const envUnset = {
+      HOME: fakeHome,
+    }
+
+    const candidatesUnset = guardCandidates(envUnset, fakeMeta, fakeRepo)
+    assert.equal(candidatesUnset.length, 3, '未設 LLM_TEAM_GUARD 時候選清單應恰好為三項')
+
+    for (const c of candidatesUnset) {
+      assert.equal(path.isAbsolute(c), true, `候選路徑應為絕對路徑：${c}`)
+    }
+
+    assert.deepEqual(candidatesUnset, expected.slice(1), '未設時候選清單應為後三項真路徑')
+  })
+
+  test('resolveGuardPath 回的值必在 guardCandidates 陣列內', () => {
+    const fakeRepo = tmpdir('repo-for-resolve-')
+    execFileSync('git', ['init', '-q', fakeRepo], { env: CLEAN_GIT_ENV })
+    const fakeHome = tmpdir('home-for-resolve-')
+    const fakeMeta = pathToFileURL(path.join(fakeRepo, 'home', 'skills', 'llm-team', 'setup.mjs')).href
+
+    // 情況 A：四個都不存在 ⇒ resolveGuardPath 回 null
+    const envEmpty = { HOME: fakeHome }
+    const cEmpty = guardCandidates(envEmpty, fakeMeta, fakeRepo)
+    const resEmpty = resolveGuardPath(envEmpty, fakeMeta, fakeRepo)
+    assert.equal(resEmpty, null)
+
+    // 情況 B：順位 3（HOME 下）存在 ⇒ 回該路徑且在 candidates 內
+    const homeGuardDir = path.join(fakeHome, '.claude', 'hooks')
+    fs.mkdirSync(homeGuardDir, { recursive: true })
+    const homeGuardPath = path.join(homeGuardDir, 'block-dangerous.sh')
+    fs.writeFileSync(homeGuardPath, '#!/bin/sh\n')
+
+    const cHome = guardCandidates(envEmpty, fakeMeta, fakeRepo)
+    const resHome = resolveGuardPath(envEmpty, fakeMeta, fakeRepo)
+    assert.equal(resHome, homeGuardPath)
+    assert.ok(cHome.includes(resHome), 'resolveGuardPath 找到的值必在 candidates 陣列內')
+
+    // 情況 C：順位 1（LLM_TEAM_GUARD）也存在 ⇒ 優先回順位 1 且在 candidates 內
+    const customGuard = path.join(tmpdir('g1-'), 'g1.sh')
+    fs.writeFileSync(customGuard, '#!/bin/sh\n')
+    const envG1 = { HOME: fakeHome, LLM_TEAM_GUARD: customGuard }
+    const cG1 = guardCandidates(envG1, fakeMeta, fakeRepo)
+    const resG1 = resolveGuardPath(envG1, fakeMeta, fakeRepo)
+    assert.equal(resG1, customGuard)
+    assert.ok(cG1.includes(resG1), 'resolveGuardPath 找到的值必在 candidates 陣列內')
+    assert.equal(resG1, cG1[0])
   })
 })
 

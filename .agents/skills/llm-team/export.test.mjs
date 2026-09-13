@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { EXPORT_FILES, exportTo, verifySnapshot, main as exportMain } from './export.mjs'
 
 function tmpdir(prefix) {
@@ -63,6 +64,7 @@ describe('export.mjs 快照導出與驗證測試', () => {
     assert.equal(sourceJson.version, '1')
     assert.equal(sourceJson.sourceCommit, 'abcdef0123456789')
     assert.equal(sourceJson.sourceDirty, false)
+    assert.deepEqual(sourceJson.files, EXPORT_FILES)
     assert.ok(sourceJson.exportedAt)
   })
 
@@ -373,4 +375,326 @@ describe('export.mjs 快照導出與驗證測試', () => {
     assert.match(errs.join('\n'), /🔴 快照已被修改（手動漂移），不准覆蓋/)
     assert.match(errs.join('\n'), /unlisted:/)
   })
+
+  test('目標同時刪檔與 manifest 行（SOURCE.json 不動）⇒ 判定為 missing 拒絕；來源真新增檔 ⇒ 成功且 files 含它；verifySnapshot 不強求 files 欄', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-deletion-')
+
+    // 1. export 一版
+    const res1 = exportTo(sourceDir, targetRoot, {
+      deps: { git: fakeGit },
+      exportFiles: [...EXPORT_FILES],
+    })
+    assert.equal(res1.ok, true)
+    assert.equal(res1.status, 0)
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const sourceJson1 = JSON.parse(fs.readFileSync(path.join(snapshotDir, 'SOURCE.json'), 'utf8'))
+    assert.deepEqual(sourceJson1.files, EXPORT_FILES)
+
+    // 2. 目標刪掉某檔（例如 lib.mjs）並從 MANIFEST 拿掉那行（SOURCE.json 不動）
+    const deleteFile = 'lib.mjs'
+    fs.unlinkSync(path.join(snapshotDir, deleteFile))
+
+    const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
+    const lines = fs
+      .readFileSync(manifestPath, 'utf8')
+      .split('\n')
+      .filter((l) => !l.includes(deleteFile))
+    fs.writeFileSync(manifestPath, lines.join('\n') + '\n')
+
+    // 3. 再 export 不帶 --force ⇒ 拒絕且訊息含該檔名
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let resNoForce
+    try {
+      resNoForce = exportTo(sourceDir, targetRoot, {
+        deps: { git: fakeGit },
+        exportFiles: [...EXPORT_FILES],
+        force: false,
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(resNoForce.ok, false)
+    assert.equal(resNoForce.status, 2)
+    assert.ok(resNoForce.verify.missing.includes(deleteFile), `missing 應包含手動刪除檔 ${deleteFile}`)
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /目標曾有此檔，現在連 manifest 都沒有＝手動刪除，不准靜默補回/)
+    assert.match(errOutput, /missing:/, '錯誤訊息應包含 missing')
+    assert.ok(errOutput.includes(deleteFile), `錯誤訊息應包含刪除檔名 ${deleteFile}`)
+
+    // 4. 對照：來源真的新增檔 ⇒ 成功、SOURCE.json.files 含它
+    const targetRootNew = tmpdir('target-repo-newfile-')
+    exportTo(sourceDir, targetRootNew, {
+      deps: { git: fakeGit },
+      exportFiles: [...EXPORT_FILES],
+    })
+
+    const newFile = 'new-feature.mjs'
+    fs.writeFileSync(path.join(sourceDir, newFile), '// newly added\nexport default 100\n')
+    const newExportFiles = [...EXPORT_FILES, newFile]
+
+    const resNew = exportTo(sourceDir, targetRootNew, {
+      deps: { git: fakeGit },
+      exportFiles: newExportFiles,
+      force: false,
+    })
+    assert.equal(resNew.ok, true)
+    assert.equal(resNew.status, 0)
+    const newSnapshotDir = path.join(targetRootNew, '.agents', 'skills', 'llm-team')
+    const sourceJsonNew = JSON.parse(fs.readFileSync(path.join(newSnapshotDir, 'SOURCE.json'), 'utf8'))
+    assert.deepEqual(sourceJsonNew.files, newExportFiles)
+    assert.ok(sourceJsonNew.files.includes(newFile))
+
+    // 5. verifySnapshot 對 files 欄的存在不另加要求（MANIFEST 才是完整性的尺）
+    const sourceJsonNoFiles = {
+      version: '1',
+      sourceCommit: 'abcdef0123456789',
+      sourceDirty: false,
+      exportedAt: new Date().toISOString(),
+    }
+    const sourceJsonNoFilesPath = path.join(newSnapshotDir, 'SOURCE.json')
+    fs.writeFileSync(sourceJsonNoFilesPath, JSON.stringify(sourceJsonNoFiles, null, 2) + '\n')
+    const newHash = crypto.createHash('sha256').update(fs.readFileSync(sourceJsonNoFilesPath)).digest('hex')
+    const manifestUpdatedLines = fs
+      .readFileSync(path.join(newSnapshotDir, 'MANIFEST.sha256'), 'utf8')
+      .split('\n')
+      .map((l) => (l.endsWith('  SOURCE.json') ? `${newHash}  SOURCE.json` : l))
+    fs.writeFileSync(path.join(newSnapshotDir, 'MANIFEST.sha256'), manifestUpdatedLines.join('\n') + '\n')
+
+    const vWithoutFiles = verifySnapshot(newSnapshotDir, { exportFiles: newExportFiles })
+    assert.equal(vWithoutFiles.ok, true, '即使 SOURCE.json 無 files 欄，只要 MANIFEST 一致，verifySnapshot 仍為 ok')
+  })
+
+  test('verifySnapshot 的 ok 不准含 sourceNew：目標乾淨、來源多一檔 ⇒ verifySnapshot(...).ok === true 且 sourceNew 含該檔', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-sourcenew-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const newFile = 'new-source-file.mjs'
+    const v = verifySnapshot(snapshotDir, {
+      exportFiles: [...EXPORT_FILES, newFile],
+    })
+
+    assert.equal(v.ok, true, '目標乾淨、來源多一檔時 verifySnapshot ok 應為 true')
+    assert.deepEqual(v.missing, [])
+    assert.deepEqual(v.changed, [])
+    assert.deepEqual(v.extra, [])
+    assert.deepEqual(v.unlisted, [])
+    assert.deepEqual(v.malformed, [])
+    assert.deepEqual(v.duplicate, [])
+    assert.ok(v.sourceNew.includes(newFile), `sourceNew 應包含該新檔，實際：${JSON.stringify(v.sourceNew)}`)
+  })
+
+  test('SOURCE.json 壞掉不准吞：寫壞 JSON ⇒ export 拒絕且訊息含 SOURCE.json；files 存在但非字串陣列 ⇒ 歸入 malformed', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-bad-source-json-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const sourceJsonPath = path.join(snapshotDir, 'SOURCE.json')
+
+    // 1. 寫壞 JSON
+    fs.writeFileSync(sourceJsonPath, '{"broken": json\n')
+
+    const v1 = verifySnapshot(snapshotDir)
+    assert.equal(v1.ok, false)
+    assert.ok(v1.malformed.includes('SOURCE.json'), `malformed 應包含 SOURCE.json，實際：${JSON.stringify(v1.malformed)}`)
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let resNoForce
+    try {
+      resNoForce = exportTo(sourceDir, targetRoot, { force: false, deps: { git: fakeGit } })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(resNoForce.ok, false)
+    assert.equal(resNoForce.status, 2)
+    assert.match(errs.join('\n'), /SOURCE\.json/)
+    assert.match(errs.join('\n'), /malformed/)
+
+    // 2. files 存在但不是字串陣列 ⇒ malformed
+    fs.writeFileSync(sourceJsonPath, JSON.stringify({ version: '1', files: [123, null] }, null, 2) + '\n')
+    const v2 = verifySnapshot(snapshotDir)
+    assert.equal(v2.ok, false)
+    assert.ok(v2.malformed.includes('SOURCE.json'), `files 包含非字串時應歸入 malformed，實際：${JSON.stringify(v2.malformed)}`)
+  })
+
+  test('舊快照沒有 files 欄 ⇒ 保守判 missing：來源新檔 ⇒ 拒絕；--force ⇒ 成功且新 SOURCE.json 有 files', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-legacy-source-json-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const sourceJsonPath = path.join(snapshotDir, 'SOURCE.json')
+
+    // 拿掉 files 欄位模擬舊版快照，更新 MANIFEST.sha256 讓快照無其他漂移
+    const oldSourceJson = {
+      version: '1',
+      sourceCommit: 'abcdef0123456789',
+      sourceDirty: false,
+      exportedAt: new Date().toISOString(),
+    }
+    fs.writeFileSync(sourceJsonPath, JSON.stringify(oldSourceJson, null, 2) + '\n')
+    const oldHash = crypto.createHash('sha256').update(fs.readFileSync(sourceJsonPath)).digest('hex')
+    const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
+    const lines = fs
+      .readFileSync(manifestPath, 'utf8')
+      .split('\n')
+      .map((l) => (l.endsWith('  SOURCE.json') ? `${oldHash}  SOURCE.json` : l))
+    fs.writeFileSync(manifestPath, lines.join('\n') + '\n')
+
+    // 來源增加新檔
+    const newFile = 'new-file-for-legacy.mjs'
+    fs.writeFileSync(path.join(sourceDir, newFile), '// legacy test\n')
+    const newExportFiles = [...EXPORT_FILES, newFile]
+
+    // verifySnapshot 檢查：missing 與 legacyNoFiles 包含該新檔
+    const v = verifySnapshot(snapshotDir, { exportFiles: newExportFiles })
+    assert.equal(v.ok, false)
+    assert.ok(v.missing.includes(newFile), `舊快照無 files 欄時來源新檔應判為 missing`)
+    assert.ok(v.legacyNoFiles.includes(newFile), `legacyNoFiles 應包含該新檔`)
+
+    // exportTo 不帶 --force ⇒ 拒絕且印出保守判 missing 訊息
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let resNoForce
+    try {
+      resNoForce = exportTo(sourceDir, targetRoot, {
+        force: false,
+        exportFiles: newExportFiles,
+        deps: { git: fakeGit },
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(resNoForce.ok, false)
+    assert.equal(resNoForce.status, 2)
+    const errText = errs.join('\n')
+    assert.match(errText, /舊版快照沒有 files 欄，無法分辨來源新增與目標刪檔；確認目標未手刪後用 --force 一次性升級/)
+    assert.ok(errText.includes(newFile))
+
+    // 帶 --force ⇒ 成功且新 SOURCE.json 有 files 欄
+    const resForce = exportTo(sourceDir, targetRoot, {
+      force: true,
+      exportFiles: newExportFiles,
+      deps: { git: fakeGit },
+    })
+    assert.equal(resForce.ok, true)
+    assert.equal(resForce.status, 0)
+
+    const updatedSourceJson = JSON.parse(fs.readFileSync(sourceJsonPath, 'utf8'))
+    assert.ok(Array.isArray(updatedSourceJson.files), '新 SOURCE.json 應有 files 陣列')
+    assert.deepEqual(updatedSourceJson.files, newExportFiles)
+    assert.ok(updatedSourceJson.files.includes(newFile))
+  })
+
+  test('C1g-a: 老式快照（SOURCE.json 無 files、manifest 的 SOURCE.json 雜湊一致）刪 ticket.test.mjs 與 manifest 行 ⇒ verifySnapshot(dir) ok===false 且 missing 含 ticket.test.mjs', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-c1g-a-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const sourceJsonPath = path.join(snapshotDir, 'SOURCE.json')
+    const oldSourceJson = {
+      version: '1',
+      sourceCommit: 'abcdef0123456789',
+      sourceDirty: false,
+      exportedAt: new Date().toISOString(),
+    }
+    fs.writeFileSync(sourceJsonPath, JSON.stringify(oldSourceJson, null, 2) + '\n')
+    const oldHash = crypto.createHash('sha256').update(fs.readFileSync(sourceJsonPath)).digest('hex')
+    const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
+
+    // 刪 ticket.test.mjs 與其 manifest 行，同時更新 SOURCE.json 的 hash 保持一致
+    const deleteFile = 'ticket.test.mjs'
+    fs.unlinkSync(path.join(snapshotDir, deleteFile))
+
+    const lines = fs
+      .readFileSync(manifestPath, 'utf8')
+      .split('\n')
+      .filter((l) => !l.includes(deleteFile))
+      .map((l) => (l.endsWith('  SOURCE.json') ? `${oldHash}  SOURCE.json` : l))
+    fs.writeFileSync(manifestPath, lines.join('\n') + '\n')
+
+    // 驗證：不帶 options，verifySnapshot 仍應回報 ok === false 且 missing 含 ticket.test.mjs
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.missing.includes(deleteFile), `missing 應包含 ${deleteFile}，實際：${JSON.stringify(v.missing)}`)
+  })
+
+  test('C1g-b: 新式快照（SOURCE.json 含 files）刪 ticket.test.mjs 與 manifest 行 ⇒ verifySnapshot(dir) ok===false 且 missing 含 ticket.test.mjs', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-c1g-b-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const deleteFile = 'ticket.test.mjs'
+    fs.unlinkSync(path.join(snapshotDir, deleteFile))
+
+    const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
+    const lines = fs
+      .readFileSync(manifestPath, 'utf8')
+      .split('\n')
+      .filter((l) => !l.includes(deleteFile))
+    fs.writeFileSync(manifestPath, lines.join('\n') + '\n')
+
+    // 驗證：不帶 options，verifySnapshot 仍應回報 ok === false 且 missing 含 ticket.test.mjs
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.missing.includes(deleteFile), `missing 應包含 ${deleteFile}，實際：${JSON.stringify(v.missing)}`)
+    assert.ok(v.manuallyDeleted.includes(deleteFile), `manuallyDeleted 應包含 ${deleteFile}`)
+  })
+
+  test('C1g-c: 乾淨快照（新式有 files／老式無 files 各一）不帶 options ⇒ verifySnapshot(dir) ok===true', () => {
+    // 1. 新式乾淨快照（含 files）
+    const sourceDir1 = makeSourceDir()
+    const targetRoot1 = tmpdir('target-repo-c1g-c-new-')
+    exportTo(sourceDir1, targetRoot1, { deps: { git: fakeGit } })
+
+    const snapshotDir1 = path.join(targetRoot1, '.agents', 'skills', 'llm-team')
+    const vNew = verifySnapshot(snapshotDir1)
+    assert.equal(vNew.ok, true, '新式乾淨快照 verifySnapshot 應為 ok')
+    assert.deepEqual(vNew.missing, [])
+    assert.deepEqual(vNew.changed, [])
+    assert.deepEqual(vNew.extra, [])
+
+    // 2. 老式乾淨快照（無 files，但 manifest 的 SOURCE.json hash 一致）
+    const sourceDir2 = makeSourceDir()
+    const targetRoot2 = tmpdir('target-repo-c1g-c-old-')
+    exportTo(sourceDir2, targetRoot2, { deps: { git: fakeGit } })
+
+    const snapshotDir2 = path.join(targetRoot2, '.agents', 'skills', 'llm-team')
+    const sourceJsonPath2 = path.join(snapshotDir2, 'SOURCE.json')
+    const oldSourceJson = {
+      version: '1',
+      sourceCommit: 'abcdef0123456789',
+      sourceDirty: false,
+      exportedAt: new Date().toISOString(),
+    }
+    fs.writeFileSync(sourceJsonPath2, JSON.stringify(oldSourceJson, null, 2) + '\n')
+    const oldHash = crypto.createHash('sha256').update(fs.readFileSync(sourceJsonPath2)).digest('hex')
+    const manifestPath2 = path.join(snapshotDir2, 'MANIFEST.sha256')
+    const lines2 = fs
+      .readFileSync(manifestPath2, 'utf8')
+      .split('\n')
+      .map((l) => (l.endsWith('  SOURCE.json') ? `${oldHash}  SOURCE.json` : l))
+    fs.writeFileSync(manifestPath2, lines2.join('\n') + '\n')
+
+    const vOld = verifySnapshot(snapshotDir2)
+    assert.equal(vOld.ok, true, '老式乾淨快照 verifySnapshot 應為 ok')
+    assert.deepEqual(vOld.missing, [])
+    assert.deepEqual(vOld.changed, [])
+    assert.deepEqual(vOld.extra, [])
+  })
 })
+
