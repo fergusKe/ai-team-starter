@@ -2219,6 +2219,26 @@ describe('setup.mjs 設定對帳測試', () => {
       )
     )
 
+    const testHome = tmpdir('setup-home-')
+    const fakeGuardDir = tmpdir('setup-guard-')
+    const fakeGuardFile = path.join(fakeGuardDir, 'block-dangerous.sh')
+    fs.writeFileSync(fakeGuardFile, '#!/usr/bin/env bash\n')
+    const fakeHookRunner = () =>
+      JSON.stringify({
+        command: {
+          data: {
+            hooks: [
+              {
+                name: 'block-dangerous',
+                enabled: true,
+                source: path.join(testHome, '.gemini', 'config', 'hooks.json'),
+                actions: [{ event: 'PreToolUse', matcher: 'run_command' }],
+              },
+            ],
+          },
+        },
+      })
+
     // 1. 缺 regex ⇒ exit 1
     const badOuts = []
     const badErrs = []
@@ -2231,7 +2251,8 @@ describe('setup.mjs 設定對帳測試', () => {
       badCode = setupMain(['--check'], {
         repoRoot: repo.dir,
         settingsFile: badSettingsFile,
-        env: { AGY_SETTINGS: badSettingsFile },
+        env: { AGY_SETTINGS: badSettingsFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
+        runAgyHooks: fakeHookRunner,
       })
     } finally {
       console.log = origLog
@@ -2255,7 +2276,8 @@ describe('setup.mjs 設定對帳測試', () => {
       goodCode = setupMain(['--check'], {
         repoRoot: repo.dir,
         settingsFile: goodSettingsFile,
-        env: { AGY_SETTINGS: goodSettingsFile },
+        env: { AGY_SETTINGS: goodSettingsFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
+        runAgyHooks: fakeHookRunner,
       })
     } finally {
       console.log = origLog
@@ -2275,12 +2297,39 @@ describe('setup.mjs 設定對帳測試', () => {
       missingCode = setupMain(['--check'], {
         repoRoot: repo.dir,
         settingsFile: nonExistentFile,
-        env: { AGY_SETTINGS: nonExistentFile },
+        env: { AGY_SETTINGS: nonExistentFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
+        runAgyHooks: fakeHookRunner,
       })
     } finally {
       // noop
     }
     assert.equal(missingCode, 2, `設定檔不存在時 exit 應為 2，實際為 ${missingCode}`)
+
+    // 4. 負向：同一組 env 但 LLM_TEAM_GUARD 指到不存在的檔 ⇒ exit 1、stderr 含「守門」
+    const badGuardOuts = []
+    const badGuardErrs = []
+    console.log = (m) => badGuardOuts.push(String(m))
+    console.error = (m) => badGuardErrs.push(String(m))
+    let badGuardCode
+    try {
+      badGuardCode = setupMain(['--check'], {
+        repoRoot: repo.dir,
+        settingsFile: goodSettingsFile,
+        env: {
+          AGY_SETTINGS: goodSettingsFile,
+          HOME: testHome,
+          LLM_TEAM_GUARD: path.join(testHome, 'nonexistent-guard.sh'),
+        },
+        importMetaUrl: 'file:///nonexistent/setup.mjs',
+        runAgyHooks: fakeHookRunner,
+      })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(badGuardCode, 1, `守門不存在時 exit 應為 1，實際為 ${badGuardCode}`)
+    const badGuardErrText = badGuardErrs.join('\n')
+    assert.match(badGuardErrText, /守門/, `stderr 應包含「守門」，實際：${badGuardErrText}`)
   })
 
   test('T12 setup --check：透過 AGY_SETTINGS 環境變數指到 tmp 假檔（缺 regex）⇒ exit 1、stdout 含 command(regex:；且 token 永不洩漏', () => {
@@ -2303,6 +2352,23 @@ describe('setup.mjs 設定對帳測試', () => {
       )
     )
 
+    const testHome = tmpdir('setup-home-t12-')
+    const fakeHookRunner = () =>
+      JSON.stringify({
+        command: {
+          data: {
+            hooks: [
+              {
+                name: 'block-dangerous',
+                enabled: true,
+                source: path.join(testHome, '.gemini', 'config', 'hooks.json'),
+                actions: [{ event: 'PreToolUse', matcher: 'run_command' }],
+              },
+            ],
+          },
+        },
+      })
+
     // 透過 deps.env 傳入 AGY_SETTINGS（不傳 settingsFile）
     const badOuts = []
     const badErrs = []
@@ -2314,7 +2380,8 @@ describe('setup.mjs 設定對帳測試', () => {
     try {
       badCode = setupMain(['--check'], {
         repoRoot: repo.dir,
-        env: { ...process.env, AGY_SETTINGS: badSettingsFile },
+        env: { ...process.env, AGY_SETTINGS: badSettingsFile, HOME: testHome },
+        runAgyHooks: fakeHookRunner,
       })
     } finally {
       console.log = origLog

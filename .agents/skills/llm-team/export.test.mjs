@@ -298,4 +298,79 @@ describe('export.mjs 快照導出與驗證測試', () => {
     const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
     assert.equal(fs.existsSync(snapshotDir), false, '目的地目錄不應存在（沒留半成品）')
   })
+
+  test('真源新增檔不是目標漂移：來源加新檔重 export 成功且目標多該檔與 MANIFEST 含它；對照目標先手放同名檔仍拒絕 unlisted', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+
+    // 1. 先 export 一版
+    const res1 = exportTo(sourceDir, targetRoot, {
+      deps: { git: fakeGit },
+      exportFiles: [...EXPORT_FILES],
+    })
+    assert.equal(res1.ok, true)
+    assert.equal(res1.status, 0)
+
+    // 2. 把來源加一個新檔（tmp 造）重 export，不帶 --force ⇒ 成功且目標多那個檔、MANIFEST 含它
+    const newFile = 'new-source-file.mjs'
+    fs.writeFileSync(path.join(sourceDir, newFile), '// newly added in source\nexport default 999\n')
+    const newExportFiles = [...EXPORT_FILES, newFile]
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let res2
+    try {
+      res2 = exportTo(sourceDir, targetRoot, {
+        deps: { git: fakeGit },
+        exportFiles: newExportFiles,
+        force: false,
+      })
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(res2.ok, true, '真源新增檔不應被當作漂移拒絕')
+    assert.equal(res2.status, 0)
+    assert.match(outs.join('\n'), /\+ new-source-file\.mjs/, '應印出 + <檔名>')
+
+    const targetSnapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const newTargetFilePath = path.join(targetSnapshotDir, newFile)
+    assert.ok(fs.existsSync(newTargetFilePath), '目標目錄應多出該新檔')
+
+    const manifestContent = fs.readFileSync(path.join(targetSnapshotDir, 'MANIFEST.sha256'), 'utf8')
+    assert.match(manifestContent, /new-source-file\.mjs/, 'MANIFEST 應包含該新檔')
+
+    // 3. 對照：目標先手放一個同名檔 ⇒ 仍拒絕 unlisted
+    const targetRootControl = tmpdir('target-repo-control-')
+    exportTo(sourceDir, targetRootControl, {
+      deps: { git: fakeGit },
+      exportFiles: [...EXPORT_FILES],
+    })
+
+    const driftFile = 'drift-file.mjs'
+    fs.writeFileSync(path.join(sourceDir, driftFile), '// in source\n')
+    const targetControlSnapshotDir = path.join(targetRootControl, '.agents', 'skills', 'llm-team')
+    fs.writeFileSync(path.join(targetControlSnapshotDir, driftFile), '// manually placed in target\n')
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let resControl
+    try {
+      resControl = exportTo(sourceDir, targetRootControl, {
+        deps: { git: fakeGit },
+        exportFiles: [...EXPORT_FILES, driftFile],
+        force: false,
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(resControl.ok, false)
+    assert.equal(resControl.status, 2)
+    assert.ok(resControl.verify.unlisted.includes(driftFile), `unlisted 應包含手放同名檔 ${driftFile}`)
+    assert.match(errs.join('\n'), /🔴 快照已被修改（手動漂移），不准覆蓋/)
+    assert.match(errs.join('\n'), /unlisted:/)
+  })
 })

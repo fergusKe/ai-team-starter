@@ -35,6 +35,7 @@ import {
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
 import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
+import { main as setupMain, matcherCovers } from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -1288,6 +1289,350 @@ describe('WRITER_PROMPT_SENTINEL 寫手提示哨兵', () => {
     assert.equal(p2.split('\n')[0], WRITER_PROMPT_SENTINEL, 'round 2 第一行必須是哨兵')
   })
 })
+
+describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
+  function makeValidSetupDeps(hooksResult) {
+    const repo = makeRepo()
+    const settingsFile = makeSettings(GOOD_ALLOW)
+    const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+    const rootWithSlash = repo.dir.endsWith('/') ? repo.dir : repo.dir + '/'
+    s.permissions.allow.push(`read_file(${rootWithSlash})`)
+    s.trustedWorkspaces = [repo.dir]
+    fs.writeFileSync(settingsFile, JSON.stringify(s))
+    const fakeHome = tmpdir('setup-fake-home-')
+    const guardDir = path.join(fakeHome, '.claude', 'hooks')
+    fs.mkdirSync(guardDir, { recursive: true })
+    const guardFile = path.join(guardDir, 'block-dangerous.sh')
+    fs.writeFileSync(guardFile, '#!/usr/bin/env bash\n')
+
+    return {
+      repoRoot: repo.dir,
+      settingsFile,
+      config: TEST_CONFIG,
+      agyBin: '/mock/bin/antigravity',
+      which: (bin) => `/mock/bin/${bin}`,
+      env: { HOME: fakeHome, LLM_TEAM_GUARD: guardFile },
+      runAgyHooks: () => hooksResult,
+    }
+  }
+
+  test('列表含 ⇒ 過', () => {
+    const deps = makeValidSetupDeps(null)
+    const hooksPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: true,
+              source: path.join(deps.env.HOME, '.gemini', 'config', 'hooks.json'),
+              actions: [
+                {
+                  event: 'PreToolUse',
+                  matcher: 'run_command',
+                  type: 'command',
+                  command: '~/.claude/skills/llm-team/agy-pretooluse.sh',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }
+    deps.runAgyHooks = () => ({ exit: 0, stdout: JSON.stringify(hooksPayload) })
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.match(logs.join('\n'), /\[hook:block-dangerous\] ✓ 已載入/)
+  })
+
+  test('空 ⇒ 紅且訊息含 install.sh', () => {
+    const emptyPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [],
+        },
+      },
+    }
+    const deps = makeValidSetupDeps({ exit: 0, stdout: JSON.stringify(emptyPayload) })
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /install\.sh/)
+    assert.match(errOutput, /🔴 agy 全域 hooks\.json 沒載入 block-dangerous/)
+  })
+
+  test('含但 enabled:false ⇒ 紅', () => {
+    const deps = makeValidSetupDeps(null)
+    const disabledPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: false,
+              source: path.join(deps.env.HOME, '.gemini', 'config', 'hooks.json'),
+              actions: [{ event: 'PreToolUse', matcher: 'run_command' }],
+            },
+          ],
+        },
+      },
+    }
+    deps.runAgyHooks = () => ({ exit: 0, stdout: JSON.stringify(disabledPayload) })
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(errs.join('\n'), /🔴 agy 全域 hooks\.json 沒載入 block-dangerous/)
+  })
+
+  test('agy 回非 JSON ⇒ 紅（fail-closed）', () => {
+    const deps = makeValidSetupDeps({ exit: 0, stdout: 'this is not a valid json output from agy' })
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(errs.join('\n'), /🔴 agy 全域 hooks\.json 沒載入 block-dangerous/)
+  })
+
+  test('只注入 settingsFile、不注入 runAgyHooks 且 agyBin 為 null ⇒ --check 紅且訊息含 hooks.json 沒載入', () => {
+    const repo = makeRepo()
+    const settingsFile = makeSettings(GOOD_ALLOW)
+    const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+    const rootWithSlash = repo.dir.endsWith('/') ? repo.dir : repo.dir + '/'
+    s.permissions.allow.push(`read_file(${rootWithSlash})`)
+    s.trustedWorkspaces = [repo.dir]
+    fs.writeFileSync(settingsFile, JSON.stringify(s))
+
+    const deps = {
+      repoRoot: repo.dir,
+      settingsFile,
+      config: TEST_CONFIG,
+      agyBin: null,
+      which: (bin) => `/mock/bin/${bin}`,
+    }
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(errs.join('\n'), /hooks\.json 沒載入/)
+  })
+
+  test('matcherCovers：matcher 當 regex 涵蓋判定', () => {
+    assert.equal(matcherCovers('run_command', 'run_command'), true)
+    assert.equal(matcherCovers('run_command|view_file', 'run_command'), true)
+    assert.equal(matcherCovers('*', 'run_command'), true)
+    assert.equal(matcherCovers('', 'run_command'), true)
+    assert.equal(matcherCovers('run_.*', 'run_command'), true)
+
+    assert.equal(matcherCovers('view_file', 'run_command'), false)
+    assert.equal(matcherCovers('run_commandx', 'run_command'), false)
+    assert.equal(matcherCovers('(', 'run_command'), false)
+
+    assert.equal(matcherCovers(['view_file', 'run_command'], 'run_command'), true)
+    assert.equal(matcherCovers(['view_file', '('], 'run_command'), false)
+  })
+
+  test('matcher 為 run_command|view_file 合法 regex ⇒ --check 過', () => {
+    const deps = makeValidSetupDeps(null)
+    const hooksPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: true,
+              source: path.join(deps.env.HOME, '.gemini', 'config', 'hooks.json'),
+              actions: [
+                {
+                  event: 'PreToolUse',
+                  matcher: 'run_command|view_file',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }
+    deps.runAgyHooks = () => ({ exit: 0, stdout: JSON.stringify(hooksPayload) })
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.match(logs.join('\n'), /\[hook:block-dangerous\] ✓ 已載入/)
+  })
+
+  test('source 指到 repo/.agents/hooks.json ⇒ 紅且訊息含「來源不是全域 hooks.json」與原始欄位清單', () => {
+    const deps = makeValidSetupDeps(null)
+    const workspaceHook = path.join(deps.repoRoot, '.agents', 'hooks.json')
+    const hooksPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: true,
+              source: workspaceHook,
+              actions: [{ event: 'PreToolUse', matcher: 'run_command' }],
+            },
+          ],
+        },
+      },
+    }
+    deps.runAgyHooks = () => ({ exit: 0, stdout: JSON.stringify(hooksPayload) })
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /來源不是全域 hooks\.json：/)
+    assert.ok(errOutput.includes(workspaceHook))
+    assert.match(errOutput, /name=block-dangerous enabled=true matcher=run_command/)
+  })
+
+  test('deps.env 指到沒有守門的 tmp HOME＋沒有 LLM_TEAM_GUARD ⇒ 紅且訊息含「守門」', () => {
+    const deps = makeValidSetupDeps(null)
+    const emptyHome = tmpdir('empty-home-')
+    deps.env = { HOME: emptyHome }
+    delete deps.env.LLM_TEAM_GUARD
+    deps.importMetaUrl = 'file:///nonexistent/setup.mjs'
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /守門/)
+  })
+
+  test('LLM_TEAM_GUARD 指到不存在的檔、HOME 是空 tmp ⇒ exit 1 且 stderr 含「守門」', () => {
+    const deps = makeValidSetupDeps(null)
+    const emptyHome = tmpdir('empty-home-')
+    deps.env = {
+      HOME: emptyHome,
+      LLM_TEAM_GUARD: path.join(emptyHome, 'nonexistent-guard.sh'),
+    }
+    deps.importMetaUrl = 'file:///nonexistent/setup.mjs'
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const errOutput = errs.join('\n')
+    assert.match(errOutput, /守門/)
+  })
+
+  test('tmp HOME 放一個檔 ⇒ 綠並印那條路徑', () => {
+    const homeWithGuard = tmpdir('home-with-guard-')
+    const guardDir = path.join(homeWithGuard, '.claude', 'hooks')
+    fs.mkdirSync(guardDir, { recursive: true })
+    const expectedGuardPath = path.join(guardDir, 'block-dangerous.sh')
+    fs.writeFileSync(expectedGuardPath, '#!/usr/bin/env bash\n')
+
+    const deps = makeValidSetupDeps(null)
+    deps.env = { HOME: homeWithGuard }
+    deps.importMetaUrl = 'file:///nonexistent/setup.mjs'
+
+    const hooksPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: true,
+              source: path.join(deps.env.HOME, '.gemini', 'config', 'hooks.json'),
+              actions: [
+                {
+                  event: 'PreToolUse',
+                  matcher: 'run_command',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }
+    deps.runAgyHooks = () => ({ exit: 0, stdout: JSON.stringify(hooksPayload) })
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    const logOutput = logs.join('\n')
+    assert.match(logOutput, /\[守門\] ✓/)
+    assert.ok(logOutput.includes(expectedGuardPath))
+  })
+})
+
 
 
 

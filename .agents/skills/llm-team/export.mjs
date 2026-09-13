@@ -20,6 +20,8 @@ export const EXPORT_FILES = [
   'ticket.test.mjs',
   'export.mjs',
   'export.test.mjs',
+  'agy-pretooluse.sh',
+  'agy-pretooluse.test.mjs',
   'SKILL.md',
   'test.sh',
   'VERSION',
@@ -31,7 +33,11 @@ export const MANIFEST_REQUIRED = [...EXPORT_FILES, 'SOURCE.json'].sort()
  * 驗證快照目錄中的檔案是否與 MANIFEST.sha256 一致，並偵測額外檔案。
  * 回傳：{ ok, missing: [], changed: [], extra: [], unlisted: [], malformed: [], duplicate: [] }
  */
-export function verifySnapshot(snapshotDir) {
+export function verifySnapshot(snapshotDir, options = {}) {
+  const manifestRequired =
+    options.manifestRequired ||
+    (options.exportFiles ? [...options.exportFiles, 'SOURCE.json'].sort() : MANIFEST_REQUIRED)
+
   const manifestPath = path.join(snapshotDir, 'MANIFEST.sha256')
   if (!fs.existsSync(manifestPath)) {
     return {
@@ -40,6 +46,7 @@ export function verifySnapshot(snapshotDir) {
       changed: [],
       extra: [],
       unlisted: [],
+      sourceNew: [],
       malformed: [],
       duplicate: [],
     }
@@ -72,15 +79,21 @@ export function verifySnapshot(snapshotDir) {
   const changed = []
   const extra = []
   const unlisted = []
+  const sourceNew = []
 
-  for (const req of MANIFEST_REQUIRED) {
+  for (const req of manifestRequired) {
     if (!manifestEntries.has(req)) {
-      unlisted.push(req)
+      const fullPath = path.join(snapshotDir, req)
+      if (fs.existsSync(fullPath)) {
+        unlisted.push(req)
+      } else {
+        sourceNew.push(req)
+      }
     }
   }
 
   for (const [relPath, expectedHash] of manifestEntries.entries()) {
-    if (!MANIFEST_REQUIRED.includes(relPath)) {
+    if (!manifestRequired.includes(relPath)) {
       if (!extra.includes(relPath)) {
         extra.push(relPath)
       }
@@ -111,7 +124,7 @@ export function verifySnapshot(snapshotDir) {
         const rel = path.relative(snapshotDir, full)
         if (rel === 'MANIFEST.sha256') continue
         if (rel.endsWith('.mjs') || rel.endsWith('.sh') || rel.endsWith('.md')) {
-          if (!manifestEntries.has(rel) && !extra.includes(rel)) {
+          if (!manifestEntries.has(rel) && !extra.includes(rel) && !unlisted.includes(rel)) {
             extra.push(rel)
           }
         }
@@ -124,6 +137,7 @@ export function verifySnapshot(snapshotDir) {
   changed.sort()
   extra.sort()
   unlisted.sort()
+  sourceNew.sort()
   malformed.sort()
   duplicate.sort()
 
@@ -132,10 +146,11 @@ export function verifySnapshot(snapshotDir) {
     changed.length === 0 &&
     extra.length === 0 &&
     unlisted.length === 0 &&
+    sourceNew.length === 0 &&
     malformed.length === 0 &&
     duplicate.length === 0
 
-  return { ok, missing, changed, extra, unlisted, malformed, duplicate }
+  return { ok, missing, changed, extra, unlisted, malformed, duplicate, sourceNew }
 }
 
 /**
@@ -145,13 +160,31 @@ export function verifySnapshot(snapshotDir) {
 export function exportTo(sourceDir, targetRoot, options = {}) {
   const force = Boolean(options.force)
   const deps = options.deps || {}
+  const exportFiles = options.exportFiles || deps.exportFiles || EXPORT_FILES
+  const manifestRequired =
+    options.manifestRequired ||
+    deps.manifestRequired ||
+    (options.exportFiles
+      ? [...options.exportFiles, 'SOURCE.json'].sort()
+      : deps.exportFiles
+      ? [...deps.exportFiles, 'SOURCE.json'].sort()
+      : MANIFEST_REQUIRED)
 
   const targetDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
   const targetManifest = path.join(targetDir, 'MANIFEST.sha256')
 
+  let pendingNewFiles = []
   if (fs.existsSync(targetManifest)) {
-    const v = verifySnapshot(targetDir)
-    if (!v.ok) {
+    const v = verifySnapshot(targetDir, { exportFiles, manifestRequired })
+    const hasDrift =
+      v.changed.length > 0 ||
+      v.missing.length > 0 ||
+      v.extra.length > 0 ||
+      v.unlisted.length > 0 ||
+      v.malformed.length > 0 ||
+      v.duplicate.length > 0
+
+    if (hasDrift) {
       if (!force) {
         const parts = []
         if (v.changed.length > 0) parts.push(`changed:\n  ${v.changed.join('\n  ')}`)
@@ -163,6 +196,10 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
         console.error(`🔴 快照已被修改（手動漂移），不准覆蓋：\n  ${parts.join('\n  ')}`)
         return { ok: false, status: 2, verify: v, changed: v.changed }
       }
+    }
+
+    if (v.sourceNew && v.sourceNew.length > 0) {
+      pendingNewFiles = [...v.sourceNew]
     }
   }
 
@@ -192,17 +229,21 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
   fs.mkdirSync(targetDir, { recursive: true })
 
   // 1. 複製 EXPORT_FILES
-  for (const f of EXPORT_FILES) {
+  for (const f of exportFiles) {
     const src = path.join(sourceDir, f)
     const dst = path.join(targetDir, f)
     fs.copyFileSync(src, dst)
+  }
+
+  for (const f of pendingNewFiles) {
+    console.log(`+ ${f}`)
   }
 
   // 2. 寫 SOURCE.json
   fs.writeFileSync(path.join(targetDir, 'SOURCE.json'), JSON.stringify(sourceJson, null, 2) + '\n')
 
   // 3. 寫 MANIFEST.sha256
-  const manifestFiles = [...MANIFEST_REQUIRED]
+  const manifestFiles = [...manifestRequired]
   const manifestLines = []
   for (const f of manifestFiles) {
     const full = path.join(targetDir, f)
