@@ -15,7 +15,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { CLEAN_GIT_ENV, buildSafeCommandRegex } from './lib.mjs'
-import { main as ticketMain } from './ticket.mjs'
+import { main as ticketMain, runCli } from './ticket.mjs'
 import { main as setupMain } from './setup.mjs'
 import { EXPORT_FILES } from './export.mjs'
 
@@ -25,6 +25,7 @@ function tmpdir(prefix) {
 
 const TEST_CONFIG = {
   schemaVersion: 1,
+  branchPrefixes: [],
   models: {
     writer: 'gemini-3.8-flash-high',
     reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
@@ -53,7 +54,7 @@ function makeRepo(configOverride = {}) {
 }
 
 describe('ticket.mjs 票流程測試', () => {
-  test('T1 run：注入 writeMain 回 0 且改檔、councilMain 回 0 且簽 ⇒ exit 0、summary 兩筆「簽」、changed 含改動檔', () => {
+  test('T1 run：注入 writeMain 回 0 且改檔、councilMain 回 0 且簽 ⇒ exit 0、summary 兩筆「簽」、changed 含改動檔', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 新增功能票\n實作細節')
@@ -88,7 +89,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -122,7 +123,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary.review.anyEmpty, false)
   })
 
-  test('T2 run：write 回 2 ⇒ exit 2、councilMain 沒被呼叫', () => {
+  test('T2 run：write 回 2 ⇒ exit 2、councilMain 沒被呼叫', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 失敗票\n內容')
@@ -144,7 +145,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -168,7 +169,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(councilCalled, false, 'councilMain 不應被呼叫')
   })
 
-  test('T3 run：某位複審者零輸出 ⇒ exit 3、摘要含「零輸出」', () => {
+  test('T3 run：某位複審者零輸出 ⇒ exit 3、摘要含「零輸出」', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 零輸出票\n內容')
@@ -197,7 +198,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -222,7 +223,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(output, /零輸出/, `摘要應包含「零輸出」，實際：${output}`)
   })
 
-  test('T4 陽性對照：複審者回「整份：不簽」⇒ exit 0（不是錯誤碼）且摘要含「不簽」', () => {
+  test('T4 陽性對照：複審者回「整份：不簽」⇒ exit 0（不是錯誤碼）且摘要含「不簽」', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 不簽票\n內容')
@@ -254,7 +255,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -279,7 +280,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(output, /不簽/, `摘要應包含「不簽」，實際：${output}`)
   })
 
-  test('T5 publish：注入假的 git／gh spawn，斷言沒有呼叫任何 merge 指令、commit 訊息＝--title、gh pr create 帶 --draft', () => {
+  test('T5 publish：注入假的 git／gh spawn，斷言沒有呼叫任何 merge 指令、commit 訊息＝--title、gh pr create 帶 --draft', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't5')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -336,7 +337,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't5', '--title', 'feat: custom title'], deps)
+      code = await ticketMain(['publish', '--name', 't5', '--title', 'feat: custom title'], deps)
     } finally {
       console.log = origLog
     }
@@ -371,7 +372,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(prCall.args[titleIdx + 1], 'feat: custom title')
   })
 
-  test('T7 publish 誘餌：worktree 有未追蹤檔 decoy.txt（不在 summary.changed）⇒ publish 回 2、注入的 git 沒收到 commit／push、stderr 含 decoy.txt', () => {
+  test('T7 publish 誘餌：worktree 有未追蹤檔 decoy.txt（不在 summary.changed）⇒ publish 回 2、注入的 git 沒收到 commit／push、stderr 含 decoy.txt', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't7')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -420,7 +421,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't7'], deps)
+      code = await ticketMain(['publish', '--name', 't7'], deps)
     } finally {
       console.error = origErr
     }
@@ -438,7 +439,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errOutput, /decoy\.txt/, `stderr 應包含 decoy.txt，實際：${errOutput}`)
   })
 
-  test('T8 陽性對照：沒有誘餌 ⇒ publish 回 0，且注入的 git 收到的 add 引數逐字等於 summary.changed（不含 -A）', () => {
+  test('T8 陽性對照：沒有誘餌 ⇒ publish 回 0，且注入的 git 收到的 add 引數逐字等於 summary.changed（不含 -A）', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't8')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -492,7 +493,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't8'], deps)
+      code = await ticketMain(['publish', '--name', 't8'], deps)
     } finally {
       console.log = origLog
     }
@@ -505,7 +506,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.deepEqual(addCall.args, ['add', '--', ...summary.changed], 'add 引數應為 [add, --, ...summary.changed]')
   })
 
-  test('T9 非法 --tier：--tier blcok ⇒ run 回 2、writeMain 沒被呼叫', () => {
+  test('T9 非法 --tier：--tier blcok ⇒ run 回 2、writeMain 沒被呼叫', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 測試票\n內容')
@@ -525,7 +526,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -553,7 +554,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errOutput, /用法：run/, `stderr 應包含用法，實際：${errOutput}`)
   })
 
-  test('T10 run 清舊複審：<outDir>/review/opus.txt 預先放「整份：不簽」殘留、councilMain 這輪產「整份：簽」⇒ summary 是「簽」（證明清過）', () => {
+  test('T10 run 清舊複審：<outDir>/review/opus.txt 預先放「整份：不簽」殘留、councilMain 這輪產「整份：簽」⇒ summary 是「簽」（證明清過）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 清舊複審票\n內容')
@@ -590,7 +591,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -620,7 +621,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(opus.overall, '簽', 'opus overall 應為「簽」，證明舊的「不簽」殘留已被清除')
   })
 
-  test('T11 riskDomains 升級：config riskDomains: [金流]、brief 含「金流」、--tier standard ⇒ councilMain 收到 --tier block、summary.tierEscalatedBy 是 [金流]；riskDomains: [] ⇒ 仍是 standard', () => {
+  test('T11 riskDomains 升級：config riskDomains: [金流]、brief 含「金流」、--tier standard ⇒ councilMain 收到 --tier block、summary.tierEscalatedBy 是 [金流]；riskDomains: [] ⇒ 仍是 standard', async () => {
     // 1. riskDomains: ['金流'] ⇒ 升級 block
     const repo1 = makeRepo({ riskDomains: ['金流'] })
     const briefFile1 = path.join(tmpdir('brief1-'), 'brief.md')
@@ -653,7 +654,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs1.push(String(m))
     let code1
     try {
-      code1 = ticketMain(
+      code1 = await ticketMain(
         [
           'run',
           '--name',
@@ -715,7 +716,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs2.push(String(m))
     let code2
     try {
-      code2 = ticketMain(
+      code2 = await ticketMain(
         [
           'run',
           '--name',
@@ -748,7 +749,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary2.review.tier, 'standard', 'summary.review.tier 應維持 standard')
   })
 
-  test('T17 --test 不在 allow 內：--test "bash -n x.sh" ⇒ run 回 2、writeMain 沒被呼叫、stderr 含 allowCommandHeads', () => {
+  test('T17 --test 不在 allow 內：--test "bash -n x.sh" ⇒ run 回 2、writeMain 沒被呼叫、stderr 含 allowCommandHeads', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 測試票\n內容')
@@ -768,7 +769,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -794,7 +795,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errOutput, /allowCommandHeads/, `stderr 應包含 allowCommandHeads，實際：${errOutput}`)
   })
 
-  test('T18 陽性對照：--test "node --test x.test.mjs && node --check x.mjs" ⇒ 通過這道檢查（run 繼續往下、writeMain 被呼叫）', () => {
+  test('T18 陽性對照：--test "node --test x.test.mjs && node --check x.mjs" ⇒ 通過這道檢查（run 繼續往下、writeMain 被呼叫）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 測試票\n內容')
@@ -814,7 +815,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -838,7 +839,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(code, 0, `run 應成功執行完畢，實際 exit code 為 ${code}`)
   })
 
-  test('T19 writeMain 回 3、changed 空 ⇒ run 回 3（陽性對照：把第 1 點拿掉就回 0）', () => {
+  test('T19 writeMain 回 3、changed 空 ⇒ run 回 3（陽性對照：把第 1 點拿掉就回 0）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T19\n內容')
@@ -856,7 +857,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -884,7 +885,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.deepEqual(summary.changed, [])
   })
 
-  test('T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3', () => {
+  test('T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T20\n內容')
@@ -913,7 +914,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -939,7 +940,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary.verifyExit, 1)
   })
 
-  test('T21 全綠 ⇒ 0', () => {
+  test('T21 全綠 ⇒ 0', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T21\n內容')
@@ -968,7 +969,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -996,7 +997,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary.review.anyEmpty, false)
   })
 
-  test('T22 publish：summary verifyExit:1 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T22 publish：summary verifyExit:1 ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't22')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1042,7 +1043,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't22'], deps)
+      code = await ticketMain(['publish', '--name', 't22'], deps)
     } finally {
       console.error = origErr
     }
@@ -1052,7 +1053,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /verifyExit/)
   })
 
-  test('T23 publish：summary anyEmpty:true ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T23 publish：summary anyEmpty:true ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't23')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1098,7 +1099,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't23'], deps)
+      code = await ticketMain(['publish', '--name', 't23'], deps)
     } finally {
       console.error = origErr
     }
@@ -1108,7 +1109,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /anyEmpty/)
   })
 
-  test('T24 publish：一位 overall:\'不簽\' 且無 dispositions ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T24 publish：一位 overall:\'不簽\' 且無 dispositions ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't24')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1154,7 +1155,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't24'], deps)
+      code = await ticketMain(['publish', '--name', 't24'], deps)
     } finally {
       console.error = origErr
     }
@@ -1164,7 +1165,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /不簽/)
   })
 
-  test('T25 同上但 accept --disposition 標了 rejected ＋ --q6 ⇒ publish 走到 gh', () => {
+  test('T25 同上但 accept --disposition 標了 rejected ＋ --q6 ⇒ publish 走到 gh', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't25')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1209,7 +1210,7 @@ describe('ticket.mjs 票流程測試', () => {
     }
 
     // 1. accept 寫入 disposition 與 q6
-    const acceptCode = ticketMain(
+    const acceptCode = await ticketMain(
       ['accept', '--name', 't25', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'opus:Q1=rejected:"範圍縮減裁決"'],
       deps
     )
@@ -1226,7 +1227,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let publishCode
     try {
-      publishCode = ticketMain(['publish', '--name', 't25'], deps)
+      publishCode = await ticketMain(['publish', '--name', 't25'], deps)
     } finally {
       console.log = origLog
     }
@@ -1235,7 +1236,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(ghCalled, true, 'gh 應被呼叫')
   })
 
-  test('T26 publish：沒 q6Receipt ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T26 publish：沒 q6Receipt ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't26')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1281,7 +1282,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't26'], deps)
+      code = await ticketMain(['publish', '--name', 't26'], deps)
     } finally {
       console.error = origErr
     }
@@ -1291,7 +1292,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /q6Receipt/)
   })
 
-  test('T27 lifecycle：跑完 run 後 lifecycle.ndjson 至少有 run-start、writer-done、review-done 三行、順序正確、每行有 harness；設 LLM_TEAM_HARNESS=agy 時 harness 為 agy', () => {
+  test('T27 lifecycle：跑完 run 後 lifecycle.ndjson 至少有 run-start、writer-done、review-done 三行、順序正確、每行有 harness；設 LLM_TEAM_HARNESS=agy 時 harness 為 agy', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T27\n內容')
@@ -1321,7 +1322,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -1368,7 +1369,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(summary.comparable, false)
   })
 
-  test('T28 summary --name：印出 harness、q6Receipt（有無）、dispositions 數', () => {
+  test('T28 summary --name：印出 harness、q6Receipt（有無）、dispositions 數', async () => {
     const repo = makeRepo()
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't28')
     fs.mkdirSync(outDir, { recursive: true })
@@ -1398,7 +1399,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(['summary', '--name', 't28'], { repoRoot: repo.dir })
+      code = await ticketMain(['summary', '--name', 't28'], { repoRoot: repo.dir })
     } finally {
       console.log = origLog
     }
@@ -1410,7 +1411,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(outText, /dispositions: 1/)
   })
 
-  test('T29 lifecycle：writeMain 回 3 失敗時 lifecycle 恰有 run-start 與 writer-done 兩行（無 review-done）', () => {
+  test('T29 lifecycle：writeMain 回 3 失敗時 lifecycle 恰有 run-start 與 writer-done 兩行（無 review-done）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T29\n內容')
@@ -1431,7 +1432,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -1463,7 +1464,7 @@ describe('ticket.mjs 票流程測試', () => {
     )
   })
 
-  test('T30 publish：summary writeExit:3 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T30 publish：summary writeExit:3 ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't30')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1509,7 +1510,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't30'], deps)
+      code = await ticketMain(['publish', '--name', 't30'], deps)
     } finally {
       console.error = origErr
     }
@@ -1519,7 +1520,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /writeExit 為 3/)
   })
 
-  test('T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫', () => {
+  test('T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't31')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1562,7 +1563,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't31'], deps)
+      code = await ticketMain(['publish', '--name', 't31'], deps)
     } finally {
       console.error = origErr
     }
@@ -1572,7 +1573,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /複審成員少於 2 位/)
   })
 
-  test('T32 publish：同成員兩題不簽只處置一題 ⇒ publish 回 2 且 gh 未呼叫', () => {
+  test('T32 publish：同成員兩題不簽只處置一題 ⇒ publish 回 2 且 gh 未呼叫', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't32')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1621,7 +1622,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(['publish', '--name', 't32'], deps)
+      code = await ticketMain(['publish', '--name', 't32'], deps)
     } finally {
       console.error = origErr
     }
@@ -1631,7 +1632,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /codex 之 Q6 不簽且未處置/)
   })
 
-  test('T33 publish：整份不簽無逐題時給 q:Q3 仍回 2，給 q:overall 且 accept 寫入後 publish 通過', () => {
+  test('T33 publish：整份不簽無逐題時給 q:Q3 仍回 2，給 q:overall 且 accept 寫入後 publish 通過', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't33')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1686,7 +1687,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code1
     try {
-      code1 = ticketMain(['publish', '--name', 't33'], deps)
+      code1 = await ticketMain(['publish', '--name', 't33'], deps)
     } finally {
       console.error = origErr
     }
@@ -1695,7 +1696,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /opus 整份不簽且未處置/)
 
     // 2. 測試 accept --disposition opus:overall=rejected:"..." 寫入
-    const acceptCode = ticketMain(
+    const acceptCode = await ticketMain(
       ['accept', '--name', 't33', '--q6', '親自坐實', '--disposition', 'opus:overall=rejected:"整體風險已控制"'],
       deps
     )
@@ -1713,7 +1714,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code2
     try {
-      code2 = ticketMain(['publish', '--name', 't33'], deps)
+      code2 = await ticketMain(['publish', '--name', 't33'], deps)
     } finally {
       console.log = origLog
     }
@@ -1721,7 +1722,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(ghCalled, true, 'gh 應被呼叫')
   })
 
-  test('T34 分支前綴由 config branchPrefixes 決定：["agy/"] 擋 feat/ 過 agy/；[] 全放行', () => {
+  test('T34 分支前綴由 config branchPrefixes 決定：["agy/"] 擋 feat/ 過 agy/；[] 全放行', async () => {
     // 1. config branchPrefixes: ['agy/']
     const repo1 = makeRepo({ branchPrefixes: ['agy/'] })
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
@@ -1742,12 +1743,12 @@ describe('ticket.mjs 票流程測試', () => {
     let codePass
     try {
       // feat/x 應該被擋
-      codeFail = ticketMain(
+      codeFail = await ticketMain(
         ['run', '--name', 't34-1', '--brief', briefFile, '--branch', 'feat/x', '--allow', 'a.txt', '--test', 'true'],
         deps1
       )
       // agy/x 應該放行
-      codePass = ticketMain(
+      codePass = await ticketMain(
         ['run', '--name', 't34-2', '--brief', briefFile, '--branch', 'agy/x', '--allow', 'a.txt', '--test', 'true'],
         deps1
       )
@@ -1768,14 +1769,14 @@ describe('ticket.mjs 票流程測試', () => {
       councilMain: () => 0,
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
-    const codeAny = ticketMain(
+    const codeAny = await ticketMain(
       ['run', '--name', 't34-3', '--brief', briefFile, '--branch', 'custom-branch-without-prefix', '--allow', 'a.txt', '--test', 'true'],
       deps2
     )
     assert.equal(codeAny, 0, 'branchPrefixes 為空陣列時任何名字都應通過')
   })
 
-  test('T35 早期失敗清理：deps 注入 install 回非零 ⇒ run 回 2 且 worktree 與 branch 被清掉；write 之後失敗 ⇒ worktree 仍在；write 回 2 但已改檔 ⇒ 絕不清理', () => {
+  test('T35 早期失敗清理：deps 注入 install 回非零 ⇒ run 回 2 且 worktree 與 branch 被清掉；write 之後失敗 ⇒ worktree 仍在；write 回 2 但已改檔 ⇒ 絕不清理', async () => {
     // 1. deps 注入 runInstall 回非零 ⇒ run 回 2 且 worktree 目錄不存在、branch 不存在
     const repo1 = makeRepo({ installCommand: 'echo fail' })
     const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
@@ -1787,7 +1788,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs1.push(String(m))
     let codeFail
     try {
-      codeFail = ticketMain(
+      codeFail = await ticketMain(
         [
           'run',
           '--name',
@@ -1831,7 +1832,7 @@ describe('ticket.mjs 票流程測試', () => {
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
 
-    const codeWriteFail = ticketMain(
+    const codeWriteFail = await ticketMain(
       [
         'run',
         '--name',
@@ -1870,7 +1871,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs3.push(String(m))
     let codeWrite2Changed
     try {
-      codeWrite2Changed = ticketMain(
+      codeWrite2Changed = await ticketMain(
         [
           'run',
           '--name',
@@ -1898,7 +1899,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.doesNotMatch(errText3, /🧹/, 'write 回 2 但已改檔時絕不應印出 🧹 清理訊息')
   })
 
-  test('T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下', () => {
+  test('T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下', async () => {
     // 1. 實驗組：codexTier: "all" + tier standard
     const repo1 = makeRepo({ codexTier: 'all' })
     const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
@@ -1928,7 +1929,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs1.push(String(m))
     let runCode1
     try {
-      runCode1 = ticketMain(
+      runCode1 = await ticketMain(
         [
           'run',
           '--name',
@@ -1977,7 +1978,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errsPub.push(String(m))
     let pubCode
     try {
-      pubCode = ticketMain(['publish', '--name', 't36-all'], publishDeps)
+      pubCode = await ticketMain(['publish', '--name', 't36-all'], publishDeps)
     } finally {
       console.error = origErr
     }
@@ -2011,7 +2012,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     let runCode2
     try {
-      runCode2 = ticketMain(
+      runCode2 = await ticketMain(
         [
           'run',
           '--name',
@@ -2039,7 +2040,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(hasCodex, false, 'codexTier: block ＋ standard 時 members 不應含 codex')
   })
 
-  test('T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（settings 缺 regex ⇒ run 回 2、未建 worktree 且 writeMain 沒被呼叫）', () => {
+  test('T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（settings 缺 regex ⇒ run 回 2、未建 worktree 且 writeMain 沒被呼叫）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T37\n內容')
@@ -2080,7 +2081,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -2109,7 +2110,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(branches.trim(), '', 'G2 失敗時分支不應被建立')
   })
 
-  test('T37b G2 對帳：deps 注入 writeMain 且 settings 含正確 regex ⇒ 過 G2 且 writeMain 被呼叫', () => {
+  test('T37b G2 對帳：deps 注入 writeMain 且 settings 含正確 regex ⇒ 過 G2 且 writeMain 被呼叫', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T37b\n內容')
@@ -2152,7 +2153,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = ticketMain(
+      code = await ticketMain(
         [
           'run',
           '--name',
@@ -2177,6 +2178,222 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(fs.existsSync(worktreePath), true, 'G2 通過時 worktree 應被建立')
     const branches = repo.g('branch', '--list', 'feat/t37b--slice')
     assert.match(branches, /feat\/t37b--slice/, 'G2 通過時分支應被建立')
+  })
+
+  test('T38 run 拒絕多餘位置參數：--allow a b ⇒ exit 2 且訊息含 b；--allow a --allow b ⇒ 通過參數檢查', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# brief\n')
+    const deps = {
+      repoRoot: repo.dir,
+      config: TEST_CONFIG,
+      assertSettings: () => true,
+      writeMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+      councilMain: () => 0,
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run',
+          '--name', 't38',
+          '--brief', briefFile,
+          '--branch', 'feat/t38',
+          '--allow', 'a', 'b',
+          '--test', 'true',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, '有未預期的位置參數時 run 應回 2')
+    const allErr = errs.join('\n')
+    assert.match(allErr, /🔴 多餘的位置參數（--allow 要每個檔各給一次）：b/)
+    assert.ok(allErr.includes('b'), `錯誤訊息應含 'b'，實際輸出：${allErr}`)
+
+    // 陽性對照：--allow a --allow b 通過參數檢查（不因「多餘的位置參數」而報錯，且走完流程 exit 0）
+    const errs2 = []
+    console.error = (m) => errs2.push(String(m))
+    let codePass
+    try {
+      codePass = await ticketMain(
+        [
+          'run',
+          '--name', 't38',
+          '--brief', briefFile,
+          '--branch', 'feat/t38',
+          '--allow', 'a',
+          '--allow', 'b',
+          '--test', 'true',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+    const allErr2 = errs2.join('\n')
+    assert.doesNotMatch(allErr2, /多餘的位置參數/, `合法參數不應報多餘位置參數錯誤，實際：${allErr2}`)
+    assert.equal(codePass, 0, '合法 --allow a --allow b 通過參數檢查後正常執行完畢回 0')
+  })
+
+  test('T39 councilMain 延遲 resolve（非同步 Promise）：run 仍等待其完成、summary.json 含複審結果、exit 正確', async () => {
+    // 陽性對照：若 ticket.mjs 在 councilMainFn 呼叫處拿掉 await，則 summary.json 寫入時 reviewMembers 尚未產出（或 councilExit 尚未取得），這條測試會紅。
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 新增功能票\n實作細節')
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't39')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't39', 'review')
+
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello world\n')
+        return 0
+      },
+      councilMain: async () => {
+        await new Promise((res) => setTimeout(res, 30))
+        fs.mkdirSync(reviewOutDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(reviewOutDir, 'opus.txt'),
+          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認 hello.txt 內容'
+        )
+        fs.writeFileSync(
+          path.join(reviewOutDir, 'gemini.txt'),
+          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認檔案編碼'
+        )
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run',
+          '--name', 't39',
+          '--brief', briefFile,
+          '--branch', 'feat/t39--slice',
+          '--allow', 'hello.txt',
+          '--test', 'true',
+        ],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, '非同步 councilMain 成功完成後 run 應回 0')
+    const summaryPath = path.join(repo.dir, '.local', 'llm-team', 't39', 'summary.json')
+    assert.ok(fs.existsSync(summaryPath), 'summary.json 應存在')
+    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+    assert.equal(summary.review.members.length, 2, 'summary 應包含 2 位複審結果')
+    assert.equal(summary.review.members[0].overall, '簽')
+    assert.equal(summary.review.members[1].overall, '簽')
+    assert.equal(summary.review.anyEmpty, false)
+  })
+
+  test('T40 councilMain reject ⇒ main 回傳 rejected Promise', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# brief\n')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't40')
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello\n')
+        return 0
+      },
+      councilMain: async () => {
+        throw new Error('council 內部嚴重異常')
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    await assert.rejects(
+      async () => {
+        await ticketMain(
+          [
+            'run',
+            '--name', 't40',
+            '--brief', briefFile,
+            '--branch', 'feat/t40',
+            '--allow', 'hello.txt',
+            '--test', 'true',
+          ],
+          deps
+        )
+      },
+      /council 內部嚴重異常/
+    )
+  })
+
+  test('T41 runCli 入口測試：main resolve ⇒ exitFn(code)；main reject ⇒ errFn(err) 且 exitFn(1)', async () => {
+    // 1. resolve 路徑
+    let resolvedCode = null
+    const exitFn1 = (code) => { resolvedCode = code }
+    const errs1 = []
+    const errFn1 = (err) => { errs1.push(err) }
+
+    const retCode1 = await runCli(['--unknown-cmd'], exitFn1, errFn1)
+    assert.equal(resolvedCode, 2, '未知指令時 main resolve 2，exitFn 應收到 2')
+    assert.equal(retCode1, 2)
+    assert.equal(errs1.length, 0, 'resolve 路徑不應呼叫 errFn')
+
+    // 2. reject 路徑
+    let rejectedCode = null
+    const exitFn2 = (code) => { rejectedCode = code }
+    const errs2 = []
+    const errFn2 = (err) => { errs2.push(err) }
+
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# brief\n')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't41')
+    const rejectDeps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello\n')
+        return 0
+      },
+      councilMain: async () => {
+        throw new Error('councilMain 拋出例外')
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const retCode2 = await runCli(
+      [
+        'run',
+        '--name', 't41',
+        '--brief', briefFile,
+        '--branch', 'feat/t41',
+        '--allow', 'hello.txt',
+        '--test', 'true',
+      ],
+      exitFn2,
+      errFn2,
+      rejectDeps
+    )
+
+    assert.equal(rejectedCode, 1, 'reject 時 exitFn 應收到 1')
+    assert.equal(retCode2, 1)
+    assert.equal(errs2.length, 1, 'reject 時 errFn 應收到錯誤物件')
+    assert.match(errs2[0].message, /councilMain 拋出例外/)
   })
 })
 

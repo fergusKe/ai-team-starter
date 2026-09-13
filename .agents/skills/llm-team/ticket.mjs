@@ -98,7 +98,7 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
   return lines
 }
 
-export function main(argv, deps = {}) {
+export async function main(argv, deps = {}) {
   const env = deps.env || process.env
   const harness = (env && env.LLM_TEAM_HARNESS) || 'unknown'
   const conversationId = (env && env.LLM_TEAM_CONVERSATION_ID) || null
@@ -135,7 +135,19 @@ export function main(argv, deps = {}) {
   const isSafeCommandFn = deps.isSafeCommand || isSafeCommand
 
   if (sub === 'run') {
-    const a = parseArgs(rest, ['allow'])
+    // 🔴 事故：2026-09-13 票 E `--allow a b c` 靜默只收一個；陽性對照：ticket.test.mjs「T38 run 拒絕多餘位置參數：--allow a b ⇒ exit 2 且訊息含 b；--allow a --allow b ⇒ 通過參數檢查」；停止條件：parseArgs 改成宣告式 schema（每個 flag 標 multi）那天拆掉。
+    let a
+    try {
+      a = parseArgs(rest, ['allow'], { strictPositional: true })
+    } catch (e) {
+      const extraList = (e.positionals || []).join(' ')
+      console.error(`🔴 多餘的位置參數（--allow 要每個檔各給一次）：${extraList}`)
+      return 2
+    }
+    if (a._ && a._.length > 0) {
+      console.error(`🔴 多餘的位置參數（--allow 要每個檔各給一次）：${a._.join(' ')}`)
+      return 2
+    }
     if (!a.name || !a.brief || !a.branch || !a.allow || a.allow.length === 0 || !a.test) {
       console.error(
         '用法：run --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main]'
@@ -316,7 +328,7 @@ export function main(argv, deps = {}) {
         tier,
       ]
       if (configFile) councilArgs.push('--config', configFile)
-      councilExit = councilMainFn(councilArgs, deps)
+      councilExit = await councilMainFn(councilArgs, deps)
     }
 
     // 收集複審成員結果
@@ -737,6 +749,19 @@ export function main(argv, deps = {}) {
   return 2
 }
 
+export function runCli(argv, exitFn = process.exit, errFn = console.error, deps = {}) {
+  return main(argv, deps)
+    .then((code) => {
+      exitFn(code)
+      return code
+    })
+    .catch((err) => {
+      errFn(err)
+      exitFn(1)
+      return 1
+    })
+}
+
 if (isDirectRun(import.meta.url)) {
-  process.exit(main(process.argv.slice(2)))
+  runCli(process.argv.slice(2))
 }

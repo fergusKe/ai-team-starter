@@ -18,7 +18,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn as cpSpawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 // ─────────────────── 🔴 git 子行程環境的單一真源 ───────────────────
@@ -230,7 +230,137 @@ export function buildAgyArgs({ model, mode, prompt, timeoutMs = 10 * 60 * 1000, 
 }
 
 /**
- * 跑一次 agy headless。回 { exit, stdout, stderr, result, steps, denied }。
+ * 非同步 spawn 子行程，回傳 Promise<{ status, signal, stdout, stderr }>。
+ * 與 spawnSync 回傳形狀一致：
+ * - 支援 opts.timeout：到期自動 kill('SIGTERM')，status: null, signal: 'SIGTERM'。
+ * - 支援 opts.maxBuffer：超過上限截斷並在 stderr 記一行。
+ */
+export function spawnAsync(bin, args = [], opts = {}) {
+  return new Promise((resolve, reject) => {
+    const encoding = opts.encoding || 'utf8'
+    const timeout = opts.timeout || 0
+    const killGraceMs = opts.killGraceMs !== undefined ? opts.killGraceMs : 5000
+    const maxBuffer = opts.maxBuffer || 64 * 1024 * 1024
+    const stdio = opts.stdio || ['ignore', 'pipe', 'pipe']
+    const cwd = opts.cwd
+    const env = opts.env
+
+    let child
+    try {
+      child = cpSpawn(bin, args, { cwd, env, stdio })
+    } catch (err) {
+      return reject(err)
+    }
+
+    let stdout = ''
+    let stderr = ''
+    let stdoutTruncated = false
+    let stderrTruncated = false
+    let timedOut = false
+    let timer = null
+    let killTimer = null
+    let effectiveSignal = null
+
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        timedOut = true
+        effectiveSignal = 'SIGTERM'
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          /* 忽略可能已退出的錯誤 */
+        }
+        if (killGraceMs > 0) {
+          killTimer = setTimeout(() => {
+            effectiveSignal = 'SIGKILL'
+            try {
+              child.kill('SIGKILL')
+            } catch {
+              /* 忽略可能已退出的錯誤 */
+            }
+          }, killGraceMs)
+          if (killTimer.unref) killTimer.unref()
+        }
+      }, timeout)
+      if (timer.unref) timer.unref()
+    }
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        const str = typeof chunk === 'string' ? chunk : chunk.toString(encoding)
+        if (stdout.length + str.length > maxBuffer) {
+          if (!stdoutTruncated) {
+            stdout += str.slice(0, Math.max(0, maxBuffer - stdout.length))
+            stdoutTruncated = true
+          }
+        } else {
+          stdout += str
+        }
+      })
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        const str = typeof chunk === 'string' ? chunk : chunk.toString(encoding)
+        if (stderr.length + str.length > maxBuffer) {
+          if (!stderrTruncated) {
+            stderr += str.slice(0, Math.max(0, maxBuffer - stderr.length))
+            stderrTruncated = true
+          }
+        } else {
+          stderr += str
+        }
+      })
+    }
+
+    child.on('error', (err) => {
+      if (timer) clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
+      reject(err)
+    })
+
+    child.on('close', (code, sig) => {
+      if (timer) clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
+      if (stdoutTruncated) {
+        stderr += `\n[spawnAsync] stdout exceeded maxBuffer (${maxBuffer} bytes) and was truncated\n`
+      }
+      if (stderrTruncated) {
+        stderr += `\n[spawnAsync] stderr exceeded maxBuffer (${maxBuffer} bytes) and was truncated\n`
+      }
+      const reportedSignal = timedOut
+        ? (sig === 'SIGKILL' || effectiveSignal === 'SIGKILL' ? 'SIGKILL' : (sig || effectiveSignal || 'SIGTERM'))
+        : (sig || null)
+      resolve({
+        status: timedOut ? null : (code !== null ? code : null),
+        signal: reportedSignal,
+        timedOut,
+        stdout,
+        stderr,
+      })
+    })
+  })
+}
+
+/** 解析 runAgy 或 runAgyAsync 之 spawn 結果物件。 */
+export function parseAgyRun(res) {
+  const r = res || {}
+  const parsed = parseStreamJson(r.stdout || '')
+  return {
+    exit: r.status,
+    signal: r.signal || null,
+    timedOut: r.timedOut === true,
+    stdout: r.stdout || '',
+    stderr: r.stderr || '',
+    result: parsed.result,
+    steps: parsed.steps,
+    denied: parsed.denied,
+    conversationId: parsed.conversationId,
+  }
+}
+
+/**
+ * 跑一次 agy headless（同步版）。回 { exit, signal, stdout, stderr, result, steps, denied, conversationId }。
  * - `result` 是 stream-json 最後的 result 物件（沒有 ⇒ null）。
  * - `denied` 是被拒的 action 清單（`result.denied_actions` ∪ 步驟裡 permission 失敗的 tool）。
  * 🔴 stderr 一定要保留：無頭拒絕的訊息只出現在 stderr，而 exit 是 0。
@@ -256,17 +386,34 @@ export function runAgy({
     maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const parsed = parseStreamJson(r.stdout || '')
-  return {
-    exit: r.status,
-    signal: r.signal,
-    stdout: r.stdout || '',
-    stderr: r.stderr || '',
-    result: parsed.result,
-    steps: parsed.steps,
-    denied: parsed.denied,
-    conversationId: parsed.conversationId,
-  }
+  return parseAgyRun(r)
+}
+
+/**
+ * 跑一次 agy headless（非同步版）。
+ */
+export async function runAgyAsync({
+  model,
+  mode,
+  prompt,
+  cwd,
+  timeoutMs = 10 * 60 * 1000,
+  env = process.env,
+  extraArgs = [],
+  spawn = spawnAsync,
+}) {
+  const bin = resolveAgyBin(env)
+  if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
+  const args = buildAgyArgs({ model, mode, prompt, timeoutMs, extraArgs })
+  const r = await spawn(bin, args, {
+    cwd,
+    env: cleanGitEnv(env),
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return parseAgyRun(r)
 }
 
 /** 解析 stream-json：抽 result、工具步驟、被拒清單、conversationId。壞行不丟，記進 steps 讓人看得到。 */
@@ -304,8 +451,26 @@ export function parseStreamJson(text) {
   return { result, steps, denied, conversationId }
 }
 
+/** 組裝 codex exec 引數。 */
+export function buildCodexArgs({ model, prompt, effort = 'high', cwd }) {
+  if (!model) throw new Error('runCodex 需要 model（來自 config.models.codex）')
+  return ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
+}
+
+/** 解析 runCodex 或 runCodexAsync 之 spawn 結果物件。 */
+export function parseCodexRun(res) {
+  const r = res || {}
+  return {
+    exit: r.status,
+    signal: r.signal || null,
+    timedOut: r.timedOut === true,
+    stdout: r.stdout || '',
+    stderr: r.stderr || '',
+  }
+}
+
 /**
- * 跑一次 codex exec（唯讀 sandbox；它讀得到檔，所以提示【不要】加 NO_EXEC_HEADER）。
+ * 跑一次 codex exec（唯讀 sandbox，同步版）。
  * 🔴 stdin 一律接 /dev/null（`< /dev/null`）——否則會掛著等輸入。
  */
 export function runCodex({
@@ -317,9 +482,8 @@ export function runCodex({
   env = process.env,
   spawn = spawnSync,
 }) {
-  if (!model) throw new Error('runCodex 需要 model（來自 config.models.codex）')
   const bin = resolveCodexBin(env)
-  const args = ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
+  const args = buildCodexArgs({ model, prompt, effort, cwd })
   const r = spawn(bin, args, {
     cwd,
     env: cleanGitEnv(env),
@@ -328,7 +492,32 @@ export function runCodex({
     maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  return { exit: r.status, signal: r.signal, stdout: r.stdout || '', stderr: r.stderr || '' }
+  return parseCodexRun(r)
+}
+
+/**
+ * 跑一次 codex exec（唯讀 sandbox，非同步版）。
+ */
+export async function runCodexAsync({
+  model,
+  prompt,
+  cwd,
+  effort = 'high',
+  timeoutMs = 15 * 60 * 1000,
+  env = process.env,
+  spawn = spawnAsync,
+}) {
+  const bin = resolveCodexBin(env)
+  const args = buildCodexArgs({ model, prompt, effort, cwd })
+  const r = await spawn(bin, args, {
+    cwd,
+    env: cleanGitEnv(env),
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return parseCodexRun(r)
 }
 
 
@@ -377,7 +566,7 @@ export function ledgerAppend(file, entry) {
 }
 
 /** 極簡 argv 解析：`--k v` / `--flag`；重複的 `--allow` 會累成陣列。 */
-export function parseArgs(argv, multi = []) {
+export function parseArgs(argv, multi = [], { strictPositional = false } = {}) {
   const out = { _: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -390,6 +579,11 @@ export function parseArgs(argv, multi = []) {
     const v = next === undefined || next.startsWith('--') ? true : (i++, next)
     if (multi.includes(k)) (out[k] ||= []).push(v)
     else out[k] = v
+  }
+  if (strictPositional && out._.length > 0) {
+    const err = new Error(`多餘的位置參數：${out._.join(' ')}`)
+    err.positionals = [...out._]
+    throw err
   }
   return out
 }

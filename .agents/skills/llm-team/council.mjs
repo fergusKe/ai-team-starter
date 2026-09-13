@@ -18,8 +18,8 @@ import {
   loadConfig,
   modelsFrom,
   NO_EXEC_HEADER,
-  runAgy,
-  runCodex,
+  runAgyAsync,
+  runCodexAsync,
   git,
   ledgerAppend,
   parseArgs,
@@ -64,16 +64,29 @@ export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, ri
   ].join('\n')
 }
 
-function runOne(name, model, prompt, cwd, outDir, timeoutMs) {
+async function runOne(name, model, prompt, cwd, outDir, timeoutMs, deps = {}) {
   const started = Date.now()
+  const runCodexFn = deps.runCodexAsync || runCodexAsync
+  const runAgyFn = deps.runAgyAsync || runAgyAsync
   let r
-  if (name === 'codex') r = runCodex({ model, prompt, cwd, timeoutMs })
-  else r = runAgy({ model, mode: 'plan', prompt: NO_EXEC_HEADER + prompt, cwd, timeoutMs })
-  const text = name === 'codex' ? r.stdout : (r.result && r.result.response) || ''
+  if (name === 'codex') r = await runCodexFn({ model, prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
+  else r = await runAgyFn({ model, mode: 'plan', prompt: NO_EXEC_HEADER + prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
+  const timedOut = r.timedOut === true
+  const text = timedOut ? '' : (name === 'codex' ? r.stdout : (r.result && r.result.response) || '')
   fs.writeFileSync(path.join(outDir, `${name}.txt`), text)
   fs.writeFileSync(path.join(outDir, `${name}.stderr.txt`), r.stderr || '')
-  const empty = !text.trim()
-  return { name, model, exit: r.exit, ms: Date.now() - started, empty, denied: r.denied || [], text }
+  const empty = timedOut || !text.trim()
+  return {
+    name,
+    model,
+    exit: r.exit ?? null,
+    signal: r.signal || null,
+    timedOut,
+    ms: Date.now() - started,
+    empty,
+    denied: r.denied || [],
+    text,
+  }
 }
 
 export function parseVerdicts(text) {
@@ -89,7 +102,7 @@ export function parseVerdicts(text) {
   return { q, overall }
 }
 
-export function main(argv, deps = {}) {
+export async function main(argv, deps = {}) {
   const [sub, ...rest] = argv
   const a = parseArgs(rest)
   const outDir = a.out
@@ -114,8 +127,8 @@ export function main(argv, deps = {}) {
   }
 
   fs.mkdirSync(outDir, { recursive: true })
-  const run = deps.runOne || runOne
-  const timeoutMs = Number(a['timeout-ms'] || 15 * 60 * 1000)
+  const run = deps.runOne || ((name, model, prompt, cwd, outDir, timeoutMs) => runOne(name, model, prompt, cwd, outDir, timeoutMs, deps))
+  const timeoutMs = Number(a['timeout-ms'] || 8 * 60 * 1000)
   const models = modelsFrom(config)
   let prompt
   let cwd = process.cwd()
@@ -156,11 +169,71 @@ export function main(argv, deps = {}) {
   }
 
   fs.writeFileSync(path.join(outDir, 'prompt.md'), prompt)
-  const rows = []
-  for (const [name, model] of members) {
-    const r = run(name, model, prompt, cwd, outDir, timeoutMs)
-    const v = parseVerdicts(r.text)
-    rows.push({ ...r, verdicts: v })
+
+  const heartbeatMs = deps.heartbeatMs || (a['heartbeat-ms'] ? Number(a['heartbeat-ms']) : 60 * 1000)
+  const startTime = Date.now()
+  const memberStatus = members.map(([name]) => ({
+    name,
+    done: false,
+    durationMs: 0,
+  }))
+
+  let heartbeatTimer = null
+  if (heartbeatMs > 0) {
+    heartbeatTimer = setInterval(() => {
+      const now = Date.now()
+      const parts = memberStatus.map((s) => {
+        if (s.done) {
+          return `${s.name} 已完成 ${Math.round(s.durationMs / 1000)}s`
+        } else {
+          return `${s.name} ${Math.round((now - startTime) / 1000)}s`
+        }
+      })
+      console.error(`⏳ 等待中：${parts.join('｜')}`)
+    }, heartbeatMs)
+    if (heartbeatTimer.unref) heartbeatTimer.unref()
+  }
+
+  let rows
+  try {
+    if (a.sequential) {
+      rows = []
+      for (let i = 0; i < members.length; i++) {
+        const [name, model] = members[i]
+        const r = await run(name, model, prompt, cwd, outDir, timeoutMs)
+        memberStatus[i].done = true
+        memberStatus[i].durationMs = Date.now() - startTime
+        rows.push(r)
+      }
+    } else {
+      const promises = members.map(async ([name, model], i) => {
+        const r = await run(name, model, prompt, cwd, outDir, timeoutMs)
+        memberStatus[i].done = true
+        memberStatus[i].durationMs = Date.now() - startTime
+        return r
+      })
+      rows = await Promise.all(promises)
+    }
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer)
+  }
+
+  for (let i = 0; i < members.length; i++) {
+    const [name, model] = members[i]
+    const r = rows[i]
+    // 🔴 事故：2026-09-13 票 E 第 4 輪 opus 785 秒、串行等 15 分無輸出；陽性對照：llm-team.test.mjs「council timeout 到期：假 runOne 回 signal: SIGTERM ⇒ 表格印 不簽（timeout）、exit 非 0」；停止條件：agy 自己回報「模型忙碌」事件、能立即失敗那天，本判定改成讀該事件。
+    const isTimeout = r.timedOut === true
+    const isAborted = !isTimeout && Boolean(r.signal)
+    const v = isTimeout
+      ? { q: {}, overall: '不簽（timeout）' }
+      : (isAborted
+        ? { q: {}, overall: '不簽（被中止）' }
+        : parseVerdicts(r.text || ''))
+    r.verdicts = v
+    if (isTimeout || isAborted) {
+      r.empty = true
+      r.exit = null
+    }
     ledgerAppend(path.join(outDir, 'ledger.ndjson'), {
       schemaVersion: 1,
       tool: 'agy-council',
@@ -168,12 +241,14 @@ export function main(argv, deps = {}) {
       name,
       model,
       exit: r.exit,
+      signal: r.signal,
       ms: r.ms,
       empty: r.empty,
       denied: r.denied,
       overall: v.overall,
     })
   }
+
   // 摘要表：空輸出要顯眼——「沒話說」與「被拒」同形，都不算簽。
   console.log(`| 成員 | model | exit | 秒 | 整份 | 逐題 |`)
   console.log(`|---|---|---|---|---|---|`)
@@ -183,7 +258,12 @@ export function main(argv, deps = {}) {
     const per = Object.entries(r.verdicts.q)
       .map(([k, v]) => `${k}=${v}`)
       .join(' ')
-    console.log(`| ${r.name} | ${r.model} | ${r.exit} | ${Math.round(r.ms / 1000)} | ${r.empty ? '🔴 零輸出' : r.verdicts.overall || '?'} | ${per} |`)
+    const overallDisplay = r.timedOut === true
+      ? '不簽（timeout）'
+      : (r.signal
+        ? '不簽（被中止）'
+        : (r.empty ? '🔴 零輸出' : r.verdicts.overall || '?'))
+    console.log(`| ${r.name} | ${r.model} | ${r.exit} | ${Math.round(r.ms / 1000)} | ${overallDisplay} | ${per} |`)
   }
   console.log(`\n輸出：${outDir}/{${rows.map((r) => r.name).join(',')}}.txt`)
   return anyEmpty ? 3 : 0
@@ -195,5 +275,10 @@ function usage() {
 }
 
 if (isDirectRun(import.meta.url)) {
-  process.exit(main(process.argv.slice(2)))
+  main(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(err)
+      process.exit(1)
+    })
 }

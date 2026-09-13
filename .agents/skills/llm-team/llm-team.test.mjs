@@ -26,11 +26,14 @@ import {
   assertSettingsAllowRegex,
   resolveAgyBin,
   runCodex,
+  runCodexAsync,
   runAgy,
+  runAgyAsync,
   buildAgyArgs,
   buildSpawnEnv,
   WRITER_PROMPT_SENTINEL,
   parseArgs,
+  spawnAsync,
   isDirectRun,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
@@ -638,7 +641,7 @@ describe('council.mjs：複審與三方會議', () => {
     assert.match(p, /租戶隔離／金流/)
     assert.match(p, /Q4 租戶隔離／金流 有沒有被碰到？碰到的話是不是 block 級、有沒有對應守門？/)
   })
-  test('review：兩位 agy（假 binary 回「不簽」）⇒ 表格印 不簽、exit 0；零輸出成員 ⇒ exit 3', () => {
+  test('review：兩位 agy（假 binary 回「不簽」）⇒ 表格印 不簽、exit 0；零輸出成員 ⇒ exit 3', async () => {
     const repo = makeRepo()
     fs.writeFileSync(path.join(repo.dir, 'add.mjs'), 'export function add(a, b) { return a + b + 0 }\n')
     const brief = path.join(tmpdir('brief-'), 'brief.md')
@@ -653,7 +656,7 @@ describe('council.mjs：複審與三方會議', () => {
     process.env.AGY_BIN = bin
     process.env.FAKE_AGY_MODE = 'plan'
     try {
-      code = councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', path.join(repo.dir, '.review'), '--tier', 'standard'])
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', path.join(repo.dir, '.review'), '--tier', 'standard'])
     } finally {
       console.log = origLog
       for (const k of Object.keys(saved)) {
@@ -677,7 +680,7 @@ describe('council.mjs：複審與三方會議', () => {
     process.env.FAKE_AGY_MODE = 'denied'
     let code2
     try {
-      code2 = councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', path.join(repo.dir, '.review2'), '--tier', 'standard'])
+      code2 = await councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', path.join(repo.dir, '.review2'), '--tier', 'standard'])
     } finally {
       console.log = origLog
       for (const k of Object.keys(saved)) {
@@ -692,7 +695,7 @@ describe('council.mjs：複審與三方會議', () => {
     assert.equal(resolveAgyBin({ AGY_BIN: '/x/agy' }), '/x/agy')
   })
 
-  test('T3：reviewers: [] 且未帶 --codex ⇒ council main() 回 2、deps.runOne 未被呼叫、stdout 不含「簽」', () => {
+  test('T3：reviewers: [] 且未帶 --codex ⇒ council main() 回 2、deps.runOne 未被呼叫、stdout 不含「簽」', async () => {
     const repo = makeRepo({ models: { writer: 'w', reviewers: [], codex: 'c' } })
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
@@ -715,7 +718,7 @@ describe('council.mjs：複審與三方會議', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = councilMain(
+      code = await councilMain(
         ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
         deps
       )
@@ -730,6 +733,243 @@ describe('council.mjs：複審與三方會議', () => {
     assert.ok(!allOut.includes('簽'), `stdout 不應含「簽」，實際輸出：${allOut}`)
     const allErr = errs.join('\n')
     assert.match(allErr, /🔴 沒有任何複審者（config\.models\.reviewers 空且未加 --codex）/, `stderr 應提示沒有複審者，實際：${allErr}`)
+  })
+
+  test('council 複審者並行啟動：同時發起請求並按原順序寫台帳與印表', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const events = []
+    const deps = {
+      runOne: async (name, model) => {
+        events.push(`start:${name}`)
+        await new Promise((r) => setTimeout(r, 20))
+        events.push(`done:${name}`)
+        return { name, model, exit: 0, ms: 20, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+    const code = await councilMain(
+      ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.equal(events[0], 'start:opus')
+    assert.equal(events[1], 'start:gemini')
+
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(ledger[0].name, 'opus')
+    assert.equal(ledger[1].name, 'gemini')
+  })
+
+  test('council --sequential 保留依序執行行為', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const events = []
+    const deps = {
+      runOne: async (name, model) => {
+        events.push(`start:${name}`)
+        await new Promise((r) => setTimeout(r, 20))
+        events.push(`done:${name}`)
+        return { name, model, exit: 0, ms: 20, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+    const code = await councilMain(
+      ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard', '--sequential'],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.deepEqual(events, ['start:opus', 'done:opus', 'start:gemini', 'done:gemini'])
+  })
+
+  test('council 心跳：並行等待期間每 heartbeatMs 印進度至 stderr', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+
+    const deps = {
+      heartbeatMs: 10,
+      runOne: async (name, model) => {
+        await new Promise((r) => setTimeout(r, 30))
+        return { name, model, exit: 0, ms: 30, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+    try {
+      const code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+      assert.equal(code, 0)
+    } finally {
+      console.error = origErr
+    }
+    const allErr = errs.join('\n')
+    assert.match(allErr, /⏳ 等待中：/)
+  })
+
+  test('council timeout 預設為 8 分鐘（480000ms），--timeout-ms 可覆寫', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    let receivedTimeout = null
+    const deps = {
+      runOne: (name, model, prompt, cwd, out, timeoutMs) => {
+        receivedTimeout = timeoutMs
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: '整份：簽' }
+      },
+    }
+    await councilMain(
+      ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+      deps
+    )
+    assert.equal(receivedTimeout, 8 * 60 * 1000, '預設 timeout 應為 8 分鐘（480000ms）')
+
+    await councilMain(
+      ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard', '--timeout-ms', '12345'],
+      deps
+    )
+    assert.equal(receivedTimeout, 12345, '--timeout-ms 應能覆寫 timeoutMs')
+  })
+
+  test('council timeout 到期：假 runOne 回 signal: SIGTERM ⇒ 表格印 不簽（timeout）、exit 非 0', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+
+    const deps = {
+      runOne: (name, model) => {
+        if (name === 'opus') {
+          return { name, model, exit: null, signal: 'SIGTERM', timedOut: true, ms: 100, empty: true, denied: [], text: '' }
+        }
+        return { name, model, exit: 0, ms: 50, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+    assert.notEqual(code, 0, '有成員 timeout 時 exit 應非 0')
+    assert.equal(code, 3)
+
+    const table = logs.join('\n')
+    assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（timeout） \|/)
+    assert.match(table, /\| gemini \| .* \| 0 \| .* \| 簽 \|/)
+
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    const opusEntry = ledger.find((l) => l.name === 'opus')
+    assert.equal(opusEntry.exit, null)
+    assert.equal(opusEntry.signal, 'SIGTERM')
+    assert.equal(opusEntry.empty, true)
+    assert.equal(opusEntry.overall, '不簽（timeout）')
+  })
+
+  test('council 判斷 timeout 與外部中止：假 spawn 回 timedOut: false, signal: SIGTERM ⇒ 不簽（被中止）；timedOut: true ⇒ 不簽（timeout）', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+
+    // 1. 假 spawn 回 signal: 'SIGTERM', timedOut: false ⇒ 不簽（被中止）
+    {
+      const outDir = path.join(repo.dir, '.review-aborted')
+      const logs = []
+      const origLog = console.log
+      console.log = (m) => logs.push(String(m))
+
+      const deps = {
+        spawn: async () => ({
+          status: null,
+          signal: 'SIGTERM',
+          timedOut: false,
+          stdout: '',
+          stderr: 'killed by external process',
+        }),
+        env: { ...process.env, AGY_BIN: '/mock/bin/antigravity' },
+      }
+      let code
+      try {
+        code = await councilMain(
+          ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+          deps
+        )
+      } finally {
+        console.log = origLog
+      }
+      assert.notEqual(code, 0)
+      const table = logs.join('\n')
+      assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（被中止） \|/)
+      assert.doesNotMatch(table, /不簽（timeout）/)
+
+      const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+      const opusEntry = ledger.find((l) => l.name === 'opus')
+      assert.equal(opusEntry.exit, null)
+      assert.equal(opusEntry.signal, 'SIGTERM')
+      assert.equal(opusEntry.overall, '不簽（被中止）')
+    }
+
+    // 2. 假 spawn 回 signal: 'SIGTERM', timedOut: true ⇒ 不簽（timeout）
+    {
+      const outDir = path.join(repo.dir, '.review-timeout')
+      const logs = []
+      const origLog = console.log
+      console.log = (m) => logs.push(String(m))
+
+      const deps = {
+        spawn: async () => ({
+          status: null,
+          signal: 'SIGTERM',
+          timedOut: true,
+          stdout: '',
+          stderr: '',
+        }),
+        env: { ...process.env, AGY_BIN: '/mock/bin/antigravity' },
+      }
+      let code
+      try {
+        code = await councilMain(
+          ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+          deps
+        )
+      } finally {
+        console.log = origLog
+      }
+      assert.notEqual(code, 0)
+      const table = logs.join('\n')
+      assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（timeout） \|/)
+      assert.doesNotMatch(table, /不簽（被中止）/)
+
+      const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+      const opusEntry = ledger.find((l) => l.name === 'opus')
+      assert.equal(opusEntry.exit, null)
+      assert.equal(opusEntry.signal, 'SIGTERM')
+      assert.equal(opusEntry.overall, '不簽（timeout）')
+    }
   })
 })
 
@@ -750,6 +990,79 @@ describe('parseArgs', () => {
     const res = parseArgs(['cmd', 'subcmd', '--foo', 'bar', 'extra'])
     assert.deepEqual(res, { _: ['cmd', 'subcmd', 'extra'], foo: 'bar' })
     assert.deepEqual(parseArgs(['a', 'b']), { _: ['a', 'b'] })
+  })
+
+  test('strictPositional: true 遇到位置參數 throw 且帶 positionals；沒有位置參數正常過', () => {
+    assert.throws(
+      () => parseArgs(['--foo', 'bar', 'extra'], [], { strictPositional: true }),
+      (err) => {
+        assert.match(err.message, /多餘的位置參數：extra/)
+        assert.deepEqual(err.positionals, ['extra'])
+        return true
+      }
+    )
+    assert.throws(
+      () => parseArgs(['a', 'b'], [], { strictPositional: true }),
+      (err) => {
+        assert.match(err.message, /多餘的位置參數：a b/)
+        assert.deepEqual(err.positionals, ['a', 'b'])
+        return true
+      }
+    )
+    const ok = parseArgs(['--foo', 'bar'], [], { strictPositional: true })
+    assert.deepEqual(ok, { _: [], foo: 'bar' })
+  })
+})
+
+describe('spawnAsync 非同步子行程執行', () => {
+  test('spawnAsync 正常執行 exit 0 與 capture stdout', async () => {
+    const r = await spawnAsync('node', ['-e', 'console.log("hello")'])
+    assert.equal(r.status, 0)
+    assert.equal(r.signal, null)
+    assert.equal(r.timedOut, false)
+    assert.equal(r.stdout.trim(), 'hello')
+    assert.equal(r.stderr, '')
+  })
+
+  test('spawnAsync timeout 到期送 SIGTERM、status: null, signal: "SIGTERM"', async () => {
+    const r = await spawnAsync('node', ['-e', 'setInterval(function(){}, 1000)'], { timeout: 50 })
+    assert.equal(r.status, null)
+    assert.equal(r.signal, 'SIGTERM')
+    assert.equal(r.timedOut, true)
+  })
+
+  test('spawnAsync timeout 後忽略 SIGTERM ⇒ killGraceMs 到期升級送 SIGKILL 且 signal 為 SIGKILL', async () => {
+    const code = [
+      'process.on("SIGTERM", function(){})',
+      'setInterval(function(){}, 1000)',
+    ].join('\n')
+    const start = Date.now()
+    let watchdogTimer = null
+    const race = await Promise.race([
+      spawnAsync('node', ['-e', code], { timeout: 100, killGraceMs: 100 }),
+      new Promise(function (resolve) {
+        watchdogTimer = setTimeout(function () {
+          resolve('WATCHDOG')
+        }, 3000)
+      }),
+    ])
+    if (watchdogTimer) clearTimeout(watchdogTimer)
+    if (race === 'WATCHDOG') {
+      assert.fail('spawnAsync 在 3 秒內沒有 resolve：SIGKILL 升級沒生效')
+    }
+    const r = race
+    const elapsed = Date.now() - start
+    assert.ok(elapsed < 1000, `應在 1 秒內結束，實際耗時 ${elapsed}ms`)
+    assert.equal(r.status, null)
+    assert.equal(r.signal, 'SIGKILL')
+    assert.equal(r.timedOut, true)
+  })
+
+  test('spawnAsync maxBuffer 超過 ⇒ 截斷並記 stderr 一行', async () => {
+    const r = await spawnAsync('node', ['-e', 'console.log("a".repeat(2000))'], { maxBuffer: 100 })
+    assert.equal(r.status, 0)
+    assert.equal(r.stdout.length, 100)
+    assert.match(r.stderr, /\[spawnAsync\] stdout exceeded maxBuffer \(100 bytes\) and was truncated/)
   })
 })
 
@@ -1182,7 +1495,7 @@ describe('agy 無頭第 5 坑：--print-timeout 與 timeoutMs 傳遞', () => {
 })
 
 describe('codexTier 出席層級測試', () => {
-  test('codexTier: "all" ＋ standard tier ⇒ members 含 codex', () => {
+  test('codexTier: "all" ＋ standard tier ⇒ members 含 codex', async () => {
     const repo = makeRepo({ codexTier: 'all' })
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
@@ -1196,7 +1509,7 @@ describe('codexTier 出席層級測試', () => {
       },
     }
 
-    const code = councilMain(
+    const code = await councilMain(
       ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
       deps
     )
@@ -1204,7 +1517,7 @@ describe('codexTier 出席層級測試', () => {
     assert.ok(membersCalled.includes('codex'), `codexTier: "all" 時 standard tier 應出席 codex，實際成員：${membersCalled.join(', ')}`)
   })
 
-  test('codexTier: "block" ＋ standard tier ⇒ members 不含 codex', () => {
+  test('codexTier: "block" ＋ standard tier ⇒ members 不含 codex', async () => {
     const repo = makeRepo({ codexTier: 'block' })
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
@@ -1218,7 +1531,7 @@ describe('codexTier 出席層級測試', () => {
       },
     }
 
-    const code = councilMain(
+    const code = await councilMain(
       ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
       deps
     )
@@ -1236,7 +1549,7 @@ describe('codexTier 出席層級測試', () => {
 })
 
 describe('git 環境剝除：cleanGitEnv 真實生效', () => {
-  test('runAgy 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', () => {
+  test('runAgy 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', async () => {
     let capturedSpawnEnv = null
     const fakeSpawn = (bin, args, opts) => {
       capturedSpawnEnv = opts.env
@@ -1246,7 +1559,7 @@ describe('git 環境剝除：cleanGitEnv 真實生效', () => {
         stderr: '',
       }
     }
-    runAgy({
+    await runAgy({
       model: 'gemini-3.8-flash-high',
       mode: 'plan',
       prompt: 'test',
@@ -1260,13 +1573,13 @@ describe('git 環境剝除：cleanGitEnv 真實生效', () => {
     assert.equal(capturedSpawnEnv.PATH, '/custom/bin', 'PATH 應被保留')
   })
 
-  test('runCodex 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', () => {
+  test('runCodex 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', async () => {
     let capturedSpawnEnv = null
     const fakeSpawn = (bin, args, opts) => {
       capturedSpawnEnv = opts.env
       return { status: 0, stdout: 'ok', stderr: '' }
     }
-    runCodex({
+    await runCodex({
       model: 'gpt-5.6-sol',
       prompt: 'test',
       cwd: process.cwd(),
@@ -1277,6 +1590,82 @@ describe('git 環境剝除：cleanGitEnv 真實生效', () => {
     assert.equal(capturedSpawnEnv.GIT_DIR, undefined, 'GIT_DIR 應被刪除')
     assert.equal(capturedSpawnEnv.GIT_WORK_TREE, undefined, 'GIT_WORK_TREE 應被刪除')
     assert.equal(capturedSpawnEnv.PATH, '/custom/bin', 'PATH 應被保留')
+  })
+})
+
+describe('runAgy 與 runCodex 同步／非同步介面契約', () => {
+  test('runAgy 與 runCodex 同步介面：回傳值非 thenable 且 stdout 立刻可讀（不 await）', () => {
+    const fakeSyncAgySpawn = (bin, args, opts) => {
+      return {
+        status: 0,
+        stdout: '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}',
+        stderr: '',
+      }
+    }
+    const agyRes = runAgy({
+      model: 'gemini-3.8-flash-high',
+      mode: 'plan',
+      prompt: 'test prompt',
+      cwd: process.cwd(),
+      env: { AGY_BIN: '/mock/bin/antigravity' },
+      spawn: fakeSyncAgySpawn,
+    })
+    assert.notEqual(typeof agyRes?.then, 'function', 'runAgy 回傳值不應為 thenable')
+    assert.equal(typeof agyRes.stdout, 'string')
+    assert.ok(agyRes.stdout.includes('"event":"result"'), 'runAgy 的 stdout 應立刻可讀')
+
+    const fakeSyncCodexSpawn = (bin, args, opts) => {
+      return {
+        status: 0,
+        stdout: 'codex sync output',
+        stderr: '',
+      }
+    }
+    const codexRes = runCodex({
+      model: 'gpt-5.6-sol',
+      prompt: 'test prompt',
+      cwd: process.cwd(),
+      env: { CODEX_BIN: '/mock/bin/codex' },
+      spawn: fakeSyncCodexSpawn,
+    })
+    assert.notEqual(typeof codexRes?.then, 'function', 'runCodex 回傳值不應為 thenable')
+    assert.equal(typeof codexRes.stdout, 'string')
+    assert.equal(codexRes.stdout, 'codex sync output', 'runCodex 的 stdout 應立刻可讀')
+  })
+
+  test('runAgyAsync 回傳值為 Promise 實例（instanceof Promise）', async () => {
+    const fakeAsyncSpawn = async (bin, args, opts) => {
+      return {
+        status: 0,
+        stdout: '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}',
+        stderr: '',
+        timedOut: false,
+      }
+    }
+    const agyPromise = runAgyAsync({
+      model: 'gemini-3.8-flash-high',
+      mode: 'plan',
+      prompt: 'test prompt',
+      cwd: process.cwd(),
+      env: { AGY_BIN: '/mock/bin/antigravity' },
+      spawn: fakeAsyncSpawn,
+    })
+    assert.ok(agyPromise instanceof Promise, 'runAgyAsync 應回傳 Promise 實例')
+    const agyRes = await agyPromise
+    assert.equal(typeof agyRes.stdout, 'string')
+    assert.equal(agyRes.timedOut, false)
+
+    const codexPromise = runCodexAsync({
+      model: 'gpt-5.6-sol',
+      prompt: 'test prompt',
+      cwd: process.cwd(),
+      env: { CODEX_BIN: '/mock/bin/codex' },
+      spawn: fakeAsyncSpawn,
+    })
+    assert.ok(codexPromise instanceof Promise, 'runCodexAsync 應回傳 Promise 實例')
+    const codexRes = await codexPromise
+    assert.equal(codexRes.stdout, '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}')
+    assert.equal(codexRes.timedOut, false)
   })
 })
 

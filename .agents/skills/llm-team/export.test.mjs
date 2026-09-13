@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { EXPORT_FILES, exportTo, verifySnapshot, main as exportMain } from './export.mjs'
+import { main as setupMain } from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -93,6 +94,52 @@ describe('export.mjs 快照導出與驗證測試', () => {
     const v = verifySnapshot(snapshotDir)
     assert.equal(v.ok, false)
     assert.ok(v.extra.includes('x.mjs'), `extra 應包含 x.mjs，實際：${JSON.stringify(v.extra)}`)
+  })
+
+  test('乾淨快照對照 ⇒ extra 空且 --sync-check exit 0', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, true)
+    assert.deepEqual(v.extra, [])
+
+    const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+    assert.equal(code, 0)
+  })
+
+  test('乾淨快照 + x.json ⇒ extra 含 x.json 且 --sync-check exit 1', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    fs.writeFileSync(path.join(snapshotDir, 'x.json'), '{"extra":true}\n')
+
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.extra.includes('x.json'), `extra 應包含 x.json，實際：${JSON.stringify(v.extra)}`)
+
+    const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+    assert.equal(code, 1)
+  })
+
+  test('乾淨快照 + 無副檔名檔 stray ⇒ extra 含 stray 且 --sync-check exit 1', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    fs.writeFileSync(path.join(snapshotDir, 'stray'), 'stray content\n')
+
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.extra.includes('stray'), `extra 應包含 stray，實際：${JSON.stringify(v.extra)}`)
+
+    const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+    assert.equal(code, 1)
   })
 
   test('再 export 不帶 --force ⇒ 回 2；帶 --force ⇒ 覆蓋且 ok', () => {

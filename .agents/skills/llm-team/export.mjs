@@ -153,7 +153,7 @@ export function verifySnapshot(snapshotDir, options = {}) {
     }
   }
 
-  // 檢查快照目錄裡不在 manifest 的 *.mjs / *.sh / *.md 檔
+  // 🔴 事故：2026-09-13 GuildHub-frontend 快照複審 codex 指出 .json／無副檔名檔靜默放行；陽性對照：export.test.mjs「乾淨快照 + x.json ⇒ extra 含 x.json 且 --sync-check exit 1」、「乾淨快照 + 無副檔名檔 stray ⇒ extra 含 stray 且 --sync-check exit 1」；停止條件：快照改成單一 tar／簽章檔那天拆掉。
   function scan(dir) {
     if (!fs.existsSync(dir)) return
     const entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -164,10 +164,8 @@ export function verifySnapshot(snapshotDir, options = {}) {
       } else if (entry.isFile()) {
         const rel = path.relative(snapshotDir, full)
         if (rel === 'MANIFEST.sha256') continue
-        if (rel.endsWith('.mjs') || rel.endsWith('.sh') || rel.endsWith('.md')) {
-          if (!manifestEntries.has(rel) && !extra.includes(rel) && !unlisted.includes(rel)) {
-            extra.push(rel)
-          }
+        if (!manifestEntries.has(rel) && !extra.includes(rel) && !unlisted.includes(rel)) {
+          extra.push(rel)
         }
       }
     }
