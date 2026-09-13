@@ -105,8 +105,9 @@ export function main(argv, deps = {}) {
   try {
     const commonDir = path.resolve(targetDir, gitFn(targetDir, ['rev-parse', '--git-common-dir']))
     repoRoot = path.dirname(commonDir)
+    const worktreeRoot = path.resolve(targetDir, gitFn(targetDir, ['rev-parse', '--show-toplevel']))
     const loadCfg = deps.loadConfig || loadConfig
-    config = loadCfg(repoRoot, a.config)
+    config = loadCfg(worktreeRoot, a.config)
   } catch (e) {
     console.error(`🔴 config 載入失敗：${e.message}`)
     return 2
@@ -146,7 +147,7 @@ export function main(argv, deps = {}) {
       writerModel: models.writer,
       riskDomains: config.riskDomains || [],
     })
-    if (tier === 'block' || a.codex) members.push(['codex', models.codex])
+    if (tier === 'block' || a.codex || config.codexTier === 'all') members.push(['codex', models.codex])
   } else return usage()
 
   if (members.length === 0) {

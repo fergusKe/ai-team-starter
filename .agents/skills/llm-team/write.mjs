@@ -33,6 +33,7 @@ import {
   CLEAN_GIT_ENV,
   isDirectRun,
   BASE_COMMAND_HEADS,
+  WRITER_PROMPT_SENTINEL,
 } from './lib.mjs'
 
 export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads }) {
@@ -41,6 +42,7 @@ export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback,
       ? [`     你只准跑這些指令頭：${allowedHeads.join('、')}。其他任何指令一跑整輪就被殺、你的改動作廢——需要清單外的指令就停下回報。`]
       : []
   const head = [
+    WRITER_PROMPT_SENTINEL,
     `工作目錄（絕對路徑，所有檔案操作只准在這棵樹內）：${worktree}`,
     '🔴 硬規則（違反任一條就停下來回報，不要自己變通）：',
     `  1. 只准建立或修改以下路徑：${allowlist.map((a) => `\`${a}\``).join('、')}。其他檔一律不碰（包括「順手」重構）。`,
@@ -91,8 +93,9 @@ export function main(argv, deps = {}) {
   try {
     const commonDir = path.resolve(worktree, gitFn(worktree, ['rev-parse', '--git-common-dir']))
     repoRoot = path.dirname(commonDir)
+    const worktreeRoot = path.resolve(worktree, gitFn(worktree, ['rev-parse', '--show-toplevel']))
     const loadCfg = deps.loadConfig || loadConfig
-    config = loadCfg(repoRoot, a.config)
+    config = loadCfg(worktreeRoot, a.config)
   } catch (e) {
     console.error(`🔴 config 載入失敗：${e.message}`)
     return 2
@@ -184,6 +187,7 @@ export function main(argv, deps = {}) {
     ...BASE_COMMAND_HEADS,
     ...(config.allowCommandHeads || []),
   ]
+  const timeoutMs = Number(a['timeout-ms'] || 25 * 60 * 1000)
   let toolErrorRetries = 0
   for (let round = 1; round <= maxRounds; round++) {
     const prompt = buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads })
@@ -194,6 +198,7 @@ export function main(argv, deps = {}) {
       prompt,
       cwd: worktree,
       extraArgs,
+      timeoutMs,
     })
 
     // 🔴 agy 無頭第 6 坑（2026-09-13 H1 票，統整者親自坐實）：--continue 續的是「最近一個對話」；
@@ -270,7 +275,9 @@ export function main(argv, deps = {}) {
         prompt: '上一個工具呼叫的參數不合法（見錯誤訊息），整輪被中止了。請換合法參數從那一步繼續，規則不變。',
         cwd: worktree,
         extraArgs: ['--conversation', conversationId],
+        timeoutMs,
       })
+
       const retryConvId = r.conversationId || (r.result && r.result.conversation_id) || null
       if (retryConvId !== null && retryConvId !== conversationId) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')

@@ -26,6 +26,10 @@ import {
   assertSettingsAllowRegex,
   resolveAgyBin,
   runCodex,
+  runAgy,
+  buildAgyArgs,
+  buildSpawnEnv,
+  WRITER_PROMPT_SENTINEL,
   parseArgs,
   isDirectRun,
 } from './lib.mjs'
@@ -179,6 +183,82 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const badRoundsDir = tmpdir('bad-rounds-')
     fs.writeFileSync(path.join(badRoundsDir, 'llm-team.config.json'), JSON.stringify({ schemaVersion: 1, maxRounds: 6 }))
     assert.throws(() => loadConfig(badRoundsDir), /maxRounds 超過硬上限 5/)
+  })
+
+  test('branchPrefixes: "agy/" ⇒ loadConfig throw；["agy/", 1] ⇒ throw；[] ⇒ 過', () => {
+    const dirString = tmpdir('bad-prefix-str-')
+    fs.writeFileSync(
+      path.join(dirString, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: 'agy/' })
+    )
+    assert.throws(
+      () => loadConfig(dirString),
+      (err) => {
+        assert.match(err.message, /branchPrefixes 不支援/)
+        assert.match(err.message, /string/)
+        return true
+      }
+    )
+
+    const dirMixed = tmpdir('bad-prefix-mixed-')
+    fs.writeFileSync(
+      path.join(dirMixed, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/', 1] })
+    )
+    assert.throws(
+      () => loadConfig(dirMixed),
+      (err) => {
+        assert.match(err.message, /branchPrefixes 不支援/)
+        assert.match(err.message, /number/)
+        return true
+      }
+    )
+
+    const dirEmpty = tmpdir('prefix-empty-')
+    fs.writeFileSync(
+      path.join(dirEmpty, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: [] })
+    )
+    const cfg = loadConfig(dirEmpty)
+    assert.deepEqual(cfg.branchPrefixes, [])
+  })
+
+  test('branchPrefixes: [""] ⇒ throw；["agy/", " "] ⇒ throw；["agy/"] ⇒ 過', () => {
+    const dirEmptyStr = tmpdir('bad-prefix-empty-')
+    fs.writeFileSync(
+      path.join(dirEmptyStr, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: [''] })
+    )
+    assert.throws(
+      () => loadConfig(dirEmptyStr),
+      (err) => {
+        assert.match(err.message, /branchPrefixes 不支援/)
+        assert.match(err.message, /空前綴等於不檢查，要停用請用 \[\]/)
+        return true
+      }
+    )
+
+    const dirWhitespace = tmpdir('bad-prefix-ws-')
+    fs.writeFileSync(
+      path.join(dirWhitespace, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/', ' '] })
+    )
+    assert.throws(
+      () => loadConfig(dirWhitespace),
+      (err) => {
+        assert.match(err.message, /branchPrefixes 不支援/)
+        assert.match(err.message, /空前綴等於不檢查，要停用請用 \[\]/)
+        return true
+      }
+    )
+
+    const dirOk = tmpdir('prefix-ok-')
+    fs.writeFileSync(
+      path.join(dirOk, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/'] })
+    )
+    const cfg = loadConfig(dirOk)
+    assert.deepEqual(cfg.branchPrefixes, ['agy/'])
   })
 
   test('合法 config ⇒ 成功解析回傳物件', () => {
@@ -1007,6 +1087,205 @@ describe('isDirectRun：symlink 下判斷直接執行', () => {
     assert.equal(r.status, 0, `子行程失敗（status=${r.status}）：stderr=${r.stderr} stdout=${r.stdout}`)
     const manifestPath = path.join(tmpTarget, '.agents', 'skills', 'llm-team', 'MANIFEST.sha256')
     assert.ok(fs.existsSync(manifestPath), `MANIFEST.sha256 必須存在：${manifestPath}`)
+  })
+})
+
+describe('config 從 worktree 讀（不是主 checkout）', () => {
+  test('tmp 主 repo 的 llm-team.config.json installCommand: ""，worktree 分支改 installCommand ⇒ write.main 跑的是 worktree 那份', () => {
+    const repo = makeRepo({ installCommand: '' })
+    const worktreeDir = path.join(repo.dir, '.claude', 'worktrees', 'wt-cfg')
+    repo.g('worktree', 'add', worktreeDir, '-b', 'feat/wt-cfg', 'feat/x')
+    const wtConfig = {
+      ...TEST_CONFIG,
+      installCommand: 'echo installed > .installed',
+    }
+    fs.writeFileSync(path.join(worktreeDir, 'llm-team.config.json'), JSON.stringify(wtConfig, null, 2))
+    execFileSync('git', ['-C', worktreeDir, 'commit', '-am', 'update config on worktree branch'], { env: CLEAN_GIT_ENV, encoding: 'utf8' })
+
+    let capturedInstallCmd = null
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test')
+    const outDir = path.join(worktreeDir, '.agy-write')
+
+    const deps = {
+      assertSettings: () => true,
+      runInstall: (cmd) => {
+        capturedInstallCmd = cmd
+        return { exit: 0, out: '' }
+      },
+      runAgy: () => ({
+        exit: 0,
+        stdout: '',
+        stderr: '',
+        denied: [],
+        result: { response: 'ok', conversation_id: 'conv-wt-cfg' },
+        steps: [],
+        conversationId: 'conv-wt-cfg',
+      }),
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const code = writeMain(
+      ['--worktree', worktreeDir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.equal(capturedInstallCmd, 'echo installed > .installed', 'write.main 應執行 worktree 內的 installCommand 而非主 checkout 的空字串')
+  })
+})
+
+describe('agy 無頭第 5 坑：--print-timeout 與 timeoutMs 傳遞', () => {
+  test('buildAgyArgs 組出的 argv 含 --print-timeout 25m', () => {
+    const args = buildAgyArgs({
+      model: 'gemini-3.8-flash-high',
+      mode: 'accept-edits',
+      prompt: 'hello',
+      timeoutMs: 25 * 60 * 1000,
+    })
+    const idx = args.indexOf('--print-timeout')
+    assert.ok(idx !== -1, 'args 應含 --print-timeout')
+    assert.equal(args[idx + 1], '25m')
+  })
+
+  test('write.main 每輪 runAgy 傳遞 timeoutMs＝25 分鐘', () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test')
+    const outDir = path.join(repo.dir, '.agy-write')
+
+    let capturedTimeoutMs = null
+    const deps = {
+      assertSettings: () => true,
+      runAgy: (args) => {
+        capturedTimeoutMs = args.timeoutMs
+        return {
+          exit: 0,
+          stdout: '',
+          stderr: '',
+          denied: [],
+          result: { response: 'ok', conversation_id: 'conv-timeout' },
+          steps: [],
+          conversationId: 'conv-timeout',
+        }
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const code = writeMain(
+      ['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.equal(capturedTimeoutMs, 25 * 60 * 1000, 'runAgy 呼叫參數之 timeoutMs 應為 25 分鐘（1500000 ms）')
+  })
+})
+
+describe('codexTier 出席層級測試', () => {
+  test('codexTier: "all" ＋ standard tier ⇒ members 含 codex', () => {
+    const repo = makeRepo({ codexTier: 'all' })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+
+    const membersCalled = []
+    const deps = {
+      runOne: (name, model, prompt, cwd, out) => {
+        membersCalled.push(name)
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+
+    const code = councilMain(
+      ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.ok(membersCalled.includes('codex'), `codexTier: "all" 時 standard tier 應出席 codex，實際成員：${membersCalled.join(', ')}`)
+  })
+
+  test('codexTier: "block" ＋ standard tier ⇒ members 不含 codex', () => {
+    const repo = makeRepo({ codexTier: 'block' })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+
+    const membersCalled = []
+    const deps = {
+      runOne: (name, model, prompt, cwd, out) => {
+        membersCalled.push(name)
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+
+    const code = councilMain(
+      ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
+      deps
+    )
+    assert.equal(code, 0)
+    assert.ok(!membersCalled.includes('codex'), `codexTier: "block" 時 standard tier 不應出席 codex，實際成員：${membersCalled.join(', ')}`)
+  })
+
+  test('codexTier 非法值 ⇒ loadConfig throw', () => {
+    const repo = makeRepo({ codexTier: 'invalid-tier' })
+    assert.throws(
+      () => loadConfig(repo.dir),
+      /config codexTier 不支援.*預期 "block" 或 "all"/
+    )
+  })
+})
+
+describe('git 環境剝除：cleanGitEnv 真實生效', () => {
+  test('runAgy 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', () => {
+    let capturedSpawnEnv = null
+    const fakeSpawn = (bin, args, opts) => {
+      capturedSpawnEnv = opts.env
+      return {
+        status: 0,
+        stdout: '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}',
+        stderr: '',
+      }
+    }
+    runAgy({
+      model: 'gemini-3.8-flash-high',
+      mode: 'plan',
+      prompt: 'test',
+      cwd: process.cwd(),
+      env: { PATH: '/custom/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y' },
+      spawn: fakeSpawn,
+    })
+    assert.ok(capturedSpawnEnv, 'spawn 應被呼叫')
+    assert.equal(capturedSpawnEnv.GIT_DIR, undefined, 'GIT_DIR 應被刪除')
+    assert.equal(capturedSpawnEnv.GIT_WORK_TREE, undefined, 'GIT_WORK_TREE 應被刪除')
+    assert.equal(capturedSpawnEnv.PATH, '/custom/bin', 'PATH 應被保留')
+  })
+
+  test('runCodex 子行程收到的 env 沒有 GIT_DIR 與 GIT_WORK_TREE 但保留其他 key', () => {
+    let capturedSpawnEnv = null
+    const fakeSpawn = (bin, args, opts) => {
+      capturedSpawnEnv = opts.env
+      return { status: 0, stdout: 'ok', stderr: '' }
+    }
+    runCodex({
+      model: 'gpt-5.6-sol',
+      prompt: 'test',
+      cwd: process.cwd(),
+      env: { PATH: '/custom/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y' },
+      spawn: fakeSpawn,
+    })
+    assert.ok(capturedSpawnEnv, 'spawn 應被呼叫')
+    assert.equal(capturedSpawnEnv.GIT_DIR, undefined, 'GIT_DIR 應被刪除')
+    assert.equal(capturedSpawnEnv.GIT_WORK_TREE, undefined, 'GIT_WORK_TREE 應被刪除')
+    assert.equal(capturedSpawnEnv.PATH, '/custom/bin', 'PATH 應被保留')
+  })
+})
+
+describe('WRITER_PROMPT_SENTINEL 寫手提示哨兵', () => {
+  test('buildWriterPrompt 輸出的第一行固定為 WRITER_PROMPT_SENTINEL（round 1 與 round 2）', () => {
+    const p1 = buildWriterPrompt({ brief: 'B', worktree: '/w', allowlist: ['a.ts'], round: 1 })
+    assert.equal(p1.split('\n')[0], WRITER_PROMPT_SENTINEL, 'round 1 第一行必須是哨兵')
+
+    const p2 = buildWriterPrompt({ brief: 'B', worktree: '/w', allowlist: ['a.ts'], round: 2, feedback: 'FAIL' })
+    assert.equal(p2.split('\n')[0], WRITER_PROMPT_SENTINEL, 'round 2 第一行必須是哨兵')
   })
 })
 

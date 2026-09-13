@@ -18,5 +18,14 @@
   "installCommand": "npm ci --no-audit --no-fund",
   "maxRounds": 3,
   "riskDomains": [],
-  "outDir": ".local/llm-team"
+  "outDir": ".local/llm-team",
+  "branchPrefixes": [
+    "spec/",
+    "feat/",
+    "fix/",
+    "chore/",
+    "archive/",
+    "governance/"
+  ],
+  "codexTier": "block"
 }

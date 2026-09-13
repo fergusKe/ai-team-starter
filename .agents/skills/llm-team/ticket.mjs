@@ -21,12 +21,12 @@ import {
   parseArgs,
   CLEAN_GIT_ENV,
   isSafeCommand,
+  assertSettingsAllowRegex,
+  agySettingsPath,
   isDirectRun,
 } from './lib.mjs'
 import { main as writeMain } from './write.mjs'
 import { main as councilMain, parseVerdicts } from './council.mjs'
-
-const VALID_BRANCH_PREFIXES = ['spec/', 'feat/', 'fix/', 'chore/', 'archive/', 'governance/']
 
 function runTest(cmd, cwd) {
   const env = { ...CLEAN_GIT_ENV }
@@ -150,9 +150,10 @@ export function main(argv, deps = {}) {
       return 2
     }
 
-    if (!VALID_BRANCH_PREFIXES.some((p) => a.branch.startsWith(p))) {
+    const branchPrefixes = config.branchPrefixes
+    if (branchPrefixes.length > 0 && !branchPrefixes.some((p) => a.branch.startsWith(p))) {
       console.error(
-        `🔴 分支名 '${a.branch}' 不合法，必須以前綴之一開頭：${VALID_BRANCH_PREFIXES.join(' ')}`
+        `🔴 分支名 '${a.branch}' 不合法，必須以前綴之一開頭：${branchPrefixes.join(' ')}`
       )
       return 2
     }
@@ -168,51 +169,16 @@ export function main(argv, deps = {}) {
       return 2
     }
 
-    const startedAt = new Date().toISOString()
-    const base = a.base || 'main'
-    let tier = a.tier || 'standard'
-    const worktreeRoot = config.worktreeRoot || '.claude/worktrees'
-    const worktree = path.resolve(repoRoot, worktreeRoot, a.name)
-    const outBaseDir = config.outDir || '.local/llm-team'
-    const outDir = path.resolve(repoRoot, outBaseDir, a.name)
-    const writeOutDir = path.join(outDir, 'write')
-    const reviewOutDir = path.join(outDir, 'review')
-
-    // a. worktree 管理
-    if (fs.existsSync(worktree)) {
-      let curBranch
-      try {
-        curBranch = gitFn(worktree, ['rev-parse', '--abbrev-ref', 'HEAD'])
-      } catch (e) {
-        console.error(`🔴 檢查 worktree 分支失敗：${e.message}`)
-        return 2
-      }
-      if (curBranch !== a.branch) {
-        console.error(`🔴 worktree 已存在但分支不一致：現為 ${curBranch}，預期 ${a.branch}`)
-        return 2
-      }
-      const dirty = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
-      if (dirty.length > 0) {
-        console.error(`🔴 worktree 已存在但不乾淨，先處理：\n  ${dirty.join('\n  ')}`)
-        return 2
-      }
-    } else {
-      fs.mkdirSync(path.dirname(worktree), { recursive: true })
-      try {
-        gitFn(repoRoot, ['worktree', 'add', worktree, '-b', a.branch, base])
-      } catch (e) {
-        console.error(`🔴 git worktree add 失敗：${e.message}`)
-        return 2
-      }
+    const briefPath = path.resolve(a.brief)
+    if (!fs.existsSync(briefPath)) {
+      console.error(`🔴 brief 檔案不存在：${briefPath}`)
+      return 2
     }
-
-    // 保存 brief 全文備份供 publish 與 PR body 使用
-    fs.mkdirSync(outDir, { recursive: true })
-    const briefContent = fs.readFileSync(path.resolve(a.brief), 'utf8')
-    fs.writeFileSync(path.join(outDir, 'brief.md'), briefContent)
-    appendLifecycle(outDir, { event: 'run-start', ticket: a.name }, env)
+    const briefContent = fs.readFileSync(briefPath, 'utf8')
 
     // riskDomains 升級複審（tier => block，不直接判罪）
+    const base = a.base || 'main'
+    let tier = a.tier || 'standard'
     const riskDomains = Array.from(
       new Set((Array.isArray(config.riskDomains) ? config.riskDomains : []).filter(Boolean))
     )
@@ -235,13 +201,66 @@ export function main(argv, deps = {}) {
       tierEscalatedBy = matchedRiskDomains
     }
 
+    // G2 settings 對帳（搬到 worktree add 之前，避免漂移造成 worktree 殘留）
+    // 🔴 2026-09-13 H6 複審坐實：曾寫成「注入 writeMain ⇒ 跳過 G2」，把測試捷徑當契約；G2 只能由 deps.assertSettings 覆寫。陽性對照 ticket.test.mjs「T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（assertSettings 拋錯 ⇒ run 回 2 且未建 worktree）」
+    const checkSettings = deps.assertSettings || assertSettingsAllowRegex
+    try {
+      checkSettings(agySettingsPath(env), repoRoot, config)
+    } catch (e) {
+      console.error(`🔴 G2：${e.message}`)
+      return 2
+    }
+
+    const startedAt = new Date().toISOString()
+    const worktreeRoot = config.worktreeRoot || '.claude/worktrees'
+    const worktree = path.resolve(repoRoot, worktreeRoot, a.name)
+    const outBaseDir = config.outDir || '.local/llm-team'
+    const outDir = path.resolve(repoRoot, outBaseDir, a.name)
+    const writeOutDir = path.join(outDir, 'write')
+    const reviewOutDir = path.join(outDir, 'review')
+
+    // a. worktree 管理
+    let createdWorktree = false
+    if (fs.existsSync(worktree)) {
+      let curBranch
+      try {
+        curBranch = gitFn(worktree, ['rev-parse', '--abbrev-ref', 'HEAD'])
+      } catch (e) {
+        console.error(`🔴 檢查 worktree 分支失敗：${e.message}`)
+        return 2
+      }
+      if (curBranch !== a.branch) {
+        console.error(`🔴 worktree 已存在但分支不一致：現為 ${curBranch}，預期 ${a.branch}`)
+        return 2
+      }
+      const dirty = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
+      if (dirty.length > 0) {
+        console.error(`🔴 worktree 已存在但不乾淨，先處理：\n  ${dirty.join('\n  ')}`)
+        return 2
+      }
+    } else {
+      fs.mkdirSync(path.dirname(worktree), { recursive: true })
+      try {
+        gitFn(repoRoot, ['worktree', 'add', worktree, '-b', a.branch, base])
+        createdWorktree = true
+      } catch (e) {
+        console.error(`🔴 git worktree add 失敗：${e.message}`)
+        return 2
+      }
+    }
+
+    // 保存 brief 全文備份供 publish 與 PR body 使用
+    fs.mkdirSync(outDir, { recursive: true })
+    fs.writeFileSync(path.join(outDir, 'brief.md'), briefContent)
+    appendLifecycle(outDir, { event: 'run-start', ticket: a.name }, env)
+
     // b. 呼叫 write.main
     const writeMainFn = deps.writeMain || writeMain
     const writeArgs = [
       '--worktree',
       worktree,
       '--brief',
-      path.resolve(a.brief),
+      briefPath,
       ...a.allow.flatMap((al) => ['--allow', al]),
       '--out',
       writeOutDir,
@@ -254,8 +273,18 @@ export function main(argv, deps = {}) {
     const writeExit = writeMainFn(writeArgs, deps)
     appendLifecycle(outDir, { event: 'writer-done', ticket: a.name, writeExit }, env)
 
-    // c. write 回 2 ⇒ 直接 exit 2 不複審
+    // c. write 回 2 ⇒ 若為本次新建且寫手未改動檔，清理殘骸；直接 exit 2 不複審
     if (writeExit === 2) {
+      const changed = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
+      if (createdWorktree && changed.length === 0) {
+        try {
+          gitFn(repoRoot, ['worktree', 'remove', worktree])
+          gitFn(repoRoot, ['branch', '-d', a.branch])
+          console.error(`🧹 已清掉本次建立的 worktree 與分支 ${a.name}`)
+        } catch (e) {
+          console.error(`⚠️ 清理 worktree 與分支失敗：${e.message}`)
+        }
+      }
       console.error('🔴 write 失敗（exit 2），直接退出不複審。')
       return 2
     }
@@ -297,7 +326,8 @@ export function main(argv, deps = {}) {
       name: defaultNames[i] || `reviewer-${i + 1}`,
       model: m,
     }))
-    if (tier === 'block') {
+    // codexTier=all 時 codex 出席 standard 票（council.mjs），summary 必須收它——否則它的不簽 publish 看不見。陽性對照「T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下」
+    if (tier === 'block' || config.codexTier === 'all') {
       expectedReviewers.push({ name: 'codex', model: models.codex })
     }
 
@@ -459,7 +489,7 @@ export function main(argv, deps = {}) {
       return 2
     }
 
-    // 🔴 2026-09-13 事故：複審成員不簽卻因 disposition 遺漏或比對漏洞被直接放行開 PR；陽性對照 ticket.test.mjs「T24 publish：一位 overall:'不簽' 且無 dispositions ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或引入去中心化裁決合約時重審
+    // 🔴 2026-09-13 事故：複審成員不簽卻因 disposition 遺漏或比對漏洞被直接放行開 PR；陽性對照 ticket.test.mjs「T33 publish：整份不簽無逐題時給 q:Q3 仍回 2，給 q:overall 且 accept 寫入後 publish 通過」；停止條件：summary schema 改版或引入去中心化裁決合約時重審
     const dispositions = Array.isArray(summary.dispositions) ? summary.dispositions : []
     for (const m of reviewMembersList) {
       if (m.overall !== '簽') {

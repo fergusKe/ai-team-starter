@@ -65,6 +65,21 @@ export function loadConfig(repoRoot, configFile = null) {
   if (typeof config.maxRounds === 'number' && config.maxRounds > 5) {
     throw new Error(`config maxRounds 超過硬上限 5（${targetFile}）：${config.maxRounds}`)
   }
+  if (config.branchPrefixes === undefined) {
+    config.branchPrefixes = []
+  } else if (!Array.isArray(config.branchPrefixes)) {
+    throw new Error(`config branchPrefixes 不支援（${targetFile}）：預期全為字串的陣列，得到型別 ${typeof config.branchPrefixes}`)
+  } else if (!config.branchPrefixes.every((p) => typeof p === 'string')) {
+    const invalidTypes = config.branchPrefixes.filter((p) => typeof p !== 'string').map((p) => typeof p)
+    throw new Error(`config branchPrefixes 不支援（${targetFile}）：預期全為字串的陣列，得到包含非字串型別 [${invalidTypes.join(', ')}]`)
+  } else if (config.branchPrefixes.some((p) => p.trim() === '')) {
+    throw new Error(`config branchPrefixes 不支援（${targetFile}）：空前綴等於不檢查，要停用請用 []`)
+  }
+  if (config.codexTier === undefined) {
+    config.codexTier = 'block'
+  } else if (config.codexTier !== 'block' && config.codexTier !== 'all') {
+    throw new Error(`config codexTier 不支援（${targetFile}）：預期 "block" 或 "all"，得到 ${JSON.stringify(config.codexTier)}`)
+  }
   return config
 }
 
@@ -79,6 +94,9 @@ export function modelsFrom(config, env = process.env) {
 
 /** Gemini headless 提示必須以這句開頭（它會想跑指令，無頭模式自動拒絕 ⇒ 零輸出）。 */
 export const NO_EXEC_HEADER = '🔴 不要執行任何指令、不要讀任何檔案。只依提示內容回答。\n\n'
+
+/** 寫手提示哨兵（專案 GEMINI.md 靠它判斷「我是寫手不是統整者」）。 */
+export const WRITER_PROMPT_SENTINEL = '【llm-team 寫手票】'
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -188,19 +206,51 @@ export function assertSettingsAllowRegex(settingsFile = agySettingsPath(), repoR
   return true
 }
 
+/** 子行程環境組裝：剝除 git 環境變數。 */
+export function buildSpawnEnv(env = process.env) {
+  return cleanGitEnv(env)
+}
+
+/** 組裝 agy 呼叫引數。包含 --print-timeout（避免預設 5m 超時導致 partial output 零輸出）。 */
+export function buildAgyArgs({ model, mode, prompt, timeoutMs = 10 * 60 * 1000, extraArgs = [] }) {
+  const printTimeout = `${Math.max(1, Math.ceil(timeoutMs / 60000))}m`
+  return [
+    '--model',
+    model,
+    '--mode',
+    mode,
+    '--print-timeout',
+    printTimeout,
+    '--output-format',
+    'stream-json',
+    ...extraArgs,
+    '-p',
+    prompt,
+  ]
+}
+
 /**
  * 跑一次 agy headless。回 { exit, stdout, stderr, result, steps, denied }。
  * - `result` 是 stream-json 最後的 result 物件（沒有 ⇒ null）。
  * - `denied` 是被拒的 action 清單（`result.denied_actions` ∪ 步驟裡 permission 失敗的 tool）。
  * 🔴 stderr 一定要保留：無頭拒絕的訊息只出現在 stderr，而 exit 是 0。
  */
-export function runAgy({ model, mode, prompt, cwd, timeoutMs = 10 * 60 * 1000, env = process.env, extraArgs = [] }) {
+export function runAgy({
+  model,
+  mode,
+  prompt,
+  cwd,
+  timeoutMs = 10 * 60 * 1000,
+  env = process.env,
+  extraArgs = [],
+  spawn = spawnSync,
+}) {
   const bin = resolveAgyBin(env)
   if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
-  const args = ['--model', model, '--mode', mode, '--output-format', 'stream-json', ...extraArgs, '-p', prompt]
-  const r = spawnSync(bin, args, {
+  const args = buildAgyArgs({ model, mode, prompt, timeoutMs, extraArgs })
+  const r = spawn(bin, args, {
     cwd,
-    env: { ...CLEAN_GIT_ENV, ...env },
+    env: cleanGitEnv(env),
     encoding: 'utf8',
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
@@ -258,13 +308,21 @@ export function parseStreamJson(text) {
  * 跑一次 codex exec（唯讀 sandbox；它讀得到檔，所以提示【不要】加 NO_EXEC_HEADER）。
  * 🔴 stdin 一律接 /dev/null（`< /dev/null`）——否則會掛著等輸入。
  */
-export function runCodex({ model, prompt, cwd, effort = 'high', timeoutMs = 15 * 60 * 1000, env = process.env }) {
+export function runCodex({
+  model,
+  prompt,
+  cwd,
+  effort = 'high',
+  timeoutMs = 15 * 60 * 1000,
+  env = process.env,
+  spawn = spawnSync,
+}) {
   if (!model) throw new Error('runCodex 需要 model（來自 config.models.codex）')
   const bin = resolveCodexBin(env)
   const args = ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
-  const r = spawnSync(bin, args, {
+  const r = spawn(bin, args, {
     cwd,
-    env: { ...CLEAN_GIT_ENV, ...env },
+    env: cleanGitEnv(env),
     encoding: 'utf8',
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
@@ -272,6 +330,7 @@ export function runCodex({ model, prompt, cwd, effort = 'high', timeoutMs = 15 *
   })
   return { exit: r.status, signal: r.signal, stdout: r.stdout || '', stderr: r.stderr || '' }
 }
+
 
 /** worktree 的 git 呼叫（剝掉 hook 環境變數，`-C` 才真的作用在那棵樹）。 */
 export function git(cwd, args) {

@@ -62,6 +62,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: (args) => {
         fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello world\n')
         return 0
@@ -128,6 +129,7 @@ describe('ticket.mjs 票流程測試', () => {
     let councilCalled = false
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => 2,
       councilMain: () => {
         councilCalled = true
@@ -175,6 +177,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'b.txt'), 'content')
         return 0
@@ -228,6 +231,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'c.txt'), 'content')
         return 0
@@ -508,6 +512,7 @@ describe('ticket.mjs 票流程測試', () => {
     let writeCalled = false
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         writeCalled = true
         return 0
@@ -564,6 +569,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'ok')
         return 0
@@ -625,6 +631,7 @@ describe('ticket.mjs 票流程測試', () => {
     let receivedCouncilArgs1 = null
     const deps1 = {
       repoRoot: repo1.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath1, 'pay.txt'), 'pay')
         return 0
@@ -688,6 +695,7 @@ describe('ticket.mjs 票流程測試', () => {
     let receivedCouncilArgs2 = null
     const deps2 = {
       repoRoot: repo2.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath2, 'pay.txt'), 'pay')
         return 0
@@ -747,6 +755,7 @@ describe('ticket.mjs 票流程測試', () => {
     let writeCalled = false
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         writeCalled = true
         return 0
@@ -792,6 +801,7 @@ describe('ticket.mjs 票流程測試', () => {
     let writeCalled = false
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         writeCalled = true
         return 0
@@ -834,6 +844,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => 3,
       changedFiles: () => [],
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -882,6 +893,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'changed')
         return 0
@@ -936,6 +948,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
         return 0
@@ -1287,6 +1300,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       env: { LLM_TEAM_HARNESS: 'agy' },
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
@@ -1403,6 +1417,7 @@ describe('ticket.mjs 票流程測試', () => {
     let councilCalled = false
     const deps = {
       repoRoot: repo.dir,
+      assertSettings: () => true,
       writeMain: () => 3,
       councilMain: () => {
         councilCalled = true
@@ -1704,6 +1719,464 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(code2, 0, `處置 overall 後 publish 應回 0，實際為 ${code2}`)
     assert.equal(ghCalled, true, 'gh 應被呼叫')
   })
+
+  test('T34 分支前綴由 config branchPrefixes 決定：["agy/"] 擋 feat/ 過 agy/；[] 全放行', () => {
+    // 1. config branchPrefixes: ['agy/']
+    const repo1 = makeRepo({ branchPrefixes: ['agy/'] })
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, 'test brief')
+
+    const deps1 = {
+      repoRoot: repo1.dir,
+      assertSettings: () => true,
+      writeMain: () => 0,
+      councilMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const errs1 = []
+    const origErr = console.error
+    console.error = (m) => errs1.push(String(m))
+    let codeFail
+    let codePass
+    try {
+      // feat/x 應該被擋
+      codeFail = ticketMain(
+        ['run', '--name', 't34-1', '--brief', briefFile, '--branch', 'feat/x', '--allow', 'a.txt', '--test', 'true'],
+        deps1
+      )
+      // agy/x 應該放行
+      codePass = ticketMain(
+        ['run', '--name', 't34-2', '--brief', briefFile, '--branch', 'agy/x', '--allow', 'a.txt', '--test', 'true'],
+        deps1
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(codeFail, 2, 'feat/x 不在 agy/ 前綴清單內應回 2')
+    assert.match(errs1.join('\n'), /🔴 分支名 'feat\/x' 不合法，必須以前綴之一開頭：agy\//)
+    assert.equal(codePass, 0, 'agy/x 在前綴清單內應通過')
+
+    // 2. config branchPrefixes: [] 空陣列＝不檢查
+    const repo2 = makeRepo({ branchPrefixes: [] })
+    const deps2 = {
+      repoRoot: repo2.dir,
+      assertSettings: () => true,
+      writeMain: () => 0,
+      councilMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const codeAny = ticketMain(
+      ['run', '--name', 't34-3', '--brief', briefFile, '--branch', 'custom-branch-without-prefix', '--allow', 'a.txt', '--test', 'true'],
+      deps2
+    )
+    assert.equal(codeAny, 0, 'branchPrefixes 為空陣列時任何名字都應通過')
+  })
+
+  test('T35 早期失敗清理：deps 注入 install 回非零 ⇒ run 回 2 且 worktree 與 branch 被清掉；write 之後失敗 ⇒ worktree 仍在；write 回 2 但已改檔 ⇒ 絕不清理', () => {
+    // 1. deps 注入 runInstall 回非零 ⇒ run 回 2 且 worktree 目錄不存在、branch 不存在
+    const repo1 = makeRepo({ installCommand: 'echo fail' })
+    const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile1, 'test brief')
+    const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't35-early-fail')
+
+    const errs1 = []
+    const origErr = console.error
+    console.error = (m) => errs1.push(String(m))
+    let codeFail
+    try {
+      codeFail = ticketMain(
+        [
+          'run',
+          '--name',
+          't35-early-fail',
+          '--brief',
+          briefFile1,
+          '--branch',
+          'feat/t35-early-fail',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        {
+          repoRoot: repo1.dir,
+          assertSettings: () => true,
+          runInstall: () => ({ exit: 1, out: 'install error' }),
+        }
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(codeFail, 2, 'installCommand 失敗時 ticket run 應回 2')
+    assert.equal(fs.existsSync(worktreePath1), false, '早期失敗時本次新建的 worktree 目錄應被清掉')
+    const branches1 = repo1.g('branch', '--list', 'feat/t35-early-fail')
+    assert.equal(branches1.trim(), '', '早期失敗時本次新建的分支應被刪除')
+    assert.match(errs1.join('\n'), /🧹 已清掉本次建立的 worktree 與分支 t35-early-fail/)
+
+    // 2. write 之後失敗（例如 writeMain 回 3） ⇒ worktree 仍在
+    const repo2 = makeRepo()
+    const briefFile2 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile2, 'test brief')
+    const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't35-after-write')
+
+    const deps2 = {
+      repoRoot: repo2.dir,
+      assertSettings: () => true,
+      writeMain: () => 3,
+      councilMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const codeWriteFail = ticketMain(
+      [
+        'run',
+        '--name',
+        't35-after-write',
+        '--brief',
+        briefFile2,
+        '--branch',
+        'feat/t35-after-write',
+        '--allow',
+        'a.txt',
+        '--test',
+        'true',
+      ],
+      deps2
+    )
+    assert.equal(codeWriteFail, 3, 'write 失敗時回 3')
+    assert.equal(fs.existsSync(worktreePath2), true, 'write 之後失敗時 worktree 應保留')
+    const branches2 = repo2.g('branch', '--list', 'feat/t35-after-write')
+    assert.match(branches2, /feat\/t35-after-write/, 'write 之後失敗時分支應保留')
+
+    // 3. write 回 2 但已改檔（changedFiles 非空）⇒ 絕不清理，worktree 與分支仍在，stderr 無 🧹
+    const repo3 = makeRepo()
+    const briefFile3 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile3, 'test brief')
+    const worktreePath3 = path.join(repo3.dir, '.claude', 'worktrees', 't35-write2-changed')
+
+    const deps3 = {
+      repoRoot: repo3.dir,
+      assertSettings: () => true,
+      writeMain: () => 2,
+      changedFiles: () => ['x.txt'],
+    }
+
+    const errs3 = []
+    const origErr3 = console.error
+    console.error = (m) => errs3.push(String(m))
+    let codeWrite2Changed
+    try {
+      codeWrite2Changed = ticketMain(
+        [
+          'run',
+          '--name',
+          't35-write2-changed',
+          '--brief',
+          briefFile3,
+          '--branch',
+          'feat/t35-write2-changed',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps3
+      )
+    } finally {
+      console.error = origErr3
+    }
+
+    assert.equal(codeWrite2Changed, 2, 'write 回 2 時 run 應回 2')
+    assert.equal(fs.existsSync(worktreePath3), true, 'write 回 2 但已改檔時 worktree 應保留')
+    const branches3 = repo3.g('branch', '--list', 'feat/t35-write2-changed')
+    assert.match(branches3, /feat\/t35-write2-changed/, 'write 回 2 但已改檔時分支應保留')
+    const errText3 = errs3.join('\n')
+    assert.doesNotMatch(errText3, /🧹/, 'write 回 2 但已改檔時絕不應印出 🧹 清理訊息')
+  })
+
+  test('T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下', () => {
+    // 1. 實驗組：codexTier: "all" + tier standard
+    const repo1 = makeRepo({ codexTier: 'all' })
+    const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile1, '# T36 all\n內容')
+    const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't36-all')
+    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't36-all', 'review')
+
+    const deps1 = {
+      repoRoot: repo1.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath1, 'file.txt'), 'ok')
+        return 0
+      },
+      councilMain: () => {
+        fs.mkdirSync(reviewOutDir1, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir1, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir1, 'gemini.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir1, 'codex.txt'), '整份：不簽\n')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    const outs1 = []
+    const origLog = console.log
+    console.log = (m) => outs1.push(String(m))
+    let runCode1
+    try {
+      runCode1 = ticketMain(
+        [
+          'run',
+          '--name',
+          't36-all',
+          '--brief',
+          briefFile1,
+          '--branch',
+          'feat/t36-all',
+          '--allow',
+          'file.txt',
+          '--test',
+          'true',
+          '--tier',
+          'standard',
+        ],
+        deps1
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(runCode1, 0, `run 應回 0，實際得到 ${runCode1}`)
+    const summaryFile1 = path.join(repo1.dir, '.local', 'llm-team', 't36-all', 'summary.json')
+    const summary1 = JSON.parse(fs.readFileSync(summaryFile1, 'utf8'))
+    const codexMember = summary1.review.members.find((m) => m.name === 'codex')
+    assert.ok(codexMember, 'summary.review.members 應包含 codex')
+    assert.equal(codexMember.overall, '不簽', 'codex overall 應為 不簽')
+
+    // 接著 publish 回 2 且 gh 假函式沒被呼叫
+    let ghCalled = false
+    const publishDeps = {
+      repoRoot: repo1.dir,
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          if (args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+          if (args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/123' }
+        }
+        return { status: 0, stdout: '' }
+      },
+      git: () => '',
+    }
+
+    const errsPub = []
+    const origErr = console.error
+    console.error = (m) => errsPub.push(String(m))
+    let pubCode
+    try {
+      pubCode = ticketMain(['publish', '--name', 't36-all'], publishDeps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(pubCode, 2, `codex 不簽未處置時 publish 應回 2，實際為 ${pubCode}`)
+    assert.equal(ghCalled, false, 'gh 不應被呼叫')
+    assert.match(errsPub.join('\n'), /codex 整份不簽且未處置/)
+
+    // 2. 對照組：codexTier: "block" ＋ standard ⇒ members 不含 codex（既有行為）
+    const repo2 = makeRepo({ codexTier: 'block' })
+    const briefFile2 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile2, '# T36 block\n內容')
+    const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't36-block')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't36-block', 'review')
+
+    const deps2 = {
+      repoRoot: repo2.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath2, 'file.txt'), 'ok')
+        return 0
+      },
+      councilMain: () => {
+        fs.mkdirSync(reviewOutDir2, { recursive: true })
+        fs.writeFileSync(path.join(reviewOutDir2, 'opus.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir2, 'gemini.txt'), '整份：簽\n')
+        fs.writeFileSync(path.join(reviewOutDir2, 'codex.txt'), '整份：不簽\n')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+
+    let runCode2
+    try {
+      runCode2 = ticketMain(
+        [
+          'run',
+          '--name',
+          't36-block',
+          '--brief',
+          briefFile2,
+          '--branch',
+          'feat/t36-block',
+          '--allow',
+          'file.txt',
+          '--test',
+          'true',
+          '--tier',
+          'standard',
+        ],
+        deps2
+      )
+    } finally {
+      // noop
+    }
+    assert.equal(runCode2, 0)
+    const summaryFile2 = path.join(repo2.dir, '.local', 'llm-team', 't36-block', 'summary.json')
+    const summary2 = JSON.parse(fs.readFileSync(summaryFile2, 'utf8'))
+    const hasCodex = summary2.review.members.some((m) => m.name === 'codex')
+    assert.equal(hasCodex, false, 'codexTier: block ＋ standard 時 members 不應含 codex')
+  })
+
+  test('T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（settings 缺 regex ⇒ run 回 2、未建 worktree 且 writeMain 沒被呼叫）', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T37\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't37')
+    const rootSlash = repo.dir.endsWith('/') ? repo.dir : repo.dir + '/'
+
+    const tmpSettingsDir = tmpdir('t37-settings-')
+    const badSettingsFile = path.join(tmpSettingsDir, 'bad-settings.json')
+    fs.writeFileSync(
+      badSettingsFile,
+      JSON.stringify(
+        {
+          permissions: {
+            allow: ['read_file(' + rootSlash + ')'],
+          },
+          trustedWorkspaces: [repo.dir],
+        },
+        null,
+        2
+      )
+    )
+
+    let writeCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      env: {
+        ...process.env,
+        AGY_SETTINGS: badSettingsFile,
+      },
+      writeMain: () => {
+        writeCalled = true
+        return 0
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't37',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t37--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `allow 缺 regex 時 run 應回 2，實際為 ${code}`)
+    assert.equal(writeCalled, false, 'G2 失敗時 writeMain 不應被呼叫')
+    assert.match(errs.join('\n'), /🔴 G2：/, 'stderr 應包含 G2 訊息')
+    assert.match(errs.join('\n'), /permissions\.allow 缺這條/, 'stderr 應包含 permissions.allow 缺這條')
+    assert.equal(fs.existsSync(worktreePath), false, 'G2 失敗時 worktree 不應被建立')
+    const branches = repo.g('branch', '--list', 'feat/t37--slice')
+    assert.equal(branches.trim(), '', 'G2 失敗時分支不應被建立')
+  })
+
+  test('T37b G2 對帳：deps 注入 writeMain 且 settings 含正確 regex ⇒ 過 G2 且 writeMain 被呼叫', () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# T37b\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't37b')
+    const rootSlash = repo.dir.endsWith('/') ? repo.dir : repo.dir + '/'
+    const regex = buildSafeCommandRegex(TEST_CONFIG)
+    const goodAllow = `command(regex:${regex})`
+
+    const tmpSettingsDir = tmpdir('t37b-settings-')
+    const goodSettingsFile = path.join(tmpSettingsDir, 'good-settings.json')
+    fs.writeFileSync(
+      goodSettingsFile,
+      JSON.stringify(
+        {
+          permissions: {
+            allow: [goodAllow, 'read_file(' + rootSlash + ')'],
+          },
+          trustedWorkspaces: [repo.dir],
+        },
+        null,
+        2
+      )
+    )
+
+    let writeCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      env: {
+        ...process.env,
+        AGY_SETTINGS: goodSettingsFile,
+      },
+      writeMain: () => {
+        writeCalled = true
+        return 0
+      },
+    }
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = ticketMain(
+        [
+          'run',
+          '--name',
+          't37b',
+          '--brief',
+          briefFile,
+          '--branch',
+          'feat/t37b--slice',
+          '--allow',
+          'a.txt',
+          '--test',
+          'true',
+        ],
+        deps
+      )
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 0, `G2 通過且 write 回 0 時 run 應回 0，實際為 ${code}`)
+    assert.equal(writeCalled, true, 'G2 通過時 writeMain 應被呼叫')
+    assert.equal(fs.existsSync(worktreePath), true, 'G2 通過時 worktree 應被建立')
+    const branches = repo.g('branch', '--list', 'feat/t37b--slice')
+    assert.match(branches, /feat\/t37b--slice/, 'G2 通過時分支應被建立')
+  })
 })
 
 describe('setup.mjs 設定對帳測試', () => {
@@ -1948,4 +2421,5 @@ describe('setup.mjs 設定對帳測試', () => {
     assert.match(errs.join('\n'), /🔴 快照不存在或缺少 MANIFEST\.sha256/)
   })
 })
+
 
