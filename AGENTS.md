@@ -27,8 +27,8 @@ Repository 內其他文件與本檔衝突時，以本檔為準。
 
 ```bash
 git branch --show-current                  # 你在哪個 change 上
-npx openspec list                          # 有哪些 change
-npx openspec status --change <name>        # 已經在某個 change 上才跑；<name> 是上一行列出的其中一個
+pnpm exec openspec list                          # 有哪些 change
+pnpm exec openspec status --change <name>        # 已經在某個 change 上才跑；<name> 是上一行列出的其中一個
 bash .github/scripts/progress.sh           # 做到哪裡；剛複製的話還會列出待辦
 ```
 

@@ -58,7 +58,7 @@ approve 的簽章永遠是真的。`AGENTS.md` 的注意力預算那一節是為
 # 1. 複製本目錄內容到你的專案（不要複製 .git），然後 git init
 
 # 2. 裝相依（openspec 已經在 package.json 裡釘死 1.11.0）
-npm ci
+pnpm install --frozen-lockfile
 
 # 3. 問它「我還缺什麼」
 bash .github/scripts/progress.sh
@@ -70,7 +70,7 @@ bash .github/scripts/progress.sh
 
 多模型分工：先 `node .agents/skills/llm-team/setup.mjs --check`，流程見 `prompts/07-ticket.md`。
 
-日常操作一律 `npx openspec ...`，**不需要設定任何環境變數**。
+日常操作一律 `pnpm exec openspec ...`，**不需要設定任何環境變數**。
 
 **複製之後把這份 README 換掉。** 它描述的是模板，不是你的專案 ——
 留著的話，第一個進來的人會以為這個 repo 是個 starter。
@@ -81,7 +81,7 @@ bash .github/scripts/progress.sh
 6 個 `/opsx:*` 指令。那些 skill 的 frontmatter 是 `generatedBy: "1.11.0"`，
 跟 `package.json` 釘的版本是**一組的**，所以一起放進模板。
 
-模板也附了 `package.json` 與 `package-lock.json`，裡面四個 script
+模板也附了 `package.json` 與 `pnpm-lock.yaml`，裡面四個 script
 （`lint` / `typecheck` / `test` / `build`）是**刻意會失敗的佔位** ——
 新專案的 CI 一開始就是紅的，設好或刪掉對應的 CI 步驟才會綠。
 
@@ -91,8 +91,8 @@ bash .github/scripts/progress.sh
 
 ## `openspec` 這個指令怎麼呼叫
 
-**日常用 `npx openspec ...`。** 它解析到 `node_modules/.bin`，也就是
-`package-lock.json` 鎖住的那一份，不用設定任何東西。
+**日常用 `pnpm exec openspec ...`。** 它解析到 `node_modules/.bin`，也就是
+`pnpm-lock.yaml` 鎖住的那一份，不用設定任何東西。
 
 只有一個例外：`/opsx:*` 那些 skill 呼叫的是**裸的 `openspec`**
 （`allowed-tools: Bash(openspec:*)`）。那些是 OpenSpec 自己產生的檔案，
@@ -110,10 +110,10 @@ skill 會安靜地用錯的版本。沒裝全域的話，PATH 沒設好會直接
 
 ## 更新 OpenSpec CLI
 
-**版本由 `package-lock.json` 鎖住。** CI 跑 `npx openspec`（不帶套件名），
+**版本由 `pnpm-lock.yaml` 鎖住。** CI 跑 `pnpm exec openspec`（不帶套件名），
 解析到的就是 lockfile 裡那一份 —— 所以 CI 跟每個人本機跑的是同一個版本。
 
-> ⚠️ **CI 不要寫 `npx @fission-ai/openspec@x.y.z`。**
+> ⚠️ **CI 不要寫 `pnpm dlx @fission-ai/openspec@x.y.z`。**
 > 帶套件名會去抓網路上的版本，繞過 lockfile，等於沒鎖。
 
 還有一個地方會不一致：**skill 呼叫的是裸的 `openspec`**，
@@ -131,16 +131,16 @@ $ command -v openspec
 
 ```bash
 # 1. 升級 devDependency（lockfile 跟著變，這就是要 review 的東西）
-npm install -D --save-exact @fission-ai/openspec@<新版本>
+pnpm add -D --save-exact @fission-ai/openspec@<新版本>
 
 # 2. 更新 .claude/ 底下由 CLI 產生的 skill 與指令
 #    它們的 frontmatter 有 generatedBy，跟 CLI 版本綁定
-npx openspec update
+pnpm exec openspec update
 
 # 3. 確認既有規格還是驗得過（這一步是重點）
-npx openspec validate --all --strict
+pnpm exec openspec validate --all --strict
 
-# 4. package.json / package-lock.json / .claude/ 一起進同一個 PR
+# 4. package.json / pnpm-lock.yaml / .claude/ 一起進同一個 PR
 ```
 
 第 3 步失敗的話**先不要合併** —— 那表示既有規格要跟著改，

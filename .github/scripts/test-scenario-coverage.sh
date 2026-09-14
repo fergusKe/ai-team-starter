@@ -8,7 +8,7 @@
 #   1. **有缺口的時候它要說得出是哪幾條**（報錯的尺跟沒有尺一樣糟）。
 #   2. **量不到的時候它要回 2，不可以裝作沒有缺口**（`0` 只能代表「量到了」）。
 #
-# `npx` 用只吐固定 JSON 的替身 —— 不跑真的測試（那要幾十秒，而且會讓這支
+# `pnpm` 用只吐固定 JSON 的替身（攔 `pnpm exec openspec`／`pnpm exec vitest`；2026-09-14 改 pnpm 前是 npx） —— 不跑真的測試（那要幾十秒，而且會讓這支
 # 測試的結果取決於別的東西）。替身只攔 `vitest` 與 `openspec`，其他照舊。
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -42,13 +42,15 @@ setup() {
 - **WHEN** a
 - **THEN** b
 SPEC
-  cat > "$W/repo/bin/npx" <<'STUB'
+  cat > "$W/repo/bin/pnpm" <<'STUB'
 #!/usr/bin/env bash
+if [ "${1:-}" != "exec" ]; then exec /usr/bin/env pnpm "$@"; fi
+shift
 if [ "${1:-}" = "openspec" ]; then
   if [ -n "${FAKE_SPECS_EMPTY:-}" ]; then printf '{"specs":[]}'; else printf '{"specs":[{"id":"demo"}]}'; fi
   exit 0
 fi
-if [ "${1:-}" != "vitest" ]; then exec /usr/bin/env npx "$@"; fi
+if [ "${1:-}" != "vitest" ]; then exec /usr/bin/env pnpm exec "$@"; fi
 out=""
 while [ $# -gt 0 ]; do
   case "$1" in --outputFile=*) out="${1#--outputFile=}" ;;
@@ -58,7 +60,7 @@ done
 [ -n "$out" ] && [ -n "${FAKE_JSON:-}" ] && printf '%s' "$FAKE_JSON" > "$out"
 exit "${FAKE_RC:-0}"
 STUB
-  chmod +x "$W/repo/bin/npx"
+  chmod +x "$W/repo/bin/pnpm"
 }
 
 # 兩條都通過的報告。**葉節點標題帶 ID**，那才是被認的地方。

@@ -51,7 +51,7 @@
 - **範例**（≤ 15 行）：
 ```markdown
 # 驗收與回報
-- 驗收指令：`npm test tests/runner.test.ts`
+- 驗收指令：`pnpm test tests/runner.test.ts`
 - 回報格式：改動檔案清單、測試輸出、未完成項目。
 ```
 
@@ -71,7 +71,7 @@ node .agents/skills/llm-team/ticket.mjs run \
   --brief prompts/briefs/add-runner-check.md \
   --branch feat/runner-check--impl \
   --allow src/core/runner.ts --allow tests/runner.test.ts \
-  --test "npm test tests/runner.test.ts" \
+  --test "pnpm test tests/runner.test.ts" \
   --tier standard
 
 # 2. 讀取終端印出的收貨摘要（≤ 25 行）：

@@ -37,16 +37,19 @@ jobs:
           # Branch 那一關要跟 base 比對整個 diff，需要完整歷史。
           fetch-depth: 0
 
+      # pnpm 版本讀 package.json 的 packageManager 欄（唯一真源，不在這裡重複釘）。
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: npm
+          cache: pnpm
 
-      # `npm ci` 要排在 Branch 之前。看起來多裝一次，但 Branch 那一關內部會跑
-      # `npx openspec validate`（check-pr-branch.sh 的 spec/ 與 archive/ 分支），
-      # 沒有 node_modules 的話那次 npx 會去抓網路上的版本 —— **繞過 lockfile**，
-      # 而這份檔案下面整段都在講不要繞過 lockfile。正確性優先於快速失敗。
-      - run: npm ci
+      # `pnpm install --frozen-lockfile` 要排在 Branch 之前。看起來多裝一次，但 Branch 那一關內部會跑
+      # `pnpm exec openspec validate`（check-pr-branch.sh 的 spec/ 與 archive/ 分支），
+      # 沒有 node_modules 的話那次 `pnpm exec` 找不到 bin 會直接紅（不像 npx 會去抓網路上的版本）。
+      # 正確性優先於快速失敗。
+      - run: pnpm install --frozen-lockfile
 
       # 分支類別閘門。
       #
@@ -71,28 +74,38 @@ jobs:
 
       # lockfile 的來源檢查。
       #
-      # 為什麼需要：chore/ 的大小上界**刻意排除 package-lock.json**
+      # 為什麼需要：chore/ 的大小上界**刻意排除 pnpm-lock.yaml**
       # （它是機器產生的，人不讀它，算進去的話任何套件更新都會被擋）。
       # 那個排除留下一個洞 —— 一個很小的 package.json diff 可以搭配
       # 一個把 `resolved` 指向非 registry host 的巨大 lockfile 改動。
       #
       # 這一關補那個洞：驗每一筆 resolved 都指向 npm registry、走 https、
       # 有 integrity。它不看大小，也不管 package.json 有沒有動 ——
-      # 所以 `npm audit fix` 這種只動 lockfile 的安全修補不會被誤擋。
+      # 所以 `pnpm audit --fix` 這種只動 lockfile 的安全修補不會被誤擋。
       #
-      # （lockfile 與 package.json 是否一致，上面的 `npm ci` 已經免費驗了 ——
+      # （lockfile 與 package.json 是否一致，上面的 `pnpm install --frozen-lockfile` 已經免費驗了 ——
       # 不一致會直接報錯。所以這裡不必再做一次。）
+      #
+      # 2026-09-14 改 pnpm：`lockfile-lint` 5.x 只認 npm／yarn lockfile，拿掉。
+      # pnpm-lock.yaml 只有在**非 registry** 來源時才會出現 `tarball:`／`repo:`／`commit:`／URL 這種
+      # resolution，registry 套件只記 `integrity`。所以等價的閘就是：這幾種字樣一個都不准有（不掃裸 URL：`deprecated:` 訊息裡會有 https 連結，掃了就假紅）。
+      # `--validate-integrity` 那一半由 `pnpm install --frozen-lockfile` 本身擔（缺 integrity 會裝不起來）。
       - name: Lockfile
-        run: npx lockfile-lint --path package-lock.json --type npm --allowed-hosts npm --validate-https --validate-integrity
+        run: |
+          if grep -nE '^\s*(tarball|repo|commit): |resolution: \{.*(tarball|repo|commit):' pnpm-lock.yaml; then
+            echo "✗ pnpm-lock.yaml 有非 registry 來源（上面列出的行）。相依只准來自 npm registry。" >&2
+            exit 1
+          fi
+          echo "✓ pnpm-lock.yaml 全部來自 registry"
 
       # 規格結構檢查。
       #
-      # `npx openspec` 不帶套件名，解析到的是 node_modules/.bin/openspec ——
-      # 也就是 package-lock.json 鎖住的那個版本。**不要寫成
-      # `npx @fission-ai/openspec@x.y.z`**，那會去抓網路上的版本，
+      # `pnpm exec openspec` 不帶套件名，解析到的是 node_modules/.bin/openspec ——
+      # 也就是 pnpm-lock.yaml 鎖住的那個版本。**不要寫成
+      # `pnpm dlx @fission-ai/openspec@x.y.z`**，那會去抓網路上的版本，
       # 就繞過了 lockfile，等於沒鎖。
       #
-      # 因為要先有 node_modules，這一關只能排在 npm ci 之後。
+      # 因為要先有 node_modules，這一關只能排在 pnpm install --frozen-lockfile 之後。
       # 換到的是「CI 跟每個人本機跑的是同一份」。
       #
       # `--strict` 會抓沒有 Scenario 的 requirement、沒有 delta 的 change、
@@ -100,7 +113,7 @@ jobs:
       # 所以 archive/ 分支的閘門會額外再跑一次 —— 讓它在 PR 上就紅，
       # 而不是合併後 main 才爆。
       - name: Spec
-        run: npx openspec validate --all --strict
+        run: pnpm exec openspec validate --all --strict
 
       # 工作分解表自己訂的規則（沒有 docs/WBS.md 的專案會直接通過）。
       #
@@ -122,7 +135,7 @@ jobs:
 
       # 分支閘門自己的測試。**它之前不在 CI 裡** —— 有測試、沒有讀者，
       # 而執法層本體壞掉的方式跟工作分解表一樣是安靜的。
-      # 排在 npm ci 之後：這支測試內部會跑 `npx openspec archive`。
+      # 排在 pnpm install --frozen-lockfile 之後：這支內部會跑 `pnpm exec openspec archive`。
       - name: Branch gate tests
         run: bash .github/scripts/test-check-pr-branch.sh
 
@@ -196,12 +209,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # pnpm 版本讀 package.json 的 packageManager 欄（唯一真源，不在這裡重複釘）。
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: npm
+          cache: pnpm
 
-      - run: npm ci
+      - run: pnpm install --frozen-lockfile
 
       # 每一步都獨立列出來，不要串成一行 ——
       # 串起來的話，看 log 分不出是哪一關紅的。
@@ -209,13 +225,13 @@ jobs:
       # 用不到的關就把對應那一步刪掉。**不要留一個永遠失敗的步驟** ——
       # 設定好或刪掉，兩者選一個。
       - name: Lint
-        run: npm run lint
+        run: pnpm run lint
 
       - name: Typecheck
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Test
-        run: npm test
+        run: pnpm test
 
       - name: Build
-        run: npm run build
+        run: pnpm run build

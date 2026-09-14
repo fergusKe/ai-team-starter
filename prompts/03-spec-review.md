@@ -3,8 +3,8 @@
 先跑機器檢查：
 
 ```bash
-npx openspec validate <change> --strict
-npx openspec status --change <change>
+pnpm exec openspec validate <change> --strict
+pnpm exec openspec status --change <change>
 ```
 
 `validate` 只看結構。下面這六題才是它檢查不出來的，

@@ -1423,3 +1423,24 @@ diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不�
 
 **沒有的**：
 - **CI 不會自動拉真源**：export 由維護者手動在真源執行後 commit 快照進模板，CI 只驗快照與 manifest 一致性，不發任何連外請求。
+
+---
+
+## 2026-09-14 全系統預設 pnpm
+
+Fergus 定案（起因：發現衍生專案 GuildHub-frontend 用 npm——「pnpm 就是要節省資源，結果別的專案用別的方式，這樣就失去初衷了」）。
+
+**決定**：模板與所有衍生專案一律用 pnpm，不用 npm。`package-lock.json` → `pnpm-lock.yaml`（`pnpm import` 產生）；`package.json` 加 `packageManager` 欄釘死版本；CI 與 `.github/scripts/` 的安裝／執行指令全面改寫（`npm ci` → `pnpm install --frozen-lockfile`、`npm run`／`npm test` → `pnpm run`／`pnpm test`、`npx <lockfile 鎖住的 CLI>` → `pnpm exec <CLI>`、`npx <一次性遠端套件>` → `pnpm dlx <套件>`）；`llm-team.config.json` 的 `allowCommandHeads`／`installCommand` 同步改 pnpm 系。
+
+**為什麼**：pnpm 省的是**同一台機器多個專案共用 content-addressable store**（不同 repo 各自一份 `node_modules` 是重複磁碟佔用）＋**嚴格性**（預設不做 hoisting、不放行 phantom dependency——沒宣告的相依會直接解析不到而炸掉，這對 LLM 寫的程式碼是額外一層守門）。它**不**省測試記憶體／CPU／Vercel 建置額度／LLM API 額度——這幾類問題各有自己的解法，不要拿「統一 pnpm」去頂替。
+
+**遷移順序**：先改這個模板（不改的話，下一個從模板複製出去的衍生專案又會生出 npm），衍生專案再逐字跟進，不回頭改。
+
+**`lockfile-lint` 拿掉的理由**：5.x 版只認 npm／yarn 的 lockfile 格式，不認 `pnpm-lock.yaml`。等價的閘門改成直接掃 `pnpm-lock.yaml` 裡有沒有非 `registry.npmjs.org` 來源的 resolution（`tarball:`／`repo:`／`commit:` 這幾種欄位只會出現在非 registry 來源；一般套件只記 `integrity`）——邏輯跟 `lockfile-lint --validate-https --allowed-hosts npm` 等價，只是換一種格式去驗同一件事。
+
+**拒絕的替代**：
+1. **只改衍生專案，模板留 npm**：模板是所有新專案的起點，留著 npm 會讓「系統統一用 pnpm」這件事每次複製模板都要重做一次，而且下一個忘記的人會直接把 npm 傳下去。
+2. **兩種套件管理並存（依專案自選）**：拿統一 pnpm 換取的 content-addressable store 共用，只有全部專案都用同一套管理工具才成立；並存等於沒有統一。
+
+**沒有的**：
+- **不代表任何效能保證**：這條決定省的是磁碟與嚴格性，不是速度或成本；不要拿它當其他效能問題的答案。
