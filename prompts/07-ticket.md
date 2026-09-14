@@ -62,11 +62,13 @@
 統整者處理一張票只需兩個回合：第一回合發動票流程，第二回合讀收貨摘要並收尾。
 
 ```bash
-# 0. 第一次開工前：對帳 settings.json（全對 exit 0；有缺印 JSON 片段 exit 1；不自動改設定）
-node .agents/skills/llm-team/setup.mjs --check
+# 0. 第一次開工前：對帳 config 不變式、守門、各角色 binary、該 harness 的 hooks（全對 exit 0；有缺印修法 exit 1；不自動改設定）
+#    --coordinator 必帶：你是哪個 harness 的統整者（claude／agy／codex），複審名單由 llm-team.config.json 的 profiles.<統整者> 決定
+node .agents/skills/llm-team/setup.mjs --check --coordinator claude
 
 # 1. 第一回合：起跑（建立 worktree、寫手實作、自動跑測試與多模型複審）
 node .agents/skills/llm-team/ticket.mjs run \
+  --coordinator claude \
   --name add-runner-check \
   --brief prompts/briefs/add-runner-check.md \
   --branch feat/runner-check--impl \

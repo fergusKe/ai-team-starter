@@ -17,11 +17,23 @@ import { pathToFileURL, fileURLToPath } from 'node:url'
 import {
   CLEAN_GIT_ENV,
   loadConfig,
+  validateProfiles,
   modelsFrom,
+  writerFrom,
+  memberName,
+  memberFileName,
+  nameMembers,
+  reviewerNameFor,
+  REVIEW_PROMPT_SENTINEL,
+  PLAN_PROMPT_SENTINEL,
   buildSafeCommandRegex,
   SAFE_COMMAND_REGEX,
   isSafeCommand,
   parseStreamJson,
+  parseAgyRun,
+  spawnTimedOut,
+  buildCodexArgs,
+  NO_EXEC_HEADER,
   outOfScope,
   assertSettingsAllowRegex,
   resolveAgyBin,
@@ -35,29 +47,85 @@ import {
   parseArgs,
   spawnAsync,
   isDirectRun,
+  rosterKey,
+  compareRoster,
+  readMembersJson,
+  isRosterEntry,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
 import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
-import { main as setupMain, matcherCovers, guardCandidates, resolveGuardPath } from './setup.mjs'
+import {
+  main as setupMain,
+  matcherCovers,
+  guardCandidates,
+  resolveGuardPath,
+  claudeSettingsHasDangerousHook,
+  codexPreToolUseCommands,
+  codexPreToolUseEntries,
+  codexMatcherCoversShell,
+  harnessRoles,
+} from './setup.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
-const TEST_CONFIG = {
-  schemaVersion: 1,
-  models: {
-    writer: 'gemini-3.8-flash-high',
-    reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
-    codex: 'gpt-5.6-sol',
-  },
-  allowCommandHeads: ['npm test', 'bash .github/scripts/test-'],
-  worktreeRoot: '.claude/worktrees',
-  installCommand: '',
-  maxRounds: 3,
-  riskDomains: [],
-  outDir: '.local/llm-team',
+// ─────────────────── schema v2 測試 fixture（三種統整者 profiles） ───────────────────
+// 🔴 測試一律用 v2Config() 產 config；統整者預設走 env LLM_TEAM_COORDINATOR=claude（等同 `--coordinator claude`），
+//    要驗「缺 --coordinator ⇒ 拒絕」的測試自己給 deps.env = {}。
+export const M = {
+  agyOpus: { harness: 'agy', model: 'claude-opus-4-6-thinking', quotaBucket: 'agy-claude' },
+  agyGemini: { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' },
+  codexSol: { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' },
+  claudeCode: { harness: 'claude', model: 'claude-code', quotaBucket: 'anthropic' },
 }
+
+export function v2Profiles(override = {}) {
+  return {
+    claude: {
+      coordinator: M.claudeCode,
+      reviewers: [M.agyOpus, M.agyGemini],
+      blockReviewers: [M.agyOpus, M.agyGemini, M.codexSol],
+      adjudicator: M.codexSol,
+      blockAdjudicator: 'human',
+      ...(override.claude || {}),
+    },
+    agy: {
+      coordinator: M.agyGemini,
+      reviewers: [M.codexSol],
+      blockReviewers: [M.codexSol],
+      adjudicator: 'human',
+      blockAdjudicator: 'human',
+      ...(override.agy || {}),
+    },
+    codex: {
+      coordinator: { ...M.codexSol, effort: 'medium' },
+      reviewers: [M.agyGemini],
+      blockReviewers: [M.agyGemini],
+      adjudicator: 'human',
+      blockAdjudicator: 'human',
+      ...(override.codex || {}),
+    },
+  }
+}
+
+export function v2Config(override = {}) {
+  return {
+    schemaVersion: 2,
+    writer: { harness: 'agy', model: 'gemini-3.8-flash-high', quotaBucket: 'gemini' },
+    profiles: v2Profiles(),
+    allowCommandHeads: ['npm test', 'bash .github/scripts/test-'],
+    worktreeRoot: '.claude/worktrees',
+    installCommand: '',
+    maxRounds: 3,
+    riskDomains: [],
+    outDir: '.local/llm-team',
+    ...override,
+  }
+}
+
+const TEST_CONFIG = v2Config()
+process.env.LLM_TEAM_COORDINATOR = process.env.LLM_TEAM_COORDINATOR || 'claude'
 
 /** 建一個有 main＋feature 分支與 config.json 的拋棄式 repo，回 worktree 路徑（在 feature 分支上）。 */
 function makeRepo(configOverride = {}) {
@@ -170,22 +238,38 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
   test('--config 覆寫優先', () => {
     const dir = tmpdir('override-repo-')
     const customCfgPath = path.join(dir, 'custom.config.json')
-    fs.writeFileSync(customCfgPath, JSON.stringify({ schemaVersion: 1, maxRounds: 4, custom: true }))
+    fs.writeFileSync(customCfgPath, JSON.stringify(v2Config({ maxRounds: 4, custom: true })))
     // repo 根沒有 llm-team.config.json，但傳了 customCfgPath ⇒ 應成功載入
     const cfg = loadConfig(dir, customCfgPath)
     assert.equal(cfg.maxRounds, 4)
     assert.equal(cfg.custom, true)
   })
 
-  test('schemaVersion !== 1 (例如 schemaVersion: 2) ⇒ throw', () => {
+  test('schemaVersion 1（舊格式）⇒ throw 且訊息含「舊格式：models/codexTier 已廢，改成 profiles」；schemaVersion 3 ⇒ throw「不支援」', () => {
+    const oldDir = tmpdir('old-schema-')
+    fs.writeFileSync(
+      path.join(oldDir, 'llm-team.config.json'),
+      JSON.stringify({ schemaVersion: 1, models: { writer: 'w', reviewers: ['x'], codex: 'c' }, codexTier: 'all' })
+    )
+    assert.throws(() => loadConfig(oldDir), /舊格式：models\/codexTier 已廢，改成 profiles（見 SKILL\.md）/)
+
     const badSchemaDir = tmpdir('bad-schema-')
-    fs.writeFileSync(path.join(badSchemaDir, 'llm-team.config.json'), JSON.stringify({ schemaVersion: 2 }))
-    assert.throws(() => loadConfig(badSchemaDir), /schemaVersion 不支援/)
+    fs.writeFileSync(path.join(badSchemaDir, 'llm-team.config.json'), JSON.stringify({ schemaVersion: 3 }))
+    assert.throws(() => loadConfig(badSchemaDir), /schemaVersion 不支援.*預期 2/)
+  })
+
+  test('v2 帶著已廢欄位 models 或 codexTier ⇒ throw（不做自動轉換）', () => {
+    const d1 = tmpdir('v2-stale-models-')
+    fs.writeFileSync(path.join(d1, 'llm-team.config.json'), JSON.stringify(v2Config({ models: { writer: 'w' } })))
+    assert.throws(() => loadConfig(d1), /已廢欄位 models\/codexTier/)
+    const d2 = tmpdir('v2-stale-tier-')
+    fs.writeFileSync(path.join(d2, 'llm-team.config.json'), JSON.stringify(v2Config({ codexTier: 'all' })))
+    assert.throws(() => loadConfig(d2), /已廢欄位 models\/codexTier/)
   })
 
   test('maxRounds: 6（超過硬上限 5）⇒ throw', () => {
     const badRoundsDir = tmpdir('bad-rounds-')
-    fs.writeFileSync(path.join(badRoundsDir, 'llm-team.config.json'), JSON.stringify({ schemaVersion: 1, maxRounds: 6 }))
+    fs.writeFileSync(path.join(badRoundsDir, 'llm-team.config.json'), JSON.stringify(v2Config({ maxRounds: 6 })))
     assert.throws(() => loadConfig(badRoundsDir), /maxRounds 超過硬上限 5/)
   })
 
@@ -193,7 +277,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirString = tmpdir('bad-prefix-str-')
     fs.writeFileSync(
       path.join(dirString, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: 'agy/' })
+      JSON.stringify(v2Config({ branchPrefixes: 'agy/' }))
     )
     assert.throws(
       () => loadConfig(dirString),
@@ -207,7 +291,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirMixed = tmpdir('bad-prefix-mixed-')
     fs.writeFileSync(
       path.join(dirMixed, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/', 1] })
+      JSON.stringify(v2Config({ branchPrefixes: ['agy/', 1] }))
     )
     assert.throws(
       () => loadConfig(dirMixed),
@@ -221,7 +305,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirEmpty = tmpdir('prefix-empty-')
     fs.writeFileSync(
       path.join(dirEmpty, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: [] })
+      JSON.stringify(v2Config({ branchPrefixes: [] }))
     )
     const cfg = loadConfig(dirEmpty)
     assert.deepEqual(cfg.branchPrefixes, [])
@@ -231,7 +315,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirEmptyStr = tmpdir('bad-prefix-empty-')
     fs.writeFileSync(
       path.join(dirEmptyStr, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: [''] })
+      JSON.stringify(v2Config({ branchPrefixes: [''] }))
     )
     assert.throws(
       () => loadConfig(dirEmptyStr),
@@ -245,7 +329,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirWhitespace = tmpdir('bad-prefix-ws-')
     fs.writeFileSync(
       path.join(dirWhitespace, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/', ' '] })
+      JSON.stringify(v2Config({ branchPrefixes: ['agy/', ' '] }))
     )
     assert.throws(
       () => loadConfig(dirWhitespace),
@@ -259,7 +343,7 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const dirOk = tmpdir('prefix-ok-')
     fs.writeFileSync(
       path.join(dirOk, 'llm-team.config.json'),
-      JSON.stringify({ schemaVersion: 1, branchPrefixes: ['agy/'] })
+      JSON.stringify(v2Config({ branchPrefixes: ['agy/'] }))
     )
     const cfg = loadConfig(dirOk)
     assert.deepEqual(cfg.branchPrefixes, ['agy/'])
@@ -269,35 +353,214 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const okDir = tmpdir('ok-repo-')
     fs.writeFileSync(path.join(okDir, 'llm-team.config.json'), JSON.stringify(TEST_CONFIG))
     const cfg = loadConfig(okDir)
-    assert.equal(cfg.schemaVersion, 1)
+    assert.equal(cfg.schemaVersion, 2)
     assert.equal(cfg.maxRounds, 3)
+  })
+
+  test('真源模板 config.json 走 loadConfig 不 throw；三個 profile 都解得出名單', () => {
+    const cfg = loadConfig(null, fileURLToPath(new URL('./config.json', import.meta.url)))
+    assert.deepEqual(Object.keys(cfg.profiles), ['claude', 'agy', 'codex'])
+    for (const p of ['claude', 'agy', 'codex']) {
+      const m = modelsFrom(cfg, {}, p)
+      assert.ok(m.reviewers.length >= 1 && m.blockReviewers.length >= 1, `${p} 名單非空`)
+      assert.equal(m.coordinator.profile, p)
+    }
+    // 模板名單（Fergus 2026-09-14 硬約束）：agy／codex profile 不含任何 claude
+    for (const p of ['agy', 'codex']) {
+      const m = modelsFrom(cfg, {}, p)
+      assert.ok([...m.reviewers, ...m.blockReviewers].every((x) => x.harness !== 'claude'), `${p} 名單不含 claude`)
+      assert.equal(m.adjudicator, 'human')
+    }
   })
 })
 
-describe('modelsFrom：模型對應與環境變數覆寫', () => {
-  const cfg = {
-    models: {
-      writer: 'gemini-3.8-flash-high',
-      reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
-      codex: 'gpt-5.6-sol',
-    },
+describe('validateProfiles：config 不變式（每條各自紅、各自指名 profile 與不變式）', () => {
+  function cfgWith(claudeOverride) {
+    return v2Config({ profiles: v2Profiles({ claude: claudeOverride }) })
+  }
+  function loadOf(cfg) {
+    const d = tmpdir('inv-')
+    fs.writeFileSync(path.join(d, 'llm-team.config.json'), JSON.stringify(cfg))
+    return () => loadConfig(d)
   }
 
-  test('預設從 config 讀取', () => {
-    const m = modelsFrom(cfg, {})
-    assert.equal(m.writer, 'gemini-3.8-flash-high')
-    assert.deepEqual(m.planners, ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'])
-    assert.equal(m.codex, 'gpt-5.6-sol')
+  test('陽性對照：合法 v2Config ⇒ validateProfiles 回 true、loadConfig 不 throw', () => {
+    assert.equal(validateProfiles(v2Config()), true)
+    assert.doesNotThrow(loadOf(v2Config()))
   })
 
-  test('環境變數覆寫（傳 env 參數，不改 process.env）', () => {
-    const m = modelsFrom(cfg, {
-      LLM_TEAM_WRITER: 'my-custom-writer',
-      LLM_TEAM_CODEX: 'my-custom-codex',
-    })
-    assert.equal(m.writer, 'my-custom-writer')
-    assert.equal(m.codex, 'my-custom-codex')
-    assert.deepEqual(m.planners, ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'])
+  test('缺 profiles ⇒ throw 含「缺 profiles」', () => {
+    assert.throws(loadOf(v2Config({ profiles: undefined })), /缺 profiles/)
+    assert.throws(loadOf(v2Config({ profiles: {} })), /缺 profiles/)
+  })
+
+  test('缺必要欄位（adjudicator）⇒ throw 指名 profiles.claude 缺 adjudicator', () => {
+    assert.throws(loadOf(cfgWith({ adjudicator: undefined })), /profiles\.claude 缺必要欄位 adjudicator/)
+  })
+
+  test('缺 writer ⇒ throw 指名 writer', () => {
+    assert.throws(loadOf(v2Config({ writer: undefined })), /writer 必須是成員物件/)
+  })
+
+  test('🔴 writer.harness 只准 agy（codex 複審 Q1-CLAUDE）：writer.harness=claude ⇒ loadConfig throw；=codex ⇒ throw；writerFrom 讀者側也 throw；陽性對照 agy ⇒ 過', () => {
+    const asClaude = { harness: 'claude', model: 'claude-opus', quotaBucket: 'anthropic' }
+    const asCodex = { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' }
+    assert.throws(loadOf(v2Config({ writer: asClaude })), /writer\.harness 只准 agy.*得到 "claude"/)
+    assert.throws(loadOf(v2Config({ writer: asCodex })), /writer\.harness 只准 agy.*得到 "codex"/)
+    // 讀者側（deps.config 注入繞過 loadConfig 時）也擋：writerFrom／modelsFrom
+    assert.throws(() => writerFrom(v2Config({ writer: asClaude }), {}), /writer\.harness 只准 agy/)
+    assert.throws(() => modelsFrom(v2Config({ writer: asCodex }), {}, 'claude'), /writer\.harness 只准 agy/)
+    // LLM_TEAM_WRITER 只覆寫 model，蓋不掉 harness
+    assert.equal(writerFrom(v2Config(), { LLM_TEAM_WRITER: 'x' }).harness, 'agy')
+    // 陽性對照：同一份 config、writer 是 agy ⇒ 過
+    assert.doesNotThrow(loadOf(v2Config()))
+    assert.equal(writerFrom(v2Config(), {}).harness, 'agy')
+  })
+
+  test('未知 harness／quotaBucket／effort ⇒ throw 指名欄位', () => {
+    assert.throws(loadOf(cfgWith({ reviewers: [{ harness: 'ollama', model: 'x', quotaBucket: 'gemini' }] })), /profiles\.claude\.reviewers\[0\]\.harness 未知/)
+    assert.throws(loadOf(cfgWith({ reviewers: [{ harness: 'agy', model: 'x', quotaBucket: 'free' }] })), /profiles\.claude\.reviewers\[0\]\.quotaBucket 未知/)
+    assert.throws(loadOf(cfgWith({ reviewers: [{ ...M.codexSol, effort: 'ultra' }] })), /effort 只准 high\|medium/)
+  })
+
+  test('同一名單成員重複（harness+model 相同）⇒ throw 含「重複」', () => {
+    assert.throws(loadOf(cfgWith({ reviewers: [M.agyGemini, { ...M.agyGemini }] })), /reviewers\[1\] 在同一名單重複/)
+  })
+
+  test('統整者出現在 reviewers／blockReviewers／adjudicator ⇒ 各自 throw 含「統整者本人」', () => {
+    const coordAsAgy = { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' }
+    assert.throws(
+      loadOf(cfgWith({ coordinator: coordAsAgy, reviewers: [M.codexSol, coordAsAgy], blockReviewers: [M.codexSol], adjudicator: 'human' })),
+      /profiles\.claude\.reviewers\[1\] 就是統整者本人/
+    )
+    assert.throws(
+      loadOf(cfgWith({ coordinator: coordAsAgy, reviewers: [M.codexSol], blockReviewers: [coordAsAgy], adjudicator: 'human' })),
+      /profiles\.claude\.blockReviewers\[0\] 就是統整者本人/
+    )
+    assert.throws(
+      loadOf(cfgWith({ coordinator: coordAsAgy, reviewers: [M.codexSol], blockReviewers: [M.codexSol], adjudicator: coordAsAgy })),
+      /profiles\.claude\.adjudicator 就是統整者本人/
+    )
+  })
+
+  test('統整者與 reviewer／blockReviewer／adjudicator 同 quotaBucket ⇒ 各自 throw 含「同 quotaBucket」', () => {
+    const anthropicViaAgy = { harness: 'agy', model: 'claude-opus-4-6-thinking', quotaBucket: 'anthropic' }
+    assert.throws(loadOf(cfgWith({ reviewers: [anthropicViaAgy] })), /reviewers\[0\] 與統整者同 quotaBucket=anthropic/)
+    assert.throws(loadOf(cfgWith({ blockReviewers: [anthropicViaAgy] })), /blockReviewers\[0\] 與統整者同 quotaBucket=anthropic/)
+    assert.throws(loadOf(cfgWith({ adjudicator: { harness: 'codex', model: 'x', quotaBucket: 'anthropic' } })), /adjudicator 與統整者同 quotaBucket=anthropic/)
+  })
+
+  test('adjudicator 出現在 reviewers ⇒ throw 含「裁決者 ∉ 一般票複審名單」；只在 blockReviewers ⇒ 過', () => {
+    assert.throws(loadOf(cfgWith({ reviewers: [M.agyGemini, M.codexSol], adjudicator: M.codexSol })), /adjudicator 出現在 reviewers/)
+    assert.doesNotThrow(loadOf(cfgWith({ reviewers: [M.agyGemini], blockReviewers: [M.agyGemini, M.codexSol], adjudicator: M.codexSol })))
+  })
+
+  test('adjudicator 可以是 "human"；其他字串 ⇒ throw', () => {
+    assert.doesNotThrow(loadOf(cfgWith({ adjudicator: 'human' })))
+    assert.throws(loadOf(cfgWith({ adjudicator: 'robot' })), /adjudicator 必須是成員物件/)
+  })
+
+  test('blockAdjudicator ≠ "human"（成員物件或別的字串）⇒ throw', () => {
+    assert.throws(loadOf(cfgWith({ blockAdjudicator: M.codexSol })), /blockAdjudicator 只准 "human"/)
+    assert.throws(loadOf(cfgWith({ blockAdjudicator: 'codex' })), /blockAdjudicator 只准 "human"/)
+  })
+
+  test('reviewers 或 blockReviewers 為空 ⇒ throw 含「非空陣列」', () => {
+    assert.throws(loadOf(cfgWith({ reviewers: [] })), /profiles\.claude\.reviewers 必須是非空陣列/)
+    assert.throws(loadOf(cfgWith({ blockReviewers: [] })), /profiles\.claude\.blockReviewers 必須是非空陣列/)
+  })
+
+  test('🔴 claude harness 只准當 coordinator：出現在 reviewers／blockReviewers／adjudicator ⇒ 各自 throw（Fergus 2026-09-14 硬約束）', () => {
+    const claudeOpus = { harness: 'claude', model: 'opus', quotaBucket: 'anthropic' }
+    const agyCoord = { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' }
+    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [claudeOpus], blockReviewers: [M.codexSol], adjudicator: 'human' })), /reviewers\[0\] 是 claude harness/)
+    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [claudeOpus], adjudicator: 'human' })), /blockReviewers\[0\] 是 claude harness/)
+    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [M.codexSol], adjudicator: claudeOpus })), /adjudicator 是 claude harness/)
+    // 陽性對照：同一組但 claude 只在 coordinator ⇒ 過
+    assert.doesNotThrow(loadOf(cfgWith({ coordinator: claudeOpus, reviewers: [M.agyGemini], blockReviewers: [M.codexSol], adjudicator: 'human' })))
+  })
+})
+
+describe('複審名單身分三元組（rosterKey／compareRoster／readMembersJson）', () => {
+  test('rosterKey 不含 name；compareRoster 是多重集合比對：同 name 不同 model ⇒ missing＋unexpected 各一；重複三元組要兩次都到；順序無關', () => {
+    const opus = { name: 'agy/opus', ...M.agyOpus }
+    const gemini = { name: 'agy/gemini', ...M.agyGemini }
+    const geminiLow = { name: 'agy/gemini', harness: 'agy', model: 'gemini-3.1-pro-low', quotaBucket: 'gemini' }
+    assert.equal(rosterKey(gemini), 'agy/gemini-3.1-pro-high/gemini')
+    assert.equal(rosterKey({ ...gemini, name: 'whatever' }), rosterKey(gemini), 'name 不進 key')
+    assert.deepEqual(compareRoster([opus, gemini], [gemini, opus]), { missing: [], unexpected: [], mismatch: false })
+    const d = compareRoster([opus, gemini], [opus, geminiLow])
+    assert.equal(d.mismatch, true)
+    assert.deepEqual(d.missing, [gemini])
+    assert.deepEqual(d.unexpected, [geminiLow])
+    assert.deepEqual(compareRoster([opus, gemini], [opus]).missing, [gemini])
+    assert.deepEqual(compareRoster([opus], [opus, gemini]).unexpected, [gemini])
+    // 同一三元組兩份（nameMembers 的 -2 只是顯示名）：實際只到一份 ⇒ missing 一份
+    assert.deepEqual(compareRoster([gemini, { ...gemini, name: 'agy/gemini-2' }], [gemini]).missing, [{ ...gemini, name: 'agy/gemini-2' }])
+    assert.equal(compareRoster([], []).mismatch, false)
+  })
+
+  test('readMembersJson：缺檔／壞 JSON／不是陣列／任一項缺身分欄位 ⇒ null（fail-closed）；合法 ⇒ 陣列', () => {
+    const d = tmpdir('members-')
+    const f = path.join(d, 'members.json')
+    assert.equal(readMembersJson(f), null, '缺檔')
+    fs.writeFileSync(f, '{not json')
+    assert.equal(readMembersJson(f), null, '壞 JSON')
+    fs.writeFileSync(f, JSON.stringify({ name: 'x' }))
+    assert.equal(readMembersJson(f), null, '不是陣列')
+    fs.writeFileSync(f, JSON.stringify([{ name: 'agy/gemini', harness: 'agy', model: 'gemini-3.1-pro-high' }]))
+    assert.equal(readMembersJson(f), null, '缺 quotaBucket')
+    fs.writeFileSync(f, JSON.stringify([{ name: 'agy/gemini', harness: 'agy', model: '', quotaBucket: 'gemini' }]))
+    assert.equal(readMembersJson(f), null, 'model 空字串')
+    fs.writeFileSync(f, JSON.stringify([{ name: 'agy/gemini', ...M.agyGemini, overall: '簽' }]))
+    assert.deepEqual(readMembersJson(f), [{ name: 'agy/gemini', ...M.agyGemini, overall: '簽' }])
+    assert.equal(isRosterEntry(null), false)
+    assert.equal(isRosterEntry({ name: 'a', harness: 'agy', model: 'm', quotaBucket: 'gemini' }), true)
+  })
+})
+
+describe('modelsFrom：依統整者 profile 解析角色與環境變數覆寫', () => {
+  const cfg = v2Config()
+
+  test('coordinator 參數指定 claude ⇒ writer／reviewers（含 name）／blockReviewers／adjudicator／blockAdjudicator', () => {
+    const m = modelsFrom(cfg, {}, 'claude')
+    assert.deepEqual(m.writer, { harness: 'agy', model: 'gemini-3.8-flash-high', quotaBucket: 'gemini' })
+    assert.equal(m.coordinator.profile, 'claude')
+    assert.equal(m.coordinator.harness, 'claude')
+    assert.deepEqual(m.reviewers.map((x) => x.name), ['agy/opus', 'agy/gemini'])
+    assert.deepEqual(m.blockReviewers.map((x) => x.name), ['agy/opus', 'agy/gemini', 'codex/gpt-5-6-sol'])
+    assert.equal(m.adjudicator.name, 'codex/gpt-5-6-sol')
+    assert.equal(m.blockAdjudicator, 'human')
+  })
+
+  test('coordinator 來自 env LLM_TEAM_COORDINATOR；參數優先於 env', () => {
+    assert.equal(modelsFrom(cfg, { LLM_TEAM_COORDINATOR: 'agy' }).coordinator.profile, 'agy')
+    assert.equal(modelsFrom(cfg, { LLM_TEAM_COORDINATOR: 'agy' }, 'codex').coordinator.profile, 'codex')
+    assert.equal(modelsFrom(cfg, {}, 'agy').adjudicator, 'human')
+  })
+
+  test('缺 coordinator 或不在 profiles ⇒ throw 且訊息列出可用 profiles', () => {
+    assert.throws(() => modelsFrom(cfg, {}), /未指定.*可用 profiles：claude, agy, codex/)
+    assert.throws(() => modelsFrom(cfg, {}, 'gpt'), /不存在：gpt.*可用 profiles：claude, agy, codex/)
+    assert.throws(() => modelsFrom(cfg, { LLM_TEAM_COORDINATOR: 'nope' }), /不存在：nope/)
+  })
+
+  test('LLM_TEAM_WRITER 覆寫 writer.model（不改 process.env）；LLM_TEAM_CODEX 已拿掉、不影響任何角色', () => {
+    const m = modelsFrom(cfg, { LLM_TEAM_WRITER: 'my-custom-writer', LLM_TEAM_CODEX: 'my-custom-codex' }, 'claude')
+    assert.equal(m.writer.model, 'my-custom-writer')
+    assert.equal(m.writer.harness, 'agy')
+    assert.equal(m.blockReviewers[2].model, 'gpt-5.6-sol')
+    assert.equal(m.adjudicator.model, 'gpt-5.6-sol')
+    assert.equal(writerFrom(cfg, {}).model, 'gemini-3.8-flash-high')
+  })
+
+  test('memberName／memberFileName／nameMembers：agy/gemini、codex/gpt-5-6-sol、同名加 -2、檔名 / ⇒ -', () => {
+    assert.equal(memberName(M.agyGemini), 'agy/gemini')
+    assert.equal(memberName(M.codexSol), 'codex/gpt-5-6-sol')
+    assert.equal(memberName({ harness: 'claude', model: 'opus' }), 'claude/opus')
+    assert.equal(memberFileName('agy/gemini'), 'agy-gemini')
+    const named = nameMembers([M.agyGemini, { ...M.agyGemini, model: 'gemini-3.1-pro-low' }, M.codexSol])
+    assert.deepEqual(named.map((x) => x.name), ['agy/gemini', 'agy/gemini-2', 'codex/gpt-5-6-sol'])
   })
 })
 
@@ -369,6 +632,13 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
   const settings = makeSettings(GOOD_ALLOW)
   const baseEnv = { AGY_BIN: bin, AGY_SETTINGS: settings }
 
+  test('🔴 writer.harness=claude 的 config ⇒ write.main 回 2、訊息含「writer.harness 只准 agy」、假 agy 沒被跑（沒寫 add.test.mjs）', () => {
+    const repo = makeRepo({ writer: { harness: 'claude', model: 'claude-opus', quotaBucket: 'anthropic' } })
+    const r = runWriteReal(repo, 'ok')
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /writer\.harness 只准 agy/)
+    assert.ok(!fs.existsSync(path.join(repo.dir, 'add.test.mjs')), '寫手不該被跑起來')
+  })
   test('G1：在 main 上 ⇒ exit 2、訊息點名 G1', () => {
     const repo = makeRepo()
     repo.g('checkout', '-q', 'main')
@@ -641,6 +911,46 @@ describe('council.mjs：複審與三方會議', () => {
     assert.match(p, /租戶隔離／金流/)
     assert.match(p, /Q4 租戶隔離／金流 有沒有被碰到？碰到的話是不是 block 級、有沒有對應守門？/)
   })
+  test('buildReviewPrompt 第一行固定是 REVIEW_PROMPT_SENTINEL，第二行才是「你是本 repo 的複審者」', () => {
+    const p = buildReviewPrompt({ brief: 'B', diff: '+x', tier: 'standard', diffStat: '1 file', writerModel: 'w' })
+    const lines = p.split('\n')
+    assert.equal(lines[0], REVIEW_PROMPT_SENTINEL)
+    assert.equal(REVIEW_PROMPT_SENTINEL, '【llm-team 複審票】')
+    assert.match(lines[1], /^你是本 repo 的複審者（一般票）/)
+  })
+  test('council plan：prompt.md 第一行是 PLAN_PROMPT_SENTINEL、原提示內容不動；review：prompt.md 以 REVIEW_PROMPT_SENTINEL 開頭', async () => {
+    const repo = makeRepo()
+    const promptFile = path.join(tmpdir('plan-'), 'plan.md')
+    fs.writeFileSync(promptFile, '規劃這張票\n第二行')
+    const outDir = path.join(repo.dir, '.plan')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['plan', '--worktree', repo.dir, '--prompt', promptFile, '--out', outDir], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    const written = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+    assert.equal(written, PLAN_PROMPT_SENTINEL + '\n規劃這張票\n第二行')
+    assert.equal(PLAN_PROMPT_SENTINEL, '【llm-team 規劃】')
+
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'B')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir2 = path.join(repo.dir, '.review')
+    console.log = () => {}
+    try {
+      await councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir2, '--tier', 'standard'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.ok(fs.readFileSync(path.join(outDir2, 'prompt.md'), 'utf8').startsWith(REVIEW_PROMPT_SENTINEL + '\n'))
+  })
   test('review：兩位 agy（假 binary 回「不簽」）⇒ 表格印 不簽、exit 0；零輸出成員 ⇒ exit 3', async () => {
     const repo = makeRepo()
     fs.writeFileSync(path.join(repo.dir, 'add.mjs'), 'export function add(a, b) { return a + b + 0 }\n')
@@ -666,12 +976,14 @@ describe('council.mjs：複審與三方會議', () => {
     }
     assert.equal(code, 0)
     const table = logs.join('\n')
-    assert.match(table, /\| opus \| claude-opus-4-6-thinking \| 0 \|[^|]*\| 不簽 \| Q1=簽 Q2=不簽/)
-    assert.match(table, /\| gemini \| gemini-3.1-pro-high/)
-    assert.doesNotMatch(table, /codex/, 'standard 不叫 codex')
+    assert.match(table, /\| agy\/opus \| claude-opus-4-6-thinking \| 0 \|[^|]*\| 不簽 \| Q1=簽 Q2=不簽/)
+    assert.match(table, /\| agy\/gemini \| gemini-3.1-pro-high/)
+    assert.doesNotMatch(table, /codex/, 'standard 不叫 codex（它在 blockReviewers）')
     assert.match(fs.readFileSync(path.join(repo.dir, '.review', 'prompt.md'), 'utf8'), /\+ 0 \}/)
     const ledger = fs.readFileSync(path.join(repo.dir, '.review', 'ledger.ndjson'), 'utf8')
-    assert.match(ledger, /"schemaVersion":1/)
+    assert.match(ledger, /"schemaVersion":2/)
+    assert.match(ledger, /"coordinator":"claude"/)
+    assert.match(ledger, /"harness":"agy"/)
 
     // 🔴 陽性對照：假 binary 改成 denied（零輸出）⇒ exit 3、表格標「零輸出」
     const logs2 = []
@@ -695,8 +1007,8 @@ describe('council.mjs：複審與三方會議', () => {
     assert.equal(resolveAgyBin({ AGY_BIN: '/x/agy' }), '/x/agy')
   })
 
-  test('T3：reviewers: [] 且未帶 --codex ⇒ council main() 回 2、deps.runOne 未被呼叫、stdout 不含「簽」', async () => {
-    const repo = makeRepo({ models: { writer: 'w', reviewers: [], codex: 'c' } })
+  test('T3：reviewers: [] ⇒ loadConfig 拒絕（不變式）⇒ council main() 回 2、deps.runOne 未被呼叫、stdout 不含「簽」', async () => {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [] } }) })
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
     const base = repo.g('rev-parse', 'HEAD').trim()
@@ -732,7 +1044,40 @@ describe('council.mjs：複審與三方會議', () => {
     const allOut = outs.join('\n')
     assert.ok(!allOut.includes('簽'), `stdout 不應含「簽」，實際輸出：${allOut}`)
     const allErr = errs.join('\n')
-    assert.match(allErr, /🔴 沒有任何複審者（config\.models\.reviewers 空且未加 --codex）/, `stderr 應提示沒有複審者，實際：${allErr}`)
+    assert.match(allErr, /🔴 config 載入失敗：.*profiles\.claude\.reviewers 必須是非空陣列/, `stderr 應指名不變式，實際：${allErr}`)
+  })
+
+  test('T3b：缺 --coordinator（deps.env 也沒有）⇒ council main() 回 2、訊息列出可用 profiles、deps.runOne 未被呼叫；--coordinator 不存在 ⇒ 同樣 2', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+    let runOneCalls = 0
+    const deps = {
+      env: {},
+      runOne: () => {
+        runOneCalls++
+        return { name: 'fake', model: 'fake', exit: 0, ms: 10, empty: false, denied: [], text: '整份：簽' }
+      },
+    }
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    let code2
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'], deps)
+      code2 = await councilMain(['review', '--coordinator', 'nope', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(code2, 2)
+    assert.equal(runOneCalls, 0)
+    const allErr = errs.join('\n')
+    assert.match(allErr, /統整者 profile 未指定.*可用 profiles：claude, agy, codex/)
+    assert.match(allErr, /統整者 profile 不存在：nope/)
   })
 
   test('council 複審者並行啟動：同時發起請求並按原順序寫台帳與印表', async () => {
@@ -756,12 +1101,12 @@ describe('council.mjs：複審與三方會議', () => {
       deps
     )
     assert.equal(code, 0)
-    assert.equal(events[0], 'start:opus')
-    assert.equal(events[1], 'start:gemini')
+    assert.equal(events[0], 'start:agy/opus')
+    assert.equal(events[1], 'start:agy/gemini')
 
     const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
-    assert.equal(ledger[0].name, 'opus')
-    assert.equal(ledger[1].name, 'gemini')
+    assert.equal(ledger[0].name, 'agy/opus')
+    assert.equal(ledger[1].name, 'agy/gemini')
   })
 
   test('council --sequential 保留依序執行行為', async () => {
@@ -785,7 +1130,7 @@ describe('council.mjs：複審與三方會議', () => {
       deps
     )
     assert.equal(code, 0)
-    assert.deepEqual(events, ['start:opus', 'done:opus', 'start:gemini', 'done:gemini'])
+    assert.deepEqual(events, ['start:agy/opus', 'done:agy/opus', 'start:agy/gemini', 'done:agy/gemini'])
   })
 
   test('council 心跳：並行等待期間每 heartbeatMs 印進度至 stderr', async () => {
@@ -859,7 +1204,7 @@ describe('council.mjs：複審與三方會議', () => {
 
     const deps = {
       runOne: (name, model) => {
-        if (name === 'opus') {
+        if (name === 'agy/opus') {
           return { name, model, exit: null, signal: 'SIGTERM', timedOut: true, ms: 100, empty: true, denied: [], text: '' }
         }
         return { name, model, exit: 0, ms: 50, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
@@ -878,11 +1223,11 @@ describe('council.mjs：複審與三方會議', () => {
     assert.equal(code, 3)
 
     const table = logs.join('\n')
-    assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（timeout） \|/)
-    assert.match(table, /\| gemini \| .* \| 0 \| .* \| 簽 \|/)
+    assert.match(table, /\| agy\/opus \| .* \| null \| .* \| 不簽（timeout） \|/)
+    assert.match(table, /\| agy\/gemini \| .* \| 0 \| .* \| 簽 \|/)
 
     const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
-    const opusEntry = ledger.find((l) => l.name === 'opus')
+    const opusEntry = ledger.find((l) => l.name === 'agy/opus')
     assert.equal(opusEntry.exit, null)
     assert.equal(opusEntry.signal, 'SIGTERM')
     assert.equal(opusEntry.empty, true)
@@ -923,11 +1268,11 @@ describe('council.mjs：複審與三方會議', () => {
       }
       assert.notEqual(code, 0)
       const table = logs.join('\n')
-      assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（被中止） \|/)
+      assert.match(table, /\| agy\/opus \| .* \| null \| .* \| 不簽（被中止） \|/)
       assert.doesNotMatch(table, /不簽（timeout）/)
 
       const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
-      const opusEntry = ledger.find((l) => l.name === 'opus')
+      const opusEntry = ledger.find((l) => l.name === 'agy/opus')
       assert.equal(opusEntry.exit, null)
       assert.equal(opusEntry.signal, 'SIGTERM')
       assert.equal(opusEntry.overall, '不簽（被中止）')
@@ -961,15 +1306,146 @@ describe('council.mjs：複審與三方會議', () => {
       }
       assert.notEqual(code, 0)
       const table = logs.join('\n')
-      assert.match(table, /\| opus \| .* \| null \| .* \| 不簽（timeout） \|/)
+      assert.match(table, /\| agy\/opus \| .* \| null \| .* \| 不簽（timeout） \|/)
       assert.doesNotMatch(table, /不簽（被中止）/)
 
       const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
-      const opusEntry = ledger.find((l) => l.name === 'opus')
+      const opusEntry = ledger.find((l) => l.name === 'agy/opus')
       assert.equal(opusEntry.exit, null)
       assert.equal(opusEntry.signal, 'SIGTERM')
       assert.equal(opusEntry.overall, '不簽（timeout）')
     }
+  })
+
+  test('council 複審者名稱從 profile 成員推導：reviewers: [agy/gemini-3.1-pro-high] ⇒ 成員名 agy/gemini（不是 opus），輸出檔 agy-gemini.txt', async () => {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [M.agyGemini] } }) })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+
+    const deps = {
+      runOne: (name, model, prompt, cwd, out) => {
+        fs.writeFileSync(path.join(out, `${memberFileName(name)}.txt`), 'Q1：簽\n整份：簽\n')
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+
+    try {
+      const code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+      assert.equal(code, 0)
+    } finally {
+      console.log = origLog
+    }
+
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-gemini.txt')), '輸出檔 agy-gemini.txt 應存在')
+    assert.ok(!fs.existsSync(path.join(outDir, 'agy-opus.txt')), '輸出檔 agy-opus.txt 不應存在')
+
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(ledger[0].name, 'agy/gemini')
+
+    const table = logs.join('\n')
+    assert.match(table, /\|\s*agy\/gemini\s*\|\s*gemini-3\.1-pro-high\s*\|/)
+    assert.doesNotMatch(table, /\|\s*agy\/opus\s*\|/)
+  })
+
+  test('council 複審者同名衝突：[agy/gemini-3.1-pro-high, agy/gemini-3.1-pro-low] ⇒ agy/gemini、agy/gemini-2', async () => {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [M.agyGemini, { ...M.agyGemini, model: 'gemini-3.1-pro-low' }] } }) })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+
+    const deps = {
+      runOne: (name, model, prompt, cwd, out) => {
+        fs.writeFileSync(path.join(out, `${memberFileName(name)}.txt`), 'Q1：簽\n整份：簽\n')
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+
+    try {
+      const code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+      assert.equal(code, 0)
+    } finally {
+      console.log = origLog
+    }
+
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-gemini.txt')), '輸出檔 agy-gemini.txt 應存在')
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-gemini-2.txt')), '輸出檔 agy-gemini-2.txt 應存在')
+
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(ledger[0].name, 'agy/gemini')
+    assert.equal(ledger[1].name, 'agy/gemini-2')
+
+    const table = logs.join('\n')
+    assert.match(table, /\|\s*agy\/gemini\s*\|\s*gemini-3\.1-pro-high\s*\|/)
+    assert.match(table, /\|\s*agy\/gemini-2\s*\|\s*gemini-3\.1-pro-low\s*\|/)
+  })
+
+  test('council 既有行為不變：[agy/opus, agy/gemini] ⇒ agy/opus、agy/gemini', async () => {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [M.agyOpus, M.agyGemini] } }) })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    const outDir = path.join(repo.dir, '.review')
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+
+    const deps = {
+      runOne: (name, model, prompt, cwd, out) => {
+        fs.writeFileSync(path.join(out, `${memberFileName(name)}.txt`), 'Q1：簽\n整份：簽\n')
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+
+    try {
+      const code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard'],
+        deps
+      )
+      assert.equal(code, 0)
+    } finally {
+      console.log = origLog
+    }
+
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-opus.txt')), '輸出檔 agy-opus.txt 應存在')
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-gemini.txt')), '輸出檔 agy-gemini.txt 應存在')
+
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(ledger[0].name, 'agy/opus')
+    assert.equal(ledger[1].name, 'agy/gemini')
+
+    const table = logs.join('\n')
+    assert.match(table, /\|\s*agy\/opus\s*\|\s*claude-opus-4-6-thinking\s*\|/)
+    assert.match(table, /\|\s*agy\/gemini\s*\|\s*gemini-3\.1-pro-high\s*\|/)
+  })
+})
+
+describe('reviewerNameFor', () => {
+  test('model 包含關鍵字對應特定名稱，其他過濾非 [a-z0-9-] 字元', () => {
+    assert.equal(reviewerNameFor('claude-opus-4-6-thinking'), 'opus')
+    assert.equal(reviewerNameFor('claude-3-5-sonnet-20241022'), 'sonnet')
+    assert.equal(reviewerNameFor('gemini-3.1-pro-high'), 'gemini')
+    assert.equal(reviewerNameFor('gpt-oss-preview'), 'gpt-oss')
+    assert.equal(reviewerNameFor('llama-3.1-70b'), 'llama-3-1-70b')
+    assert.equal(reviewerNameFor('gpt-5.6-sol'), 'gpt-5-6-sol')
+    assert.equal(reviewerNameFor('custom_model@2026'), 'custommodel2026')
   })
 })
 
@@ -1038,8 +1514,10 @@ describe('spawnAsync 非同步子行程執行', () => {
     ].join('\n')
     const start = Date.now()
     let watchdogTimer = null
+    const pending = spawnAsync('node', ['-e', code], { timeout: 100, killGraceMs: 100 })
+    assert.ok(pending.child && typeof pending.child.kill === 'function', 'spawnAsync 的 Promise 要掛 .child')
     const race = await Promise.race([
-      spawnAsync('node', ['-e', code], { timeout: 100, killGraceMs: 100 }),
+      pending,
       new Promise(function (resolve) {
         watchdogTimer = setTimeout(function () {
           resolve('WATCHDOG')
@@ -1048,6 +1526,12 @@ describe('spawnAsync 非同步子行程執行', () => {
     ])
     if (watchdogTimer) clearTimeout(watchdogTimer)
     if (race === 'WATCHDOG') {
+      // T6 NIT：assert.fail 之前先把子行程殺掉，否則活著的子行程讓 runner 不自退
+      try {
+        pending.child.kill('SIGKILL')
+      } catch {
+        /* 可能已退出 */
+      }
       assert.fail('spawnAsync 在 3 秒內沒有 resolve：SIGKILL 升級沒生效')
     }
     const r = race
@@ -1079,11 +1563,11 @@ describe('lastStepIsToolError：agy 無頭第 4 坑（工具參數錯 ⇒ 整輪
 })
 
 describe('T4：model 與 writerModel 必填檢查（避免特定模型硬編碼）', () => {
-  test('runCodex({ prompt: "x" }) 缺 model ⇒ throw 且訊息含 config.models.codex', () => {
+  test('runCodex({ prompt: "x" }) 缺 model ⇒ throw 且訊息指出 model 來自 profile 成員', () => {
     assert.throws(
       () => runCodex({ prompt: 'x' }),
       (err) => {
-        assert.match(err.message, /runCodex 需要 model（來自 config\.models\.codex）/, `錯誤訊息應含 config.models.codex，實際得到：${err.message}`)
+        assert.match(err.message, /runCodex 需要 model（來自 profile 成員的 model）/, `錯誤訊息應指出 model 來源，實際得到：${err.message}`)
         return true
       }
     )
@@ -1494,57 +1978,202 @@ describe('agy 無頭第 5 坑：--print-timeout 與 timeoutMs 傳遞', () => {
   })
 })
 
-describe('codexTier 出席層級測試', () => {
-  test('codexTier: "all" ＋ standard tier ⇒ members 含 codex', async () => {
-    const repo = makeRepo({ codexTier: 'all' })
+describe('複審名單依 tier 取自 profile：block 票收 blockReviewers、standard 票收 reviewers', () => {
+  async function membersFor(tier, extraArgs = []) {
+    const repo = makeRepo()
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
     const outDir = path.join(tmpdir('review-'), 'review')
-
     const membersCalled = []
     const deps = {
-      runOne: (name, model, prompt, cwd, out) => {
-        membersCalled.push(name)
+      runOne: (name, model, prompt, cwd, out, timeoutMs, member) => {
+        membersCalled.push({ name, harness: member.harness, quotaBucket: member.quotaBucket })
         return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
       },
     }
-
-    const code = await councilMain(
-      ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
-      deps
-    )
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', tier, '--out', outDir, ...extraArgs],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
     assert.equal(code, 0)
-    assert.ok(membersCalled.includes('codex'), `codexTier: "all" 時 standard tier 應出席 codex，實際成員：${membersCalled.join(', ')}`)
+    return membersCalled
+  }
+
+  test('block tier ⇒ members ＝ blockReviewers（含 codex/gpt-5-6-sol），runOne 拿到 member 第 7 參數含 harness／quotaBucket', async () => {
+    const called = await membersFor('block')
+    assert.deepEqual(called.map((m) => m.name), ['agy/opus', 'agy/gemini', 'codex/gpt-5-6-sol'])
+    assert.deepEqual(called[2], { name: 'codex/gpt-5-6-sol', harness: 'codex', quotaBucket: 'openai' })
   })
 
-  test('codexTier: "block" ＋ standard tier ⇒ members 不含 codex', async () => {
-    const repo = makeRepo({ codexTier: 'block' })
+  test('standard tier ⇒ members ＝ reviewers（不含 codex）', async () => {
+    const called = await membersFor('standard')
+    assert.deepEqual(called.map((m) => m.name), ['agy/opus', 'agy/gemini'])
+  })
+
+  test('🔴 council review 寫 members.json（codex 複審 Q5-IDENTITY）：每位實際跑的成員的身分三元組（來自 config，不是 runner 回報的字串）＋ overall／q／empty／timedOut／invalid／exit／ms；零輸出 ⇒ empty、格式不合 ⇒ invalid、逾時 ⇒ timedOut＋不簽（timeout）', async () => {
+    const repo = makeRepo()
     const brief = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(brief, 'test brief')
     const outDir = path.join(tmpdir('review-'), 'review')
-
-    const membersCalled = []
     const deps = {
-      runOne: (name, model, prompt, cwd, out) => {
-        membersCalled.push(name)
-        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      runOne: (name, model, prompt, cwd, out, timeoutMs, member) => {
+        // 故意回報錯的 name／model：members.json 的身分必須來自 config 成員，不是 runner 回的字串
+        const base = { name: 'runner-said-' + name, model: 'runner-said-' + model, exit: 0, ms: 12, denied: [] }
+        if (member.harness === 'codex') return { ...base, empty: false, text: 'Q1：簽｜ok｜無\n' /* 沒有「整份」那行 ⇒ invalid */ }
+        if (member.model === 'gemini-3.1-pro-high') return { ...base, exit: null, signal: 'SIGTERM', timedOut: true, empty: true, text: '' }
+        return { ...base, empty: false, text: 'Q1：簽｜ok｜無\nQ2：不簽｜x｜y\n整份：不簽' }
       },
     }
-
-    const code = await councilMain(
-      ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir],
-      deps
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'block', '--out', outDir], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 3, '有零輸出成員 ⇒ 3')
+    const file = path.join(outDir, 'members.json')
+    assert.ok(fs.existsSync(file), 'members.json 應存在')
+    const members = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.deepEqual(
+      members.map(({ name, harness, model, quotaBucket }) => ({ name, harness, model, quotaBucket })),
+      [
+        { name: 'agy/opus', ...M.agyOpus },
+        { name: 'agy/gemini', ...M.agyGemini },
+        { name: 'codex/gpt-5-6-sol', ...M.codexSol },
+      ],
+      '身分三元組來自 config 成員（runner 回報的 runner-said-* 不得混進來）'
     )
-    assert.equal(code, 0)
-    assert.ok(!membersCalled.includes('codex'), `codexTier: "block" 時 standard tier 不應出席 codex，實際成員：${membersCalled.join(', ')}`)
+    const [opus, gemini, codex] = members
+    assert.deepEqual({ overall: opus.overall, q: opus.q, empty: opus.empty, timedOut: opus.timedOut, invalid: opus.invalid, exit: opus.exit, ms: opus.ms }, { overall: '不簽', q: { Q1: '簽', Q2: '不簽' }, empty: false, timedOut: false, invalid: false, exit: 0, ms: 12 })
+    assert.deepEqual({ overall: gemini.overall, empty: gemini.empty, timedOut: gemini.timedOut, invalid: gemini.invalid, exit: gemini.exit, signal: gemini.signal }, { overall: '不簽（timeout）', empty: true, timedOut: true, invalid: false, exit: null, signal: 'SIGTERM' })
+    assert.deepEqual({ overall: codex.overall, empty: codex.empty, timedOut: codex.timedOut, invalid: codex.invalid }, { overall: null, empty: false, timedOut: false, invalid: true })
+    // 每一項都是 ticket／publish 認得的身分形狀
+    for (const m of members) for (const k of ['name', 'harness', 'model', 'quotaBucket']) assert.equal(typeof m[k], 'string', `${k} 要是字串`)
   })
 
-  test('codexTier 非法值 ⇒ loadConfig throw', () => {
-    const repo = makeRepo({ codexTier: 'invalid-tier' })
-    assert.throws(
-      () => loadConfig(repo.dir),
-      /config codexTier 不支援.*預期 "block" 或 "all"/
-    )
+  test('--coordinator agy 明示旗標優先於 env（env 是 claude）⇒ standard members ＝ agy profile 的 reviewers（codex/gpt-5-6-sol）', async () => {
+    const called = await membersFor('standard', ['--coordinator', 'agy'])
+    assert.deepEqual(called.map((m) => m.name), ['codex/gpt-5-6-sol'])
+  })
+
+  test('runOne 依 harness 派：codex 成員走 runCodexAsync 且帶 effort（成員未設 ⇒ high；設 medium ⇒ medium）；agy 成員走 runAgyAsync 且提示以 NO_EXEC_HEADER 開頭；codex 不加', async () => {
+    const repo = makeRepo({
+      profiles: v2Profiles({ claude: { blockReviewers: [M.agyGemini, M.codexSol, { ...M.codexSol, model: 'gpt-5.6-mini', effort: 'medium' }] } }),
+    })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    const codexCalls = []
+    const agyCalls = []
+    const deps = {
+      runCodexAsync: async (args) => {
+        codexCalls.push(args)
+        return { exit: 0, signal: null, timedOut: false, stdout: '整份：簽', stderr: '' }
+      },
+      runAgyAsync: async (args) => {
+        agyCalls.push(args)
+        return { exit: 0, signal: null, timedOut: false, stdout: '', stderr: '', result: { response: '整份：簽' }, denied: [] }
+      },
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'block', '--out', outDir], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.equal(agyCalls.length, 1)
+    assert.equal(agyCalls[0].mode, 'plan')
+    assert.ok(agyCalls[0].prompt.startsWith(NO_EXEC_HEADER), 'agy 提示要以 NO_EXEC_HEADER 開頭')
+    assert.equal(codexCalls.length, 2)
+    assert.equal(codexCalls[0].effort, 'high')
+    assert.equal(codexCalls[1].effort, 'medium')
+    assert.ok(!codexCalls[0].prompt.startsWith(NO_EXEC_HEADER), 'codex 提示不加 NO_EXEC_HEADER')
+    assert.ok(codexCalls[0].prompt.startsWith(REVIEW_PROMPT_SENTINEL), 'codex 提示第一行是複審哨兵')
+    // 輸出檔名：/ ⇒ -
+    assert.ok(fs.existsSync(path.join(outDir, 'agy-gemini.txt')))
+    assert.ok(fs.existsSync(path.join(outDir, 'codex-gpt-5-6-sol.txt')))
+    assert.ok(fs.existsSync(path.join(outDir, 'codex-gpt-5-6-mini.txt')))
+  })
+
+  test('buildCodexArgs 帶 effort medium ⇒ argv 含 model_reasoning_effort="medium"', () => {
+    const args = buildCodexArgs({ model: 'gpt-5.6-sol', prompt: 'p', effort: 'medium', cwd: '/w' })
+    assert.ok(args.includes('model_reasoning_effort="medium"'))
+    assert.ok(args.includes('read-only'))
+  })
+})
+
+describe('P5：寫手逾時 ⇒ write.main 回 3、寫 timeout.json、台帳 FAIL_timeout（不續話、不跑 --test）', () => {
+  test('deps.runAgy 回 timedOut: true（spawnSync 逾時形狀：exit null、signal SIGTERM）⇒ 回 3、timeout.json 含 round 與 timeoutMs、runTest 沒被呼叫', () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test')
+    const outDir = path.join(repo.dir, '.agy-write')
+    let testCalls = 0
+    let runCalls = 0
+    const deps = {
+      assertSettings: () => true,
+      runAgy: () => {
+        runCalls++
+        return { exit: null, signal: 'SIGTERM', timedOut: true, stdout: '', stderr: '', denied: [], steps: [], result: null, conversationId: null }
+      },
+      runTest: () => {
+        testCalls++
+        return { exit: 0, out: 'ok' }
+      },
+    }
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = writeMain(['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir, '--test', 'node --test', '--timeout-ms', '1234'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 3)
+    assert.equal(runCalls, 1, '逾時後不准續話再跑一輪')
+    assert.equal(testCalls, 0, '逾時後不跑 --test')
+    const t = JSON.parse(fs.readFileSync(path.join(outDir, 'timeout.json'), 'utf8'))
+    assert.equal(t.round, 1)
+    assert.equal(t.timeoutMs, 1234)
+    const ledger = fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(ledger[ledger.length - 1].verdict, 'FAIL_timeout')
+    assert.match(errs.join('\n'), /寫手逾時/)
+  })
+
+  test('陽性對照：同一組 deps 但 runAgy 正常回 ⇒ 回 0、沒有 timeout.json', () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test')
+    const outDir = path.join(repo.dir, '.agy-write')
+    const deps = {
+      assertSettings: () => true,
+      runAgy: () => ({ exit: 0, stdout: '', stderr: '', denied: [], steps: [], result: { response: 'ok', conversation_id: 'c1' }, conversationId: 'c1' }),
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const code = writeMain(['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir, '--test', 'node --test'], deps)
+    assert.equal(code, 0)
+    assert.ok(!fs.existsSync(path.join(outDir, 'timeout.json')))
+  })
+
+  test('spawnTimedOut：spawnSync 的 error.code ETIMEDOUT 也算逾時（parseAgyRun.timedOut 為 true）', () => {
+    assert.equal(spawnTimedOut({ status: null, signal: 'SIGTERM', error: { code: 'ETIMEDOUT' } }), true)
+    assert.equal(spawnTimedOut({ status: null, signal: 'SIGTERM' }), false)
+    assert.equal(spawnTimedOut({ timedOut: true }), true)
+    const parsed = parseAgyRun({ status: null, signal: 'SIGTERM', stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } })
+    assert.equal(parsed.timedOut, true)
   })
 })
 
@@ -1564,7 +2193,9 @@ describe('git 環境剝除：cleanGitEnv 真實生效', () => {
       mode: 'plan',
       prompt: 'test',
       cwd: process.cwd(),
-      env: { PATH: '/custom/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y' },
+      // AGY_BIN 走 resolveAgyBin 的覆寫路徑：spawn 是假的，binary 不會被執行，
+      // 但沒有它 runAgy 會在沒裝 cask 的機器（GitHub Actions）先 throw（H9e，2026-09-14 GuildHub CI 坐實）。
+      env: { PATH: '/custom/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y', AGY_BIN: '/fake/agy' },
       spawn: fakeSpawn,
     })
     assert.ok(capturedSpawnEnv, 'spawn 應被呼叫')
@@ -1700,6 +2331,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
       config: TEST_CONFIG,
       agyBin: '/mock/bin/antigravity',
       which: (bin) => `/mock/bin/${bin}`,
+      runVersion: () => ({ exit: 0, out: 'mock 1.0' }),
       env: { HOME: fakeHome, LLM_TEAM_GUARD: guardFile },
       runAgyHooks: () => hooksResult,
     }
@@ -1735,7 +2367,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.log = (m) => logs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.log = origLog
     }
@@ -1758,7 +2390,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1791,7 +2423,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1806,7 +2438,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1829,13 +2461,14 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
       config: TEST_CONFIG,
       agyBin: null,
       which: (bin) => `/mock/bin/${bin}`,
+      runVersion: () => ({ exit: 0, out: 'mock 1.0' }),
     }
     const errs = []
     const origErr = console.error
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1886,7 +2519,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.log = (m) => logs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.log = origLog
     }
@@ -1918,7 +2551,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1941,7 +2574,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -1964,7 +2597,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.error = origErr
     }
@@ -2011,7 +2644,7 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     console.log = (m) => logs.push(String(m))
     let code
     try {
-      code = setupMain(['--check'], deps)
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
     } finally {
       console.log = origLog
     }
@@ -2062,6 +2695,423 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     }
 
     assert.deepEqual(candidatesUnset, expected.slice(1), '未設時候選清單應為後三項真路徑')
+  })
+
+  test('缺 --coordinator（deps.env 也沒有）⇒ exit 2、stderr 含用法與可用 profiles；--coordinator nope ⇒ exit 2 含「不存在」', () => {
+    const deps = makeValidSetupDeps(null)
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    let code2
+    try {
+      code = setupMain(['--check'], deps)
+      code2 = setupMain(['--check', '--coordinator', 'nope'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(code2, 2)
+    const err = errs.join('\n')
+    assert.match(err, /--check --coordinator <claude\|agy\|codex>/)
+    assert.match(err, /可用 profiles：claude, agy, codex/)
+    assert.match(err, /統整者 profile 不存在：nope/)
+  })
+
+  test('[config] 行印出 profile 名單；角色用到的 harness 缺 binary ⇒ 紅並指名是哪個角色需要它（agy profile：codex 找不到 ⇒ reviewers[codex/gpt-5-6-sol]）', () => {
+    const deps = makeValidSetupDeps({ exit: 0, stdout: JSON.stringify({ command: { data: { hooks: [] } } }) })
+    deps.which = (bin) => (bin === 'codex' ? null : `/mock/bin/${bin}`)
+    const logs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => logs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const out = logs.join('\n')
+    assert.match(out, /\[config\] ✓ schema v2、profile agy：統整者 agy\/gemini〔gemini〕/)
+    assert.match(out, /一般票複審 codex\/gpt-5-6-sol〔openai〕/)
+    assert.match(out, /\[執行檔 agy\] ✓ .*需要它的角色：統整者、寫手/)
+    assert.match(out, /\[執行檔 codex\] ✗ 找不到 — 需要它的角色：reviewers\[codex\/gpt-5-6-sol\]、blockReviewers\[codex\/gpt-5-6-sol\]/)
+    assert.match(errs.join('\n'), /harness codex 的 binary 找不到；reviewers\[codex\/gpt-5-6-sol\]/)
+    // agy profile 沒有任何 claude 角色 ⇒ 不印 [執行檔 claude]
+    assert.doesNotMatch(out, /\[執行檔 claude\]/)
+  })
+
+  test('🔴 統整者 binary 也查（codex 複審 Q6）：codex profile 缺 codex binary、其餘全綠 ⇒ exit 1 並指名「統整者」；claude profile 缺 claude binary ⇒ exit 1 指名「統整者」（陽性對照：harnessRoles 不算統整者就回 0）', () => {
+    // codex profile：hooks.json＋canary 都對，只有 codex binary 找不到
+    const { deps } = makeCodexDeps({ hooksJson: hooksPointingAt(ADAPTER_REAL) })
+    deps.which = (bin) => (bin === 'codex' ? null : `/mock/bin/${bin}`)
+    const logs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => logs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'codex'], deps)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const out = logs.join('\n')
+    assert.equal(code, 1, out)
+    assert.match(out, /\[codex hooks\.json\] ✓/, '其餘檢查都綠，紅的只有統整者 binary')
+    assert.match(out, /\[codex canary\] ✓/)
+    assert.match(out, /\[執行檔 codex\] ✗ 找不到 — 需要它的角色：統整者/)
+    assert.match(errs.join('\n'), /harness codex 的 binary 找不到；統整者 會在第一次呼叫就死/)
+
+    // claude profile：claude binary 找不到
+    const base = makeValidSetupDeps(null)
+    const claudeSettings = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(claudeSettings, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '/x/block-dangerous.sh' }] }] } }))
+    const deps2 = { ...base, env: { ...base.env, CLAUDE_SETTINGS: claudeSettings }, which: (bin) => (bin === 'claude' ? null : `/mock/bin/${bin}`) }
+    const logs2 = []
+    console.log = (m) => logs2.push(String(m))
+    console.error = () => {}
+    let code2
+    try {
+      code2 = setupMain(['--check', '--coordinator', 'claude'], deps2)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const out2 = logs2.join('\n')
+    assert.equal(code2, 1, out2)
+    assert.match(out2, /\[claude hooks\] ✓/)
+    assert.match(out2, /\[執行檔 claude\] ✗ 找不到 — 需要它的角色：統整者/)
+    // 陽性對照：harnessRoles 把統整者算進去（codex profile 的 codex 只有統整者一個角色）
+    assert.deepEqual(harnessRoles(modelsFrom(TEST_CONFIG, {}, 'codex')).get('codex'), ['統整者'])
+    assert.deepEqual(harnessRoles(modelsFrom(TEST_CONFIG, {}, 'claude')).get('claude'), ['統整者'])
+    assert.deepEqual(harnessRoles(modelsFrom(TEST_CONFIG, {}, 'agy')).get('agy'), ['統整者', '寫手'])
+  })
+
+  test('claude 統整者 binary 走 env CLAUDE_BIN（真的 spawn `--version`，注入假 binary）：假 claude 印版本 ⇒ [執行檔 claude] ✓ 含路徑與版本字串；假 claude --version 回 1 ⇒ 紅', () => {
+    const binDir = tmpdir('fake-bins-')
+    const fakeClaude = path.join(binDir, 'claude')
+    fs.writeFileSync(fakeClaude, '#!/bin/sh\necho "9.9.9 (Claude Code fake)"\n')
+    fs.chmodSync(fakeClaude, 0o755)
+    const fakeCodex = path.join(binDir, 'codex')
+    fs.writeFileSync(fakeCodex, '#!/bin/sh\necho "codex-cli 0.0.0-fake"\n')
+    fs.chmodSync(fakeCodex, 0o755)
+    const brokenClaude = path.join(binDir, 'claude-broken')
+    fs.writeFileSync(brokenClaude, '#!/bin/sh\nexit 1\n')
+    fs.chmodSync(brokenClaude, 0o755)
+    const base = makeValidSetupDeps(null)
+    delete base.runVersion // 真的 spawn
+    const claudeSettings = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(claudeSettings, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '/x/block-dangerous.sh' }] }] } }))
+    const run = (claudeBin) => {
+      const deps = {
+        ...base,
+        env: { ...base.env, CLAUDE_SETTINGS: claudeSettings, CLAUDE_BIN: claudeBin },
+        which: (bin) => (bin === 'codex' ? fakeCodex : `/mock/bin/${bin}`),
+      }
+      const logs = []
+      const origLog = console.log
+      const origErr = console.error
+      console.log = (m) => logs.push(String(m))
+      console.error = () => {}
+      let code
+      try {
+        code = setupMain(['--check', '--coordinator', 'claude'], deps)
+      } finally {
+        console.log = origLog
+        console.error = origErr
+      }
+      return { code, out: logs.join('\n') }
+    }
+    const ok = run(fakeClaude)
+    assert.equal(ok.code, 0, ok.out)
+    assert.ok(ok.out.includes(`[執行檔 claude] ✓ (${fakeClaude}，9.9.9 (Claude Code fake)) — 需要它的角色：統整者`), ok.out)
+    assert.ok(ok.out.includes(`[執行檔 codex] ✓ (${fakeCodex}，codex-cli 0.0.0-fake)`), ok.out)
+    const bad = run(brokenClaude)
+    assert.equal(bad.code, 1)
+    assert.match(bad.out, /\[執行檔 claude\] ✗ --version exit 1 — 需要它的角色：統整者/)
+  })
+
+  test('--version 非 0 ⇒ 該 harness 紅（--version exit 1）', () => {
+    const deps = makeValidSetupDeps({ exit: 0, stdout: JSON.stringify({ command: { data: { hooks: [] } } }) })
+    deps.runVersion = () => ({ exit: 1, out: '' })
+    const logs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => logs.push(String(m))
+    console.error = () => {}
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(logs.join('\n'), /\[執行檔 codex\] ✗ --version exit 1/)
+  })
+
+  /** codex 統整者的環境：CODEX_HOME 放 hooks.json；守門用會 deny 含 --force 指令的假 guard。 */
+  function makeCodexDeps({ hooksJson, guardDenies = true } = {}) {
+    const repo = makeRepo()
+    const settingsFile = makeSettings(GOOD_ALLOW)
+    const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+    s.permissions.allow.push(`read_file(${repo.dir}/)`)
+    s.trustedWorkspaces = [repo.dir]
+    fs.writeFileSync(settingsFile, JSON.stringify(s))
+    const fakeHome = tmpdir('setup-codex-home-')
+    const guardFile = path.join(fakeHome, 'guard.sh')
+    fs.writeFileSync(
+      guardFile,
+      guardDenies
+        ? '#!/usr/bin/env bash\nINPUT="$(cat)"\nif echo "$INPUT" | grep -q -- "--force"; then echo "BLOCKED force" >&2; exit 2; fi\nexit 0\n'
+        : '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n'
+    )
+    const codexHome = path.join(fakeHome, '.codex')
+    fs.mkdirSync(codexHome, { recursive: true })
+    if (hooksJson !== undefined) {
+      fs.writeFileSync(path.join(codexHome, 'hooks.json'), typeof hooksJson === 'string' ? hooksJson : JSON.stringify(hooksJson))
+    }
+    return {
+      deps: {
+        repoRoot: repo.dir,
+        settingsFile,
+        config: TEST_CONFIG,
+        agyBin: '/mock/bin/antigravity',
+        which: (bin) => `/mock/bin/${bin}`,
+        runVersion: () => ({ exit: 0, out: 'mock 1.0' }),
+        env: { HOME: fakeHome, CODEX_HOME: codexHome, LLM_TEAM_GUARD: guardFile },
+      },
+      codexHome,
+      fakeHome,
+    }
+  }
+  const ADAPTER_REAL = fileURLToPath(new URL('./codex-pretooluse.sh', import.meta.url))
+  const hooksPointingAt = (cmd) => ({ hooks: { PreToolUse: [{ matcher: '^Bash$', hooks: [{ type: 'command', command: cmd, timeout: 10 }] }] } })
+
+  test('codex 統整者綠：hooks.json 指到轉接器絕對路徑（可執行）＋ canary deny ⇒ exit 0，印 [codex hooks.json] ✓、[codex canary] ✓、[提醒] workspace-write', () => {
+    const { deps } = makeCodexDeps({ hooksJson: hooksPointingAt(ADAPTER_REAL) })
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'codex'], deps)
+    } finally {
+      console.log = origLog
+    }
+    const out = logs.join('\n')
+    assert.equal(code, 0, out)
+    assert.match(out, /\[codex hooks\.json\] ✓/)
+    assert.match(out, /\[codex canary\] ✓ force push ⇒ deny/)
+    assert.match(out, /\[提醒\] codex 統整 session 要用：codex -m gpt-5\.6-sol --sandbox workspace-write -c 'sandbox_workspace_write\.network_access=true' -c model_reasoning_effort="medium"/)
+    assert.match(out, /\[執行檔 agy\] ✓ .*需要它的角色：寫手、reviewers\[agy\/gemini\]/)
+    assert.match(out, /\[執行檔 codex\] ✓ \(\/mock\/bin\/codex，mock 1\.0\) — 需要它的角色：統整者/, '統整者自己的 harness 也查')
+    assert.doesNotMatch(out, /\[hook:block-dangerous\]/, 'agy hooks 檢查只在 agy 統整者')
+  })
+
+  test('codex 統整者紅：hooks.json 不存在／command 是相對路徑／指到別的檔／壞 JSON／沒 PreToolUse／不可執行 ⇒ 各 exit 1 且 [codex hooks.json] ✗ 指名原因', () => {
+    const cases = [
+      { hooksJson: undefined, why: /不存在：/ },
+      { hooksJson: hooksPointingAt('./codex-pretooluse.sh'), why: /不是絕對路徑或 realpath 不等於轉接器/ },
+      { hooksJson: hooksPointingAt('/usr/bin/true'), why: /realpath 不等於轉接器/ },
+      { hooksJson: '{not json', why: /解析失敗/ },
+      { hooksJson: { hooks: { PreToolUse: [] } }, why: /沒有 hooks\.PreToolUse/ },
+    ]
+    for (const c of cases) {
+      const { deps } = makeCodexDeps({ hooksJson: c.hooksJson })
+      const logs = []
+      const origLog = console.log
+      const origErr = console.error
+      console.log = (m) => logs.push(String(m))
+      console.error = () => {}
+      let code
+      try {
+        code = setupMain(['--check', '--coordinator', 'codex'], deps)
+      } finally {
+        console.log = origLog
+        console.error = origErr
+      }
+      assert.equal(code, 1, `case ${c.why.source} 應紅`)
+      const line = logs.find((l) => l.startsWith('[codex hooks.json]'))
+      assert.ok(line && line.includes('✗'), `應印 ✗：${line}`)
+      assert.match(line, c.why)
+    }
+    // 不可執行：把轉接器複製成 0644，並讓 setup.mjs 的鄰居就是那份副本
+    const { deps, fakeHome } = makeCodexDeps({ hooksJson: undefined })
+    const copy = path.join(fakeHome, 'codex-pretooluse.sh')
+    fs.copyFileSync(ADAPTER_REAL, copy)
+    fs.chmodSync(copy, 0o644)
+    fs.writeFileSync(path.join(deps.env.CODEX_HOME, 'hooks.json'), JSON.stringify(hooksPointingAt(copy)))
+    deps.importMetaUrl = pathToFileURL(path.join(fakeHome, 'setup.mjs')).href
+    const logs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => logs.push(String(m))
+    console.error = () => {}
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'codex'], deps)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(logs.find((l) => l.startsWith('[codex hooks.json]')), /不可執行/)
+  })
+
+  test('🔴 codex hooks.json matcher（codex 複審 Q4-MATCHER）：^Read$ ⇒ 紅 [codex hooks.json] ✗ matcher 不涵蓋 Bash、exit 1（陽性對照）；^Bash$ ⇒ 綠；無 matcher ⇒ 綠；"Bash|Read" ⇒ 綠；同檔另一項 ^Read$ 指到別的 hook 不影響', () => {
+    const withMatcher = (matcher, cmd = ADAPTER_REAL) => {
+      const entry = { hooks: [{ type: 'command', command: cmd, timeout: 10 }] }
+      if (matcher !== undefined) entry.matcher = matcher
+      return { hooks: { PreToolUse: [entry] } }
+    }
+    const run = (hooksJson) => {
+      const { deps } = makeCodexDeps({ hooksJson })
+      const logs = []
+      const errs = []
+      const origLog = console.log
+      const origErr = console.error
+      console.log = (m) => logs.push(String(m))
+      console.error = (m) => errs.push(String(m))
+      let code
+      try {
+        code = setupMain(['--check', '--coordinator', 'codex'], deps)
+      } finally {
+        console.log = origLog
+        console.error = origErr
+      }
+      return { code, line: logs.find((l) => l.startsWith('[codex hooks.json]')) || '', errs: errs.join('\n') }
+    }
+    // 陽性對照：路徑對、可執行、canary 也會 deny，只有 matcher 錯 ⇒ 必須紅
+    const bad = run(withMatcher('^Read$'))
+    assert.equal(bad.code, 1, bad.line)
+    assert.match(bad.line, /^\[codex hooks\.json\] ✗ matcher 不涵蓋 Bash/)
+    assert.match(bad.line, /"\^Read\$"/)
+    assert.match(bad.errs, /codex hooks\.json 沒接上 codex-pretooluse\.sh（matcher 不涵蓋 Bash/)
+    // 壞 regex 也紅（fail-closed）
+    const broken = run(withMatcher('^Bash('))
+    assert.equal(broken.code, 1)
+    assert.match(broken.line, /matcher 不涵蓋 Bash/)
+    // 綠：^Bash$／無 matcher／Bash|Read／*
+    for (const m of ['^Bash$', undefined, 'Bash|Read', '*', '']) {
+      const ok = run(withMatcher(m))
+      assert.equal(ok.code, 0, `matcher ${JSON.stringify(m)} 應綠：${ok.line}`)
+      assert.match(ok.line, /^\[codex hooks\.json\] ✓/)
+    }
+    // 同檔兩項：^Read$ 指到轉接器、^Bash$ 也指到轉接器 ⇒ 綠（找得到一項會對 Bash 觸發）
+    const two = run({
+      hooks: {
+        PreToolUse: [
+          { matcher: '^Read$', hooks: [{ type: 'command', command: ADAPTER_REAL }] },
+          { matcher: '^Bash$', hooks: [{ type: 'command', command: ADAPTER_REAL }] },
+        ],
+      },
+    })
+    assert.equal(two.code, 0, two.line)
+    // 只有 ^Read$ 那項指到轉接器、^Bash$ 指到別的檔 ⇒ 紅（別的檔不是轉接器；轉接器那項對 Bash 不觸發）
+    const wrong = run({
+      hooks: {
+        PreToolUse: [
+          { matcher: '^Read$', hooks: [{ type: 'command', command: ADAPTER_REAL }] },
+          { matcher: '^Bash$', hooks: [{ type: 'command', command: '/usr/bin/true' }] },
+        ],
+      },
+    })
+    assert.equal(wrong.code, 1)
+    assert.match(wrong.line, /matcher 不涵蓋 Bash/)
+  })
+
+  test('codexMatcherCoversShell／codexPreToolUseEntries：缺／null／""／* ⇒ true；^Read$ ⇒ false；^Bash$／Bash／Bash|Read ⇒ true；壞 regex ⇒ false；陣列任一；entries 帶外層 matcher', () => {
+    assert.equal(codexMatcherCoversShell(undefined), true)
+    assert.equal(codexMatcherCoversShell(null), true)
+    assert.equal(codexMatcherCoversShell(''), true)
+    assert.equal(codexMatcherCoversShell('*'), true)
+    assert.equal(codexMatcherCoversShell('^Read$'), false)
+    assert.equal(codexMatcherCoversShell('^Bash$'), true)
+    assert.equal(codexMatcherCoversShell('Bash'), true)
+    assert.equal(codexMatcherCoversShell('Bash|Read'), true)
+    assert.equal(codexMatcherCoversShell('^Bash('), false)
+    assert.equal(codexMatcherCoversShell(42), false)
+    assert.equal(codexMatcherCoversShell(['^Read$', '^Bash$']), true)
+    assert.equal(codexMatcherCoversShell(['^Read$', '^Edit$']), false)
+    assert.deepEqual(
+      codexPreToolUseEntries({ hooks: { PreToolUse: [{ matcher: '^Read$', hooks: [{ type: 'command', command: '/a' }] }, { hooks: [{ type: 'command', command: '/b' }] }] } }),
+      [{ matcher: '^Read$', command: '/a' }, { matcher: undefined, command: '/b' }]
+    )
+  })
+
+  test('codex canary 紅（陽性對照）：hooks.json 正確但守門對 --force 放行 ⇒ [codex canary] ✗、exit 1', () => {
+    const { deps } = makeCodexDeps({ hooksJson: hooksPointingAt(ADAPTER_REAL), guardDenies: false })
+    const logs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => logs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'codex'], deps)
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    assert.match(logs.join('\n'), /\[codex hooks\.json\] ✓/)
+    assert.match(logs.join('\n'), /\[codex canary\] ✗/)
+    assert.match(errs.join('\n'), /codex deny canary 失敗/)
+  })
+
+  test('claude 統整者：CLAUDE_SETTINGS hooks.PreToolUse 有 block-dangerous ⇒ 綠；沒有／檔不存在 ⇒ 紅 [claude hooks] ✗', () => {
+    const base = makeValidSetupDeps(null)
+    const good = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(good, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '$HOME/.claude/hooks/block-dangerous.sh' }] }] } }))
+    const bad = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(bad, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '/x/other.sh' }] }] } }))
+
+    const run = (settingsPath) => {
+      const deps = { ...base, env: { ...base.env, CLAUDE_SETTINGS: settingsPath } }
+      const logs = []
+      const origLog = console.log
+      const origErr = console.error
+      console.log = (m) => logs.push(String(m))
+      console.error = () => {}
+      let code
+      try {
+        code = setupMain(['--check', '--coordinator', 'claude'], deps)
+      } finally {
+        console.log = origLog
+        console.error = origErr
+      }
+      return { code, out: logs.join('\n') }
+    }
+    const g = run(good)
+    assert.equal(g.code, 0, g.out)
+    assert.match(g.out, /\[claude hooks\] ✓/)
+    assert.match(g.out, /\[config\] ✓ schema v2、profile claude：統整者 claude\/claude-code〔anthropic〕/)
+    assert.match(g.out, /\[執行檔 codex\] ✓ .*blockReviewers\[codex\/gpt-5-6-sol\]、adjudicator\[codex\/gpt-5-6-sol\]/)
+    assert.match(g.out, /\[執行檔 claude\] ✓ \(\/mock\/bin\/claude，mock 1\.0\) — 需要它的角色：統整者/, '統整者自己的 harness 也查')
+    assert.doesNotMatch(g.out, /\[hook:block-dangerous\]/)
+    const b = run(bad)
+    assert.equal(b.code, 1)
+    assert.match(b.out, /\[claude hooks\] ✗ hooks\.PreToolUse 沒有 command 含 block-dangerous/)
+    const m = run(path.join(tmpdir('nope-'), 'settings.json'))
+    assert.equal(m.code, 1)
+    assert.match(m.out, /\[claude hooks\] ✗ 不存在/)
+  })
+
+  test('claudeSettingsHasDangerousHook／codexPreToolUseCommands：形狀判定', () => {
+    assert.equal(claudeSettingsHasDangerousHook({}), false)
+    assert.equal(claudeSettingsHasDangerousHook({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'a/block-dangerous.sh' }] }] } }), true)
+    assert.equal(claudeSettingsHasDangerousHook({ hooks: { PreToolUse: [{ hooks: [{ type: 'prompt', command: 'block-dangerous' }] }] } }), false)
+    assert.deepEqual(codexPreToolUseCommands({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: '/a' }, { type: 'command', command: '/b' }] }] } }), ['/a', '/b'])
+    assert.deepEqual(codexPreToolUseCommands({ hooks: { PostToolUse: [] } }), [])
   })
 
   test('resolveGuardPath 回的值必在 guardCandidates 陣列內', () => {

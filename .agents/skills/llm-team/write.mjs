@@ -22,7 +22,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
-  modelsFrom,
+  writerFrom,
   runAgy,
   git,
   changedFiles,
@@ -101,8 +101,15 @@ export function main(argv, deps = {}) {
     return 2
   }
 
-  const models = modelsFrom(config)
-  const model = a.model || models.writer
+  // 🔴 寫手 harness 只准 agy（本檔就是 agy runner）：writerFrom 讀者側再驗一次，deps.config 注入也繞不過（陽性對照 llm-team.test.mjs「🔴 writer.harness 只准 agy」）。
+  let writer
+  try {
+    writer = writerFrom(config)
+  } catch (e) {
+    console.error(`🔴 config 載入失敗：${e.message}`)
+    return 2
+  }
+  const model = a.model || writer.model
   const rawMaxRounds = a['max-rounds'] !== undefined ? Number(a['max-rounds']) : config.maxRounds
   const maxRounds = Number(rawMaxRounds || 3)
   if (maxRounds > 5) {
@@ -200,6 +207,32 @@ export function main(argv, deps = {}) {
       extraArgs,
       timeoutMs,
     })
+
+    // 🔴 P5（2026-09-14）：寫手逾時（spawnSync timeout ⇒ status null、signal SIGTERM）以前會落進 G3 的 FAIL_headless，
+    //    ticket 分不出「被拒」與「逾時」，而且 exit 3 後仍跑 --test 再開 council（拿半成品去複審）。
+    //    這裡先於 conversation id 檢查判逾時：寫 <outDir>/timeout.json 讓 ticket 讀得到 writeTimedOut，台帳 FAIL_timeout，回 3。
+    //    陽性對照：llm-team.test.mjs「P5：deps.runAgy 回 timedOut ⇒ main 回 3、timeout.json 存在、台帳 FAIL_timeout」。
+    if (r.timedOut === true) {
+      fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
+      fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
+      fs.writeFileSync(
+        path.join(outDir, 'timeout.json'),
+        JSON.stringify({ round, timeoutMs, signal: r.signal || null, at: new Date().toISOString() }, null, 2)
+      )
+      ledgerAppend(ledger, {
+        ...baseEntry,
+        round,
+        model,
+        baseline,
+        exit: r.exit ?? null,
+        signal: r.signal || null,
+        timeoutMs,
+        conversationId,
+        verdict: 'FAIL_timeout',
+      })
+      console.error(`🔴 第 ${round} 輪：寫手逾時（${timeoutMs} ms，signal=${r.signal || null}），不續話、回統整者。`)
+      return 3
+    }
 
     // 🔴 agy 無頭第 6 坑（2026-09-13 H1 票，統整者親自坐實）：--continue 續的是「最近一個對話」；
     //    統整者本身是 agy 互動 session 時會續到統整者的對話而不是寫手的，而且 exit 0。

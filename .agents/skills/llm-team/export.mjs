@@ -22,9 +22,12 @@ export const EXPORT_FILES = [
   'export.test.mjs',
   'agy-pretooluse.sh',
   'agy-pretooluse.test.mjs',
+  'codex-pretooluse.sh',
+  'codex-pretooluse.test.mjs',
   'SKILL.md',
   'test.sh',
   'VERSION',
+  'config.json',
 ]
 
 export const MANIFEST_REQUIRED = [...EXPORT_FILES, 'SOURCE.json'].sort()
@@ -115,7 +118,13 @@ export function verifySnapshot(snapshotDir, options = {}) {
   for (const req of manifestRequired) {
     if (!manifestEntries.has(req)) {
       const fullPath = path.join(snapshotDir, req)
-      if (fs.existsSync(fullPath)) {
+      let reqStat
+      try {
+        reqStat = fs.lstatSync(fullPath)
+      } catch {
+        reqStat = null
+      }
+      if (reqStat) {
         unlisted.push(req)
       } else if (hasSourceFilesField) {
         if (sourceFiles.has(req)) {
@@ -133,6 +142,7 @@ export function verifySnapshot(snapshotDir, options = {}) {
     }
   }
 
+  // 🔴 事故：2026-09-14 GuildHub-frontend 快照複審第 2 輪 codex Q2 指出 manifest 內檔案被同內容 symlink 取代會被 readFileSync 跟隨放行；陽性對照：export.test.mjs「manifest 檔被換成同內容 symlink ⇒ ok 為 false 且 changed 含該檔」；停止條件：快照改成單一 tar／簽章檔那天拆掉。
   for (const [relPath, expectedHash] of manifestEntries.entries()) {
     if (!manifestRequired.includes(relPath)) {
       if (!extra.includes(relPath)) {
@@ -140,8 +150,16 @@ export function verifySnapshot(snapshotDir, options = {}) {
       }
     }
     const fullPath = path.join(snapshotDir, relPath)
-    if (!fs.existsSync(fullPath)) {
+    let stat
+    try {
+      stat = fs.lstatSync(fullPath)
+    } catch {
+      stat = null
+    }
+    if (!stat) {
       missing.push(relPath)
+    } else if (!stat.isFile()) {
+      changed.push(relPath)
     } else {
       const actualHash = crypto
         .createHash('sha256')
@@ -153,7 +171,7 @@ export function verifySnapshot(snapshotDir, options = {}) {
     }
   }
 
-  // 🔴 事故：2026-09-13 GuildHub-frontend 快照複審 codex 指出 .json／無副檔名檔靜默放行；陽性對照：export.test.mjs「乾淨快照 + x.json ⇒ extra 含 x.json 且 --sync-check exit 1」、「乾淨快照 + 無副檔名檔 stray ⇒ extra 含 stray 且 --sync-check exit 1」；停止條件：快照改成單一 tar／簽章檔那天拆掉。
+  // 🔴 事故：2026-09-13 GuildHub-frontend 快照複審 codex 指出 .json／無副檔名檔靜默放行；2026-09-14 第 2 輪 codex Q2 指出 symlink／特殊檔靜默略過未計入 extra；陽性對照：export.test.mjs「乾淨快照 + x.json ⇒ extra 含 x.json 且 --sync-check exit 1」、「乾淨快照 + 無副檔名檔 stray ⇒ extra 含 stray 且 --sync-check exit 1」、「乾淨快照 + symlink ⇒ extra 含它 且 --sync-check exit 1」；停止條件：快照改成單一 tar／簽章檔那天拆掉。
   function scan(dir) {
     if (!fs.existsSync(dir)) return
     const entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -161,7 +179,7 @@ export function verifySnapshot(snapshotDir, options = {}) {
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) {
         scan(full)
-      } else if (entry.isFile()) {
+      } else {
         const rel = path.relative(snapshotDir, full)
         if (rel === 'MANIFEST.sha256') continue
         if (!manifestEntries.has(rel) && !extra.includes(rel) && !unlisted.includes(rel)) {

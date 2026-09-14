@@ -17,26 +17,112 @@ import { execFileSync } from 'node:child_process'
 import { CLEAN_GIT_ENV, buildSafeCommandRegex } from './lib.mjs'
 import { main as ticketMain, runCli } from './ticket.mjs'
 import { main as setupMain } from './setup.mjs'
+import { parseVerdicts } from './council.mjs'
 import { EXPORT_FILES } from './export.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
-const TEST_CONFIG = {
-  schemaVersion: 1,
-  branchPrefixes: [],
-  models: {
-    writer: 'gemini-3.8-flash-high',
-    reviewers: ['claude-opus-4-6-thinking', 'gemini-3.1-pro-high'],
-    codex: 'gpt-5.6-sol',
-  },
-  allowCommandHeads: ['npm test', 'bash .github/scripts/test-'],
-  worktreeRoot: '.claude/worktrees',
-  installCommand: '',
-  maxRounds: 3,
-  riskDomains: [],
-  outDir: '.local/llm-team',
+// ─────────────────── schema v2 測試 fixture（與 llm-team.test.mjs 的 v2Config 同形；測試檔不能互相 import） ───────────────────
+// 統整者預設走 env LLM_TEAM_COORDINATOR=claude（等同 `--coordinator claude`）；要驗「缺 --coordinator」的測試自己給 deps.env = {}。
+const M = {
+  agyOpus: { harness: 'agy', model: 'claude-opus-4-6-thinking', quotaBucket: 'agy-claude' },
+  agyGemini: { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' },
+  codexSol: { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' },
+  claudeCode: { harness: 'claude', model: 'claude-code', quotaBucket: 'anthropic' },
+}
+
+function v2Profiles(override = {}) {
+  return {
+    claude: {
+      coordinator: M.claudeCode,
+      reviewers: [M.agyOpus, M.agyGemini],
+      blockReviewers: [M.agyOpus, M.agyGemini, M.codexSol],
+      adjudicator: M.codexSol,
+      blockAdjudicator: 'human',
+      ...(override.claude || {}),
+    },
+    agy: {
+      coordinator: M.agyGemini,
+      reviewers: [M.codexSol],
+      blockReviewers: [M.codexSol],
+      adjudicator: 'human',
+      blockAdjudicator: 'human',
+      ...(override.agy || {}),
+    },
+    codex: {
+      coordinator: { ...M.codexSol, effort: 'medium' },
+      reviewers: [M.agyGemini],
+      blockReviewers: [M.agyGemini],
+      adjudicator: 'human',
+      blockAdjudicator: 'human',
+      ...(override.codex || {}),
+    },
+  }
+}
+
+function v2Config(override = {}) {
+  return {
+    schemaVersion: 2,
+    branchPrefixes: [],
+    writer: { harness: 'agy', model: 'gemini-3.8-flash-high', quotaBucket: 'gemini' },
+    profiles: v2Profiles(),
+    allowCommandHeads: ['npm test', 'bash .github/scripts/test-'],
+    worktreeRoot: '.claude/worktrees',
+    installCommand: '',
+    maxRounds: 3,
+    riskDomains: [],
+    outDir: '.local/llm-team',
+    ...override,
+  }
+}
+
+const TEST_CONFIG = v2Config()
+process.env.LLM_TEAM_COORDINATOR = process.env.LLM_TEAM_COORDINATOR || 'claude'
+
+/** summary.json fixture 的一般票名單（與 v2Config claude profile 的 reviewers 同）。 */
+const ROSTER_STANDARD = [
+  { name: 'agy/opus', ...M.agyOpus },
+  { name: 'agy/gemini', ...M.agyGemini },
+]
+
+// ─────────────────── 假 council 輸出（2026-09-14 Q5：ticket 只認 review/members.json 的實際名單） ───────────────────
+/** 輸出檔名 ⇒ 成員身分三元組。 */
+const MEMBER_BY_FILE = {
+  'agy-opus': { name: 'agy/opus', ...M.agyOpus },
+  'agy-gemini': { name: 'agy/gemini', ...M.agyGemini },
+  'codex-gpt-5-6-sol': { name: 'codex/gpt-5-6-sol', ...M.codexSol },
+}
+const MEMBER_BY_NAME = Object.fromEntries(Object.values(MEMBER_BY_FILE).map((m) => [m.name, m]))
+
+/**
+ * 假 council 的輸出：寫 <file>.txt 與 members.json（模擬 council.mjs review 寫的實際名單＋結果）。
+ * files：{ 'agy-opus': '整份：簽\n', … }；members 預設＝files 每一個（身分查 MEMBER_BY_FILE）；opts.members 可整份覆寫（測名單漂移）。
+ */
+function fakeCouncilOut(reviewOutDir, files, opts = {}) {
+  fs.mkdirSync(reviewOutDir, { recursive: true })
+  for (const [file, text] of Object.entries(files)) fs.writeFileSync(path.join(reviewOutDir, `${file}.txt`), text)
+  const members =
+    opts.members ||
+    Object.keys(files).map((file) => {
+      const m = MEMBER_BY_FILE[file]
+      if (!m) throw new Error(`fakeCouncilOut：未知成員檔名 ${file}`)
+      const text = files[file]
+      const v = parseVerdicts(text)
+      return { ...m, overall: v.overall, q: v.q, empty: !text.trim(), timedOut: false, invalid: Boolean(text.trim()) && v.overall === null, exit: 0, signal: null, ms: 1 }
+    })
+  fs.writeFileSync(path.join(reviewOutDir, 'members.json'), JSON.stringify(members, null, 2))
+  return members
+}
+
+/** publish fixture：summary.review.members（補上三元組）＋ review/members.json 寫同一份。members：[{ name, overall, q? }]。 */
+function reviewFixture(outDir, members) {
+  const rows = members.map((m) => ({ ...(MEMBER_BY_NAME[m.name] || {}), ...m }))
+  const reviewDir = path.join(outDir, 'review')
+  fs.mkdirSync(reviewDir, { recursive: true })
+  fs.writeFileSync(path.join(reviewDir, 'members.json'), JSON.stringify(rows, null, 2))
+  return rows
 }
 
 function makeRepo(configOverride = {}) {
@@ -70,15 +156,10 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: (args) => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(
-          path.join(reviewOutDir, 'opus.txt'),
-          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認 hello.txt 內容'
-        )
-        fs.writeFileSync(
-          path.join(reviewOutDir, 'gemini.txt'),
-          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認檔案編碼'
-        )
+        fakeCouncilOut(reviewOutDir, {
+          'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認 hello.txt 內容',
+          'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認檔案編碼',
+        })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -169,6 +250,73 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(councilCalled, false, 'councilMain 不應被呼叫')
   })
 
+  test('Q2 writeMain 回 2 ⇒ summary.json 存在且 review null、writeExit 2、writeTimedOut false、councilMain 與 runTest 沒被呼叫、收貨摘要有印、空 worktree 仍被清掉、run 回 2（陽性對照：exit 2 提早 return 就沒有 summary.json）', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# Q2 票\n內容')
+
+    let councilCalled = false
+    let testCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => 2,
+      councilMain: () => {
+        councilCalled = true
+        return 0
+      },
+      runTest: () => {
+        testCalled = true
+        return { exit: 0, out: 'ok' }
+      },
+    }
+
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        ['run', '--name', 'q2', '--brief', briefFile, '--branch', 'feat/q2', '--allow', 'a.txt', '--test', 'true'],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+
+    assert.equal(code, 2, `writeExit=2 時 run 應回 2，實際 ${code}`)
+    assert.equal(councilCalled, false, 'councilMain 不應被呼叫')
+    assert.equal(testCalled, false, 'runTest 不應被呼叫')
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', 'q2', 'summary.json')
+    assert.ok(fs.existsSync(summaryFile), 'exit 2 也要有 summary.json（收貨稽核紀錄）')
+    const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
+    assert.equal(summary.schemaVersion, 2)
+    assert.equal(summary.writeExit, 2)
+    assert.equal(summary.writeTimedOut, false)
+    assert.equal(summary.review, null)
+    assert.equal(summary.verifyExit, null)
+    assert.deepEqual(summary.changed, [])
+    assert.equal(summary.coordinator, 'claude')
+    // 收貨摘要照印
+    const out = outs.join('\n')
+    assert.match(out, /=== 收貨摘要：q2/)
+    assert.match(out, /write exit: 2/)
+    assert.match(out, /🔴 未複審（write 非 0/)
+    // 本次新建且沒改檔 ⇒ 空 worktree 與分支照舊清掉
+    assert.ok(!fs.existsSync(path.join(repo.dir, '.claude', 'worktrees', 'q2')), '空 worktree 應被清掉')
+    assert.match(errs.join('\n'), /🧹 已清掉本次建立的 worktree 與分支 q2/)
+    const branches = repo.g('branch', '--list', 'feat/q2').trim()
+    assert.equal(branches, '', '分支應被刪掉')
+    // lifecycle 只有 run-start、writer-done
+    const lines = fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'q2', 'lifecycle.ndjson'), 'utf8').trim().split('\n')
+    assert.deepEqual(lines.map((l) => JSON.parse(l).event), ['run-start', 'writer-done'])
+    assert.equal(JSON.parse(lines[1]).writeExit, 2)
+  })
+
   test('T3 run：某位複審者零輸出 ⇒ exit 3、摘要含「零輸出」', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
@@ -185,9 +333,7 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '') // 零輸出
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\nQ6：ok')
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '' /* 零輸出 */, 'agy-gemini': '整份：簽\nQ6：ok' })
         return 3
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -239,12 +385,10 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(
-          path.join(reviewOutDir, 'opus.txt'),
-          'Q1：不簽｜改動範圍過大｜需縮減\n整份：不簽\nQ6：統整者需確認 scope'
-        )
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok')
+        fakeCouncilOut(reviewOutDir, {
+          'agy-opus': 'Q1：不簽｜改動範圍過大｜需縮減\n整份：不簽\nQ6：統整者需確認 scope',
+          'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok',
+        })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -290,7 +434,9 @@ describe('ticket.mjs 票流程測試', () => {
     fs.mkdirSync(outDir, { recursive: true })
     fs.writeFileSync(path.join(outDir, 'brief.md'), '# Brief T5\n說明')
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't5',
       branch: 'feat/t5--slice',
@@ -301,10 +447,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified',
@@ -382,7 +528,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't7')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't7',
       branch: 'feat/t7--slice',
@@ -393,10 +541,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified',
@@ -449,7 +597,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't8')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't8',
       branch: 'feat/t8--slice',
@@ -460,10 +610,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified',
@@ -564,7 +714,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // 預先在 <outDir>/review/ 放殘留的 opus.txt（不簽）
     fs.mkdirSync(reviewOutDir, { recursive: true })
-    const opusPath = path.join(reviewOutDir, 'opus.txt')
+    const opusPath = path.join(reviewOutDir, 'agy-opus.txt')
     fs.writeFileSync(opusPath, 'Q1：不簽｜殘留舊資料｜需修正\n整份：不簽\nQ6：舊殘留')
 
     let existsBeforeCouncilMain = null
@@ -578,9 +728,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       councilMain: () => {
         existsBeforeCouncilMain = fs.existsSync(opusPath)
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(opusPath, 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok')
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok')
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：ok' })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -616,8 +764,8 @@ describe('ticket.mjs 票流程測試', () => {
     const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't10', 'summary.json')
     assert.ok(fs.existsSync(summaryFile), 'summary.json 應存在')
     const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
-    const opus = summary.review.members.find((m) => m.name === 'opus')
-    assert.ok(opus, 'summary 應包含 opus')
+    const opus = summary.review.members.find((m) => m.name === 'agy/opus')
+    assert.ok(opus, 'summary 應包含 agy/opus')
     assert.equal(opus.overall, '簽', 'opus overall 應為「簽」，證明舊的「不簽」殘留已被清除')
   })
 
@@ -640,10 +788,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       councilMain: (args) => {
         receivedCouncilArgs1 = args
-        fs.mkdirSync(reviewOutDir1, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir1, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir1, 'gemini.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir1, 'codex.txt'), '整份：簽\n')
+        fakeCouncilOut(reviewOutDir1, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n', 'codex-gpt-5-6-sol': '整份：簽\n' })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -704,9 +849,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       councilMain: (args) => {
         receivedCouncilArgs2 = args
-        fs.mkdirSync(reviewOutDir2, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir2, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir2, 'gemini.txt'), '整份：簽\n')
+        fakeCouncilOut(reviewOutDir2, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -902,9 +1045,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       runTest: () => ({ exit: 1, out: 'test failed' }),
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
     }
@@ -957,9 +1098,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
     }
@@ -1006,7 +1145,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't22')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't22',
       branch: 'feat/t22--slice',
@@ -1017,10 +1158,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 1,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified',
@@ -1062,7 +1203,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't23')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't23',
       branch: 'feat/t23--slice',
@@ -1074,8 +1217,8 @@ describe('ticket.mjs 票流程測試', () => {
       review: {
         tier: 'standard',
         members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
         ],
         anyEmpty: true,
       },
@@ -1118,7 +1261,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't24')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't24',
       branch: 'feat/t24--slice',
@@ -1129,10 +1274,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '不簽', q: { Q1: '不簽' } },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '不簽', q: { Q1: '不簽' } },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified',
@@ -1174,7 +1319,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't25')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't25',
       branch: 'feat/t25--slice',
@@ -1185,10 +1332,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '不簽', q: { Q1: '不簽' } },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '不簽', q: { Q1: '不簽' } },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
     }
@@ -1211,7 +1358,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // 1. accept 寫入 disposition 與 q6
     const acceptCode = await ticketMain(
-      ['accept', '--name', 't25', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'opus:Q1=rejected:"範圍縮減裁決"'],
+      ['accept', '--name', 't25', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'agy/opus:Q1=rejected:"範圍縮減裁決"'],
       deps
     )
     assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
@@ -1245,7 +1392,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't26')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't26',
       branch: 'feat/t26--slice',
@@ -1256,10 +1405,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       // 缺 q6Receipt
@@ -1303,16 +1452,14 @@ describe('ticket.mjs 票流程測試', () => {
     const deps = {
       repoRoot: repo.dir,
       assertSettings: () => true,
-      env: { LLM_TEAM_HARNESS: 'agy' },
+      env: { LLM_TEAM_HARNESS: 'agy', LLM_TEAM_COORDINATOR: 'claude' },
       writeMain: () => {
         fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir, 'gemini.txt'), '整份：簽\n')
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
     }
@@ -1374,7 +1521,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't28')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't28',
       branch: 'feat/t28--slice',
@@ -1385,12 +1534,12 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [{ name: 'opus', overall: '簽' }],
+        members: [{ name: 'agy/opus', overall: '簽' }],
         anyEmpty: false,
       },
       harness: 'agy',
       q6Receipt: 'verified ok',
-      dispositions: [{ member: 'opus', q: 'Q1', disposition: 'rejected', note: 'n', by: 'c', at: '2026' }],
+      dispositions: [{ member: 'agy/opus', q: 'Q1', disposition: 'rejected', note: 'n', by: 'c', at: '2026' }],
     }
     fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
 
@@ -1473,7 +1622,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't30')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't30',
       branch: 'feat/t30--slice',
@@ -1484,10 +1635,10 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified ok',
@@ -1520,7 +1671,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs.join('\n'), /writeExit 為 3/)
   })
 
-  test('T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫', async () => {
+  test('T31 publish：review.members 少於 summary.reviewers 名單（缺 agy/gemini）⇒ 2 且 gh 假函式沒被呼叫；members 空 ⇒ 2', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't31')
     fs.mkdirSync(worktreePath, { recursive: true })
@@ -1529,7 +1680,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't31')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't31',
       branch: 'feat/t31--slice',
@@ -1540,7 +1693,7 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [{ name: 'opus', overall: '簽' }],
+        members: reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }]),
         anyEmpty: false,
       },
       q6Receipt: 'verified ok',
@@ -1568,9 +1721,261 @@ describe('ticket.mjs 票流程測試', () => {
       console.error = origErr
     }
 
-    assert.equal(code, 2, `review.members 少於 2 位時 publish 應回 2，實際為 ${code}`)
+    assert.equal(code, 2, `review.members 未全員到齊時 publish 應回 2，實際為 ${code}`)
     assert.equal(ghCalled, false, 'gh 不應被呼叫')
-    assert.match(errs.join('\n'), /複審成員少於 2 位/)
+    assert.match(errs.join('\n'), /複審名單未全員到齊（review\/members\.json 身分三元組 ≠ summary\.reviewers），缺：agy\/gemini〔agy\/gemini-3\.1-pro-high\/gemini〕；多：\(無\)/)
+
+    // members 空 ⇒ 2（名單非空但沒人）
+    summary.review.members = []
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+    console.error = (m) => errs.push(String(m))
+    let code2
+    try {
+      code2 = await ticketMain(['publish', '--name', 't31'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code2, 2)
+    assert.equal(ghCalled, false)
+    assert.match(errs.join('\n'), /複審成員或名單為空/)
+
+    // 陽性對照：同一份但名單只有 agy/opus（1 位）且 members（summary＋members.json）有它 ⇒ 過這道閘（v2 一般票名單可以只有 1 位）
+    summary.reviewers = [ROSTER_STANDARD[0]]
+    summary.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }])
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+    const code3 = await ticketMain(['publish', '--name', 't31'], deps)
+    assert.equal(code3, 0)
+    assert.equal(ghCalled, true)
+  })
+
+  test('Q5 publish（codex 複審 Q5-IDENTITY）：同 name 不同 model ⇒ 2（陽性對照：只比 name 會放過）；members.json 多一位 ⇒ 2；缺 members.json ⇒ 2；summary.rosterMismatch:true ⇒ 2；summary.review.members 三元組漂移 ⇒ 2；全對 ⇒ 走到 gh', async () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'q5p')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'q5p')
+    fs.mkdirSync(outDir, { recursive: true })
+    const membersFile = path.join(outDir, 'review', 'members.json')
+    const baseSummary = () => ({
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
+      project: 'test-proj',
+      ticket: 'q5p',
+      branch: 'feat/q5p',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      rosterMismatch: false,
+      review: { tier: 'standard', members: [], anyEmpty: false },
+      q6Receipt: 'verified ok',
+    })
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          if (args[0] === '--version') return { status: 0, stdout: 'gh' }
+          return { status: 0, stdout: 'https://x/pr/1' }
+        }
+        return { status: 0, stdout: '' }
+      },
+    }
+    const run = async () => {
+      const errs = []
+      const origErr = console.error
+      const origLog = console.log
+      console.error = (m) => errs.push(String(m))
+      console.log = () => {}
+      let code
+      try {
+        code = await ticketMain(['publish', '--name', 'q5p'], deps)
+      } finally {
+        console.error = origErr
+        console.log = origLog
+      }
+      return { code, errs: errs.join('\n') }
+    }
+    const write = (summary) => fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    // 1. 同 name 不同 model：agy/gemini 實際跑的是 gemini-3.1-pro-low（名字一樣、三元組不同）
+    const impostor = { name: 'agy/gemini', harness: 'agy', model: 'gemini-3.1-pro-low', quotaBucket: 'gemini', overall: '簽' }
+    let s = baseSummary()
+    s.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, impostor])
+    write(s)
+    // 陽性對照的前提：只比 name 看不出差別
+    assert.deepEqual(s.review.members.map((m) => m.name), s.reviewers.map((r) => r.name))
+    let r = await run()
+    assert.equal(r.code, 2, '同 name 不同 model 必須擋')
+    assert.equal(ghCalled, false)
+    assert.match(r.errs, /複審名單未全員到齊（review\/members\.json 身分三元組 ≠ summary\.reviewers），缺：agy\/gemini〔agy\/gemini-3\.1-pro-high\/gemini〕；多：agy\/gemini〔agy\/gemini-3\.1-pro-low\/gemini〕/)
+
+    // 2. members.json 多一位（codex 在一般票裡冒出來）
+    s = baseSummary()
+    s.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }, { name: 'codex/gpt-5-6-sol', overall: '簽' }])
+    write(s)
+    r = await run()
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /多：codex\/gpt-5-6-sol〔codex\/gpt-5\.6-sol\/openai〕/)
+
+    // 3. 缺 members.json（summary 自己貼的名單再漂亮也不算）
+    s = baseSummary()
+    s.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }])
+    write(s)
+    fs.unlinkSync(membersFile)
+    r = await run()
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /缺 council 的實際名單（或格式不合法）/)
+    assert.equal(ghCalled, false)
+
+    // 4. run 已判 rosterMismatch:true（即使檔案都對）
+    s = baseSummary()
+    s.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }])
+    s.rosterMismatch = true
+    write(s)
+    r = await run()
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /run 已判 rosterMismatch/)
+
+    // 5. members.json 對、但 summary.review.members 被改成同 name 不同 model ⇒ 也擋
+    s = baseSummary()
+    reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }])
+    s.review.members = [{ ...MEMBER_BY_NAME['agy/opus'], overall: '簽' }, impostor]
+    write(s)
+    r = await run()
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /summary\.review\.members 身分三元組 ≠ summary\.reviewers/)
+    assert.equal(ghCalled, false)
+
+    // 6. 陽性對照：全對 ⇒ 走到 gh
+    s = baseSummary()
+    s.review.members = reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }])
+    write(s)
+    r = await run()
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(ghCalled, true)
+  })
+
+  test('Q5 run（codex 複審 Q5-IDENTITY）：ticket 只從 review/members.json 取實際名單——少一位／多一位／同 name 不同 model ⇒ run 回 3、summary.rosterMismatch true、rosterDiff 指名、收貨摘要含 rosterMismatch；缺 members.json ⇒ 3；全對 ⇒ 0 且 members 三元組來自 members.json（陽性對照）', async () => {
+    const cases = [
+      {
+        label: '少一位',
+        members: [{ ...MEMBER_BY_NAME['agy/opus'], overall: '簽', empty: false }],
+        missing: ['agy/gemini〔agy/gemini-3.1-pro-high/gemini〕'],
+        unexpected: [],
+      },
+      {
+        label: '多一位',
+        members: [
+          { ...MEMBER_BY_NAME['agy/opus'], overall: '簽', empty: false },
+          { ...MEMBER_BY_NAME['agy/gemini'], overall: '簽', empty: false },
+          { ...MEMBER_BY_NAME['codex/gpt-5-6-sol'], overall: '簽', empty: false },
+        ],
+        missing: [],
+        unexpected: ['codex/gpt-5-6-sol〔codex/gpt-5.6-sol/openai〕'],
+      },
+      {
+        label: '同 name 不同 model',
+        members: [
+          { ...MEMBER_BY_NAME['agy/opus'], overall: '簽', empty: false },
+          { name: 'agy/gemini', harness: 'agy', model: 'gemini-3.1-pro-low', quotaBucket: 'gemini', overall: '簽', empty: false },
+        ],
+        missing: ['agy/gemini〔agy/gemini-3.1-pro-high/gemini〕'],
+        unexpected: ['agy/gemini〔agy/gemini-3.1-pro-low/gemini〕'],
+      },
+      { label: '缺 members.json', members: null, missing: ['agy/opus〔agy/claude-opus-4-6-thinking/agy-claude〕', 'agy/gemini〔agy/gemini-3.1-pro-high/gemini〕'], unexpected: [] },
+    ]
+    for (const c of cases) {
+      const repo = makeRepo()
+      const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+      fs.writeFileSync(briefFile, '# Q5 run\n內容')
+      const name = `q5r-${cases.indexOf(c)}`
+      const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
+      const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+      const deps = {
+        repoRoot: repo.dir,
+        assertSettings: () => true,
+        writeMain: () => {
+          fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
+          return 0
+        },
+        runTest: () => ({ exit: 0, out: 'ok' }),
+        councilMain: () => {
+          // 每位都有輸出檔（含預期名單的每一位）——只有 members.json 說了算
+          fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n', 'codex-gpt-5-6-sol': '整份：簽\n' }, c.members ? { members: c.members } : {})
+          if (!c.members) fs.unlinkSync(path.join(reviewOutDir, 'members.json'))
+          return 0
+        },
+      }
+      const outs = []
+      const origLog = console.log
+      console.log = (m) => outs.push(String(m))
+      let code
+      try {
+        code = await ticketMain(['run', '--name', name, '--brief', briefFile, '--branch', `feat/${name}`, '--allow', 'a.txt', '--test', 'true'], deps)
+      } finally {
+        console.log = origLog
+      }
+      assert.equal(code, 3, `${c.label}：run 應回 3，實際 ${code}`)
+      const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', name, 'summary.json'), 'utf8'))
+      assert.equal(summary.rosterMismatch, true, c.label)
+      assert.deepEqual(summary.rosterDiff.missing.map((m) => `${m.name}〔${m.harness}/${m.model}/${m.quotaBucket}〕`), c.missing, c.label)
+      assert.deepEqual(summary.rosterDiff.unexpected.map((m) => `${m.name}〔${m.harness}/${m.model}/${m.quotaBucket}〕`), c.unexpected, c.label)
+      assert.equal(summary.review.anyEmpty, false, `${c.label}：不是零輸出造成的 3`)
+      assert.match(outs.join('\n'), /🔴 rosterMismatch：council 實際名單 ≠ profile 預期名單/, c.label)
+      if (!c.members) assert.match(summary.rosterDiff.reason, /缺 council 的 members\.json/)
+      // 名單只從 members.json 來：多出來的殘留 .txt（codex）不會因為檔案存在就被撿進 members
+      if (c.members) assert.deepEqual(summary.review.members.map((m) => m.name), c.members.map((m) => m.name), c.label)
+      // 陽性對照的前提（同 name 不同 model）：只比 name 看不出差別
+      if (c.label === '同 name 不同 model') assert.deepEqual(summary.review.members.map((m) => m.name), summary.reviewers.map((r) => r.name))
+      const lifecycle = fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', name, 'lifecycle.ndjson'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+      assert.equal(lifecycle.find((l) => l.event === 'review-done').rosterMismatch, true, c.label)
+    }
+
+    // 陽性對照：members.json 與預期名單完全一致 ⇒ 0、rosterMismatch false、members 的三元組來自 members.json、membersSource 標明來源
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# Q5 ok\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'q5ok')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'q5ok', 'review')
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ok')
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+      councilMain: () => {
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': 'Q2：不簽｜x｜y\n整份：不簽\n', 'agy-gemini': '整份：簽\n' })
+        return 0
+      },
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await ticketMain(['run', '--name', 'q5ok', '--brief', briefFile, '--branch', 'feat/q5ok', '--allow', 'a.txt', '--test', 'true'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'q5ok', 'summary.json'), 'utf8'))
+    assert.equal(summary.rosterMismatch, false)
+    assert.equal(summary.rosterDiff, undefined)
+    assert.equal(summary.review.membersSource, 'review/members.json')
+    assert.deepEqual(
+      summary.review.members.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut })),
+      [
+        { name: 'agy/opus', ...M.agyOpus, overall: '不簽', q: { Q2: '不簽' }, empty: false, timedOut: false },
+        { name: 'agy/gemini', ...M.agyGemini, overall: '簽', q: {}, empty: false, timedOut: false },
+      ]
+    )
   })
 
   test('T32 publish：同成員兩題不簽只處置一題 ⇒ publish 回 2 且 gh 未呼叫', async () => {
@@ -1582,7 +1987,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't32')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: [ROSTER_STANDARD[0], { name: 'codex/gpt-5-6-sol', ...M.codexSol }],
       project: 'test-proj',
       ticket: 't32',
       branch: 'feat/t32--slice',
@@ -1593,15 +2000,15 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'block',
-        members: [
-          { name: 'opus', overall: '簽' },
-          { name: 'codex', overall: '不簽', q: { Q1: '不簽', Q6: '不簽' } },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'codex/gpt-5-6-sol', overall: '不簽', q: { Q1: '不簽', Q6: '不簽' } },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified ok',
       dispositions: [
-        { member: 'codex', q: 'Q1', disposition: 'rejected', note: 'Q1 裁決', by: 'coordinator', at: '2026-09-13' },
+        { member: 'codex/gpt-5-6-sol', q: 'Q1', disposition: 'rejected', note: 'Q1 裁決', by: 'coordinator', at: '2026-09-13' },
       ],
     }
     fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
@@ -1629,7 +2036,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     assert.equal(code, 2, `同成員兩題不簽只處置一題時 publish 應回 2，實際為 ${code}`)
     assert.equal(ghCalled, false, 'gh 不應被呼叫')
-    assert.match(errs.join('\n'), /codex 之 Q6 不簽且未處置/)
+    assert.match(errs.join('\n'), /codex\/gpt-5-6-sol 之 Q6 不簽且未處置/)
   })
 
   test('T33 publish：整份不簽無逐題時給 q:Q3 仍回 2，給 q:overall 且 accept 寫入後 publish 通過', async () => {
@@ -1641,7 +2048,9 @@ describe('ticket.mjs 票流程測試', () => {
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't33')
     fs.mkdirSync(outDir, { recursive: true })
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
       project: 'test-proj',
       ticket: 't33',
       branch: 'feat/t33--slice',
@@ -1652,16 +2061,16 @@ describe('ticket.mjs 票流程測試', () => {
       verifyExit: 0,
       review: {
         tier: 'standard',
-        members: [
-          { name: 'opus', overall: '不簽', q: {} },
-          { name: 'gemini', overall: '簽' },
-        ],
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '不簽', q: {} },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
         anyEmpty: false,
       },
       q6Receipt: 'verified ok',
       dispositions: [
         // 給了 Q3 disposition，但 member 只有整份不簽無逐題，只認 overall
-        { member: 'opus', q: 'Q3', disposition: 'rejected', note: '無效的逐題處置', by: 'coordinator', at: '2026-09-13' },
+        { member: 'agy/opus', q: 'Q3', disposition: 'rejected', note: '無效的逐題處置', by: 'coordinator', at: '2026-09-13' },
       ],
     }
     fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
@@ -1693,17 +2102,17 @@ describe('ticket.mjs 票流程測試', () => {
     }
     assert.equal(code1, 2, `整份不簽無逐題給了 Q3 disposition 時 publish 應回 2，實際為 ${code1}`)
     assert.equal(ghCalled, false, 'gh 不應被呼叫')
-    assert.match(errs.join('\n'), /opus 整份不簽且未處置/)
+    assert.match(errs.join('\n'), /agy\/opus 整份不簽且未處置/)
 
     // 2. 測試 accept --disposition opus:overall=rejected:"..." 寫入
     const acceptCode = await ticketMain(
-      ['accept', '--name', 't33', '--q6', '親自坐實', '--disposition', 'opus:overall=rejected:"整體風險已控制"'],
+      ['accept', '--name', 't33', '--q6', '親自坐實', '--disposition', 'agy/opus:overall=rejected:"整體風險已控制"'],
       deps
     )
     assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
 
     const updatedSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    const overallDisp = updatedSummary.dispositions.find((d) => d.member === 'opus' && d.q === 'overall')
+    const overallDisp = updatedSummary.dispositions.find((d) => d.member === 'agy/opus' && d.q === 'overall')
     assert.ok(overallDisp, 'summary.dispositions 應包含 q === overall 的處置')
     assert.equal(overallDisp.disposition, 'rejected')
     assert.equal(overallDisp.note, '整體風險已控制')
@@ -1899,9 +2308,9 @@ describe('ticket.mjs 票流程測試', () => {
     assert.doesNotMatch(errText3, /🧹/, 'write 回 2 但已改檔時絕不應印出 🧹 清理訊息')
   })
 
-  test('T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下', async () => {
-    // 1. 實驗組：codexTier: "all" + tier standard
-    const repo1 = makeRepo({ codexTier: 'all' })
+  test('T36 block 票收 blockReviewers（含 codex/gpt-5-6-sol）到 summary，codex 不簽則 publish 擋下；standard 票只收 reviewers（不含 codex）', async () => {
+    // 1. 實驗組：--tier block ⇒ members ＝ blockReviewers（agy/opus、agy/gemini、codex/gpt-5-6-sol）
+    const repo1 = makeRepo()
     const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile1, '# T36 all\n內容')
     const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't36-all')
@@ -1915,10 +2324,7 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir1, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir1, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir1, 'gemini.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir1, 'codex.txt'), '整份：不簽\n')
+        fakeCouncilOut(reviewOutDir1, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n', 'codex-gpt-5-6-sol': '整份：不簽\n' })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -1943,7 +2349,7 @@ describe('ticket.mjs 票流程測試', () => {
           '--test',
           'true',
           '--tier',
-          'standard',
+          'block',
         ],
         deps1
       )
@@ -1954,9 +2360,15 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(runCode1, 0, `run 應回 0，實際得到 ${runCode1}`)
     const summaryFile1 = path.join(repo1.dir, '.local', 'llm-team', 't36-all', 'summary.json')
     const summary1 = JSON.parse(fs.readFileSync(summaryFile1, 'utf8'))
-    const codexMember = summary1.review.members.find((m) => m.name === 'codex')
+    const codexMember = summary1.review.members.find((m) => m.name === 'codex/gpt-5-6-sol')
     assert.ok(codexMember, 'summary.review.members 應包含 codex')
     assert.equal(codexMember.overall, '不簽', 'codex overall 應為 不簽')
+    assert.equal(codexMember.harness, 'codex')
+    assert.equal(codexMember.quotaBucket, 'openai')
+    assert.equal(summary1.schemaVersion, 2)
+    assert.equal(summary1.coordinator, 'claude')
+    assert.deepEqual(summary1.reviewers.map((r) => r.name), ['agy/opus', 'agy/gemini', 'codex/gpt-5-6-sol'])
+    assert.equal(summary1.review.tier, 'block')
 
     // 接著 publish 回 2 且 gh 假函式沒被呼叫
     let ghCalled = false
@@ -1984,10 +2396,10 @@ describe('ticket.mjs 票流程測試', () => {
     }
     assert.equal(pubCode, 2, `codex 不簽未處置時 publish 應回 2，實際為 ${pubCode}`)
     assert.equal(ghCalled, false, 'gh 不應被呼叫')
-    assert.match(errsPub.join('\n'), /codex 整份不簽且未處置/)
+    assert.match(errsPub.join('\n'), /codex\/gpt-5-6-sol 整份不簽且未處置/)
 
-    // 2. 對照組：codexTier: "block" ＋ standard ⇒ members 不含 codex（既有行為）
-    const repo2 = makeRepo({ codexTier: 'block' })
+    // 2. 對照組：--tier standard ⇒ members ＝ reviewers（不含 codex）；council 目錄裡多一個 codex 的殘留輸出檔（不在 members.json）不會被撿進來
+    const repo2 = makeRepo()
     const briefFile2 = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile2, '# T36 block\n內容')
     const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't36-block')
@@ -2001,10 +2413,8 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: () => {
-        fs.mkdirSync(reviewOutDir2, { recursive: true })
-        fs.writeFileSync(path.join(reviewOutDir2, 'opus.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir2, 'gemini.txt'), '整份：簽\n')
-        fs.writeFileSync(path.join(reviewOutDir2, 'codex.txt'), '整份：不簽\n')
+        fakeCouncilOut(reviewOutDir2, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
+        fs.writeFileSync(path.join(reviewOutDir2, 'codex-gpt-5-6-sol.txt'), '整份：不簽\n') // 殘留檔，不在 members.json
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -2036,8 +2446,253 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(runCode2, 0)
     const summaryFile2 = path.join(repo2.dir, '.local', 'llm-team', 't36-block', 'summary.json')
     const summary2 = JSON.parse(fs.readFileSync(summaryFile2, 'utf8'))
-    const hasCodex = summary2.review.members.some((m) => m.name === 'codex')
-    assert.equal(hasCodex, false, 'codexTier: block ＋ standard 時 members 不應含 codex')
+    const hasCodex = summary2.review.members.some((m) => m.name === 'codex/gpt-5-6-sol')
+    assert.equal(hasCodex, false, 'standard 票 members 不應含 codex')
+    assert.deepEqual(summary2.reviewers.map((r) => r.name), ['agy/opus', 'agy/gemini'])
+  })
+
+
+  test('P5：writeMain 回 3 且【有】改檔 ⇒ councilMain 假函式沒被呼叫、runTest 沒被呼叫、run 回 3、summary.review === null、writeTimedOut false（陽性對照：把 P5 的 writeFailed 判斷拿掉就會開 council）', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# P5\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'p5')
+
+    let councilCalls = 0
+    let testCalls = 0
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'half.txt'), '半成品')
+        return 3
+      },
+      councilMain: () => {
+        councilCalls++
+        return 0
+      },
+      runTest: () => {
+        testCalls++
+        return { exit: 0, out: 'ok' }
+      },
+    }
+
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        ['run', '--name', 'p5', '--brief', briefFile, '--branch', 'feat/p5', '--allow', 'half.txt', '--test', 'true'],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 3)
+    assert.equal(councilCalls, 0, 'write 非 0 不准開 council')
+    assert.equal(testCalls, 0, 'write 非 0 不准跑 --test')
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'p5', 'summary.json'), 'utf8'))
+    assert.equal(summary.writeExit, 3)
+    assert.deepEqual(summary.changed, ['half.txt'])
+    assert.equal(summary.review, null)
+    assert.equal(summary.verifyExit, null)
+    assert.equal(summary.writeTimedOut, false)
+    assert.equal(summary.schemaVersion, 2)
+    assert.match(outs.join('\n'), /未複審（write 非 0/)
+
+    // 陽性對照：同一組 deps 但 writeMain 回 0 ⇒ council 與 runTest 都被呼叫
+    const repo2 = makeRepo()
+    const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 'p5b')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 'p5b', 'review')
+    const deps2 = {
+      ...deps,
+      repoRoot: repo2.dir,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath2, 'half.txt'), '完成')
+        return 0
+      },
+      councilMain: (args) => {
+        councilCalls++
+        assert.ok(args.includes('--coordinator') && args[args.indexOf('--coordinator') + 1] === 'claude', 'council 要收到 --coordinator claude')
+        fakeCouncilOut(reviewOutDir2, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
+        return 0
+      },
+    }
+    console.log = () => {}
+    let code2
+    try {
+      code2 = await ticketMain(
+        ['run', '--name', 'p5b', '--brief', briefFile, '--branch', 'feat/p5b', '--allow', 'half.txt', '--test', 'true'],
+        deps2
+      )
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code2, 0)
+    assert.equal(councilCalls, 1)
+    assert.equal(testCalls, 1)
+  })
+
+  test('P5：寫手逾時（writeMain 回 3 並在 <writeOutDir>/timeout.json 留證）⇒ summary.writeTimedOut true、收貨摘要含「寫手逾時」', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# P5 timeout\n內容')
+    const writeOutDir = path.join(repo.dir, '.local', 'llm-team', 'p5t', 'write')
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: (args) => {
+        const out = args[args.indexOf('--out') + 1]
+        assert.equal(out, writeOutDir)
+        fs.mkdirSync(out, { recursive: true })
+        fs.writeFileSync(path.join(out, 'timeout.json'), JSON.stringify({ round: 1, timeoutMs: 1500000 }))
+        return 3
+      },
+      councilMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['run', '--name', 'p5t', '--brief', briefFile, '--branch', 'feat/p5t', '--allow', 'x.txt', '--test', 'true'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 3)
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'p5t', 'summary.json'), 'utf8'))
+    assert.equal(summary.writeTimedOut, true)
+    assert.equal(summary.review, null)
+    assert.match(outs.join('\n'), /寫手逾時/)
+  })
+
+  test('run 缺 --coordinator（deps.env 也沒有）⇒ exit 2、訊息列出可用 profiles、writeMain 沒被呼叫、沒建 worktree；--coordinator 明示 agy ⇒ council 收到 --coordinator agy 且名單是 agy profile 的', async () => {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# coord\n內容')
+    let writeCalls = 0
+    const deps = {
+      repoRoot: repo.dir,
+      env: {},
+      assertSettings: () => true,
+      writeMain: () => {
+        writeCalls++
+        return 0
+      },
+      councilMain: () => 0,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['run', '--name', 'c0', '--brief', briefFile, '--branch', 'feat/c0', '--allow', 'x.txt', '--test', 'true'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(writeCalls, 0)
+    assert.ok(!fs.existsSync(path.join(repo.dir, '.claude', 'worktrees', 'c0')), '缺 coordinator 不准建 worktree')
+    assert.match(errs.join('\n'), /統整者 profile 未指定.*可用 profiles：claude, agy, codex/)
+
+    // 明示 --coordinator agy
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'c1')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'c1', 'review')
+    let councilArgs = null
+    const deps2 = {
+      ...deps,
+      writeMain: () => {
+        fs.writeFileSync(path.join(worktreePath, 'x.txt'), 'ok')
+        return 0
+      },
+      councilMain: (args) => {
+        councilArgs = args
+        fakeCouncilOut(reviewOutDir, { 'codex-gpt-5-6-sol': '整份：簽\n' })
+        return 0
+      },
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code2
+    try {
+      code2 = await ticketMain(['run', '--coordinator', 'agy', '--name', 'c1', '--brief', briefFile, '--branch', 'feat/c1', '--allow', 'x.txt', '--test', 'true'], deps2)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code2, 0)
+    assert.equal(councilArgs[councilArgs.indexOf('--coordinator') + 1], 'agy')
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'c1', 'summary.json'), 'utf8'))
+    assert.equal(summary.coordinator, 'agy')
+    assert.deepEqual(summary.reviewers.map((r) => r.name), ['codex/gpt-5-6-sol'])
+    assert.deepEqual(summary.review.members.map((m) => [m.name, m.overall]), [['codex/gpt-5-6-sol', '簽']])
+  })
+
+  test('publish：summary schemaVersion 1（舊 summary）⇒ 2 且 gh 假函式沒被呼叫（陽性對照：同一份改成 2 ＋ reviewers 名單 ⇒ 走到 gh）', async () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'sv1')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'sv1')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 1,
+      project: 'p',
+      ticket: 'sv1',
+      branch: 'feat/sv1',
+      base: 'main',
+      writeExit: 0,
+      rounds: 1,
+      changed: ['file.txt'],
+      verifyExit: 0,
+      review: { tier: 'standard', members: reviewFixture(outDir, [{ name: 'agy/opus', overall: '簽' }, { name: 'agy/gemini', overall: '簽' }]), anyEmpty: false },
+      q6Receipt: 'ok',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary))
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          if (args[0] === '--version') return { status: 0, stdout: 'gh' }
+          return { status: 0, stdout: 'https://x/pr/1' }
+        }
+        return { status: 0, stdout: '' }
+      },
+    }
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['publish', '--name', 'sv1'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(ghCalled, false)
+    assert.match(errs.join('\n'), /summary\.schemaVersion 為 1（非 2）/)
+
+    summary.schemaVersion = 2
+    summary.coordinator = 'claude'
+    summary.reviewers = ROSTER_STANDARD
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary))
+    const origLog = console.log
+    console.log = () => {}
+    let code2
+    try {
+      code2 = await ticketMain(['publish', '--name', 'sv1'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code2, 0)
+    assert.equal(ghCalled, true)
   })
 
   test('T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（settings 缺 regex ⇒ run 回 2、未建 worktree 且 writeMain 沒被呼叫）', async () => {
@@ -2261,15 +2916,10 @@ describe('ticket.mjs 票流程測試', () => {
       },
       councilMain: async () => {
         await new Promise((res) => setTimeout(res, 30))
-        fs.mkdirSync(reviewOutDir, { recursive: true })
-        fs.writeFileSync(
-          path.join(reviewOutDir, 'opus.txt'),
-          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認 hello.txt 內容'
-        )
-        fs.writeFileSync(
-          path.join(reviewOutDir, 'gemini.txt'),
-          'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認檔案編碼'
-        )
+        fakeCouncilOut(reviewOutDir, {
+          'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認 hello.txt 內容',
+          'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：請確認檔案編碼',
+        })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -2398,6 +3048,13 @@ describe('ticket.mjs 票流程測試', () => {
 })
 
 describe('setup.mjs 設定對帳測試', () => {
+  /** 假 binary：不打真的 agy／codex／claude（連 --version 都不打）。 */
+  const mockBins = {
+    agyBin: '/mock/bin/antigravity',
+    which: (bin) => `/mock/bin/${bin}`,
+    runVersion: () => ({ exit: 0, out: 'mock 1.0' }),
+  }
+
   test('T6 setup --check：缺 regex 假設定 ⇒ exit 1、stdout 含 command(regex:；全對 ⇒ exit 0；不存在 ⇒ exit 2；且 token 永不洩漏', () => {
     const repo = makeRepo()
     const regex = buildSafeCommandRegex(TEST_CONFIG)
@@ -2466,11 +3123,12 @@ describe('setup.mjs 設定對帳測試', () => {
     console.error = (m) => badErrs.push(String(m))
     let badCode
     try {
-      badCode = setupMain(['--check'], {
+      badCode = setupMain(['--check', '--coordinator', 'agy'], {
         repoRoot: repo.dir,
         settingsFile: badSettingsFile,
         env: { AGY_SETTINGS: badSettingsFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
         runAgyHooks: fakeHookRunner,
+        ...mockBins,
       })
     } finally {
       console.log = origLog
@@ -2491,11 +3149,12 @@ describe('setup.mjs 設定對帳測試', () => {
     console.error = (m) => goodErrs.push(String(m))
     let goodCode
     try {
-      goodCode = setupMain(['--check'], {
+      goodCode = setupMain(['--check', '--coordinator', 'agy'], {
         repoRoot: repo.dir,
         settingsFile: goodSettingsFile,
         env: { AGY_SETTINGS: goodSettingsFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
         runAgyHooks: fakeHookRunner,
+        ...mockBins,
       })
     } finally {
       console.log = origLog
@@ -2512,11 +3171,12 @@ describe('setup.mjs 設定對帳測試', () => {
     const nonExistentFile = path.join(tmpSettingsDir, 'not-found.json')
     let missingCode
     try {
-      missingCode = setupMain(['--check'], {
+      missingCode = setupMain(['--check', '--coordinator', 'agy'], {
         repoRoot: repo.dir,
         settingsFile: nonExistentFile,
         env: { AGY_SETTINGS: nonExistentFile, HOME: testHome, LLM_TEAM_GUARD: fakeGuardFile },
         runAgyHooks: fakeHookRunner,
+        ...mockBins,
       })
     } finally {
       // noop
@@ -2530,7 +3190,7 @@ describe('setup.mjs 設定對帳測試', () => {
     console.error = (m) => badGuardErrs.push(String(m))
     let badGuardCode
     try {
-      badGuardCode = setupMain(['--check'], {
+      badGuardCode = setupMain(['--check', '--coordinator', 'agy'], {
         repoRoot: repo.dir,
         settingsFile: goodSettingsFile,
         env: {
@@ -2540,6 +3200,7 @@ describe('setup.mjs 設定對帳測試', () => {
         },
         importMetaUrl: 'file:///nonexistent/setup.mjs',
         runAgyHooks: fakeHookRunner,
+        ...mockBins,
       })
     } finally {
       console.log = origLog
@@ -2596,10 +3257,11 @@ describe('setup.mjs 設定對帳測試', () => {
     console.error = (m) => badErrs.push(String(m))
     let badCode
     try {
-      badCode = setupMain(['--check'], {
+      badCode = setupMain(['--check', '--coordinator', 'agy'], {
         repoRoot: repo.dir,
         env: { ...process.env, AGY_SETTINGS: badSettingsFile, HOME: testHome },
         runAgyHooks: fakeHookRunner,
+        ...mockBins,
       })
     } finally {
       console.log = origLog

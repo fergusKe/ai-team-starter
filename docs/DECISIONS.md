@@ -1444,3 +1444,13 @@ Fergus 定案（起因：發現衍生專案 GuildHub-frontend 用 npm——「pn
 
 **沒有的**：
 - **不代表任何效能保證**：這條決定省的是磁碟與嚴格性，不是速度或成本；不要拿它當其他效能問題的答案。
+
+## 2026-09-14　llm-team 名單改成「每種統整者一組 profile」（schema v2），用量是第一約束
+
+**決定**：`llm-team.config.json` 不再有一份全域複審名單（`models.reviewers`＋`codexTier`），改成 `profiles.<統整者>`（`claude`／`agy`／`codex` 各一組：寫手、一般票複審、block 級複審、一般票裁決、block 未決）；`ticket run`／`council`／`setup --check` 必帶 `--coordinator`。config 載入時機械驗不變式：統整者不在自己票的名單、統整者與複審／裁決者不同額度桶、`claude` 只准當統整者、寫手只准 agy、block 未決一律交人。快照多了 `codex-pretooluse.sh`（codex 當統整者時的破壞性指令守門，接 `~/.codex/hooks.json`）。
+
+**為什麼**：衍生專案 2026-09-14 實測，agy 當統整者一天就把 Gemini 額度吃光——根因是統整者與複審者同一個額度桶「一票雙吃」，不是寫手。三種 harness 的額度桶大小差很多（codex 只有 ChatGPT Plus），所以名單必須跟著「誰在統整」變，而且要機械驗，不能靠人記。`agy`／`codex` profile 只在 Claude 額度用完時才開，名單就只剩另一桶、裁決交人——這是兩桶的結構限制，不是可調參數。
+
+**拒絕的替代**：三份 config 檔各對一種統整者（規則會漂、`setup --check` 只讀一份）；讓 Claude 當 agy／codex 模式的複審者（那兩個模式的前提就是 Claude 沒額度）；gpt-oss 替補（未校準）。
+
+**沒有的**：不含額度預檢（四個桶都沒有可查剩餘額度的 API）——規則是「打到 429 ⇒ 該角色停線、記進交接檔、下個 session 開票前先讀」。

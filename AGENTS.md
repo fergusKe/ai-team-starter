@@ -395,14 +395,16 @@ ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）�
 快照**不准手改**——要改程式去真源改、重新 export；`SOURCE.json` 記來源 commit。
 
 ```bash
-node .agents/skills/llm-team/setup.mjs --check              # 對帳 settings.json
-node .agents/skills/llm-team/ticket.mjs run --name <n> ...   # 寫手實作＋雙模型複審
+node .agents/skills/llm-team/setup.mjs --check --coordinator <claude|agy|codex>   # 對帳 config 不變式、守門、各角色 binary、該 harness 的 hooks
+node .agents/skills/llm-team/ticket.mjs run --coordinator <claude|agy|codex> --name <n> ...   # 寫手實作＋複審（名單由 profile 決定）
 node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
 ```
 
-**為什麼分工。** 統整者（Claude 或 agy，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
-動手寫，再由兩位獨立模型複審（寫手與複審名單**只住 `llm-team.config.json`**，本檔不寫死模型名）。省的是統整者回合，
+**為什麼分工。** 統整者（Claude Code／agy／codex 三種，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`／本檔）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
+動手寫，再由獨立模型複審。**寫手與複審名單只住 `llm-team.config.json` 的 `profiles.<統整者>`**（schema v2；本檔不寫死模型名；統整者與複審者不同額度桶、統整者不在自己票的名單、`claude` 只准當統整者——這些是 config 載入時機械驗的不變式，違反就拒開票）。`agy`／`codex` profile 是「Claude 額度用完」時的備用模式，名單只剩另一桶、裁決交人；`codex` 只做短票。省的是統整者回合，
 作者≠審核者避免「自己寫自己審」的盲區。
+**角色哨兵（本檔也會被 `council.mjs` 叫起的 codex 無頭複審者讀到）**：提示第一行是 `【llm-team 複審票】`／`【llm-team 規劃】` ⇒ 你是複審者／裁決者，只答提示裡的 Q 題（異議格式 `<ID> [BLOCK|PROC|NIT]`），不必讀本檔其餘段落。
+**codex 當統整者**：`codex -m <model> -c model_reasoning_effort="medium" --sandbox workspace-write -c 'sandbox_workspace_write.network_access=true'`（全域 config 維持 read-only、不用 danger-full-access）；守門走 `~/.codex/hooks.json` → 快照 `codex-pretooluse.sh`（`setup --check --coordinator codex` 對帳＋deny canary；hooks.json 要在互動 session 信任一次才載入，開工先在可拋棄目錄做一次 canary）。
 
 **寫手 wrapper 的自我約束（G1–G6 各擋什麼）。**
 - G1：worktree 不在 main 且乾淨（不污損主分支）。

@@ -142,6 +142,45 @@ describe('export.mjs 快照導出與驗證測試', () => {
     assert.equal(code, 1)
   })
 
+  test('乾淨快照 + symlink ⇒ extra 含它 且 --sync-check exit 1', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const target = path.join(snapshotDir, 'lib.mjs')
+    const linkPath = path.join(snapshotDir, 'link-to-lib.mjs')
+    fs.symlinkSync(target, linkPath)
+
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.extra.includes('link-to-lib.mjs'), `extra 應包含 link-to-lib.mjs，實際：${JSON.stringify(v.extra)}`)
+
+    const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+    assert.equal(code, 1)
+  })
+
+  test('manifest 檔被換成同內容 symlink ⇒ ok 為 false 且 changed 含該檔', () => {
+    const sourceDir = makeSourceDir()
+    const targetRoot = tmpdir('target-repo-')
+    exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+    const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+    const origPath = path.join(snapshotDir, 'lib.mjs')
+    const backupDir = tmpdir('backup-')
+    const backupPath = path.join(backupDir, 'lib.mjs')
+    fs.renameSync(origPath, backupPath)
+
+    fs.symlinkSync(backupPath, origPath)
+
+    const v = verifySnapshot(snapshotDir)
+    assert.equal(v.ok, false)
+    assert.ok(v.changed.includes('lib.mjs'), `changed 應包含 lib.mjs，實際：${JSON.stringify(v.changed)}`)
+
+    const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+    assert.equal(code, 1)
+  })
+
   test('再 export 不帶 --force ⇒ 回 2；帶 --force ⇒ 覆蓋且 ok', () => {
     const sourceDir = makeSourceDir()
     const targetRoot = tmpdir('target-repo-')

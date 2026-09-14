@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 2,
+  "writer": { "harness": "agy", "model": "gemini-3.8-flash-high", "quotaBucket": "gemini" },
+  "profiles": {
+    "claude": {
+      "coordinator": { "harness": "claude", "model": "claude-code", "quotaBucket": "anthropic" },
+      "reviewers": [
+        { "harness": "agy", "model": "gemini-3.1-pro-high", "quotaBucket": "gemini" }
+      ],
+      "blockReviewers": [
+        { "harness": "agy", "model": "gemini-3.1-pro-high", "quotaBucket": "gemini" },
+        { "harness": "codex", "model": "gpt-5.6-sol", "quotaBucket": "openai" }
+      ],
+      "adjudicator": { "harness": "codex", "model": "gpt-5.6-sol", "quotaBucket": "openai" },
+      "blockAdjudicator": "human"
+    },
+    "agy": {
+      "coordinator": { "harness": "agy", "model": "gemini-3.1-pro-high", "quotaBucket": "gemini" },
+      "reviewers": [
+        { "harness": "codex", "model": "gpt-5.6-sol", "quotaBucket": "openai" }
+      ],
+      "blockReviewers": [
+        { "harness": "codex", "model": "gpt-5.6-sol", "quotaBucket": "openai" }
+      ],
+      "adjudicator": "human",
+      "blockAdjudicator": "human"
+    },
+    "codex": {
+      "coordinator": { "harness": "codex", "model": "gpt-5.6-sol", "quotaBucket": "openai", "effort": "medium" },
+      "reviewers": [
+        { "harness": "agy", "model": "gemini-3.1-pro-high", "quotaBucket": "gemini" }
+      ],
+      "blockReviewers": [
+        { "harness": "agy", "model": "gemini-3.1-pro-high", "quotaBucket": "gemini" }
+      ],
+      "adjudicator": "human",
+      "blockAdjudicator": "human"
+    }
+  },
+  "allowCommandHeads": [
+    "pnpm test",
+    "pnpm run",
+    "pnpm exec openspec validate",
+    "bash .github/scripts/test-"
+  ],
+  "worktreeRoot": ".claude/worktrees",
+  "installCommand": "",
+  "maxRounds": 3,
+  "riskDomains": [],
+  "outDir": ".local/llm-team",
+  "branchPrefixes": [
+    "spec/",
+    "feat/",
+    "fix/",
+    "chore/",
+    "archive/",
+    "governance/"
+  ]
+}

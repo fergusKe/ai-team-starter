@@ -1,23 +1,28 @@
 #!/usr/bin/env node
-// ─────────────────── 規劃／複審三方會議（agy opus-4-6 ＋ agy Gemini 3.1 Pro ＋ codex sol） ───────────────────
-// 用法：
-//   規劃：node .agents/skills/llm-team/council.mjs plan   --prompt <file> --out <dir> [--codex] [--config <file>]        （預設兩位 agy；--codex 加 sol）
-//   複審：node .agents/skills/llm-team/council.mjs review --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--config <file>]
+// ─────────────────── 規劃／複審會議（依統整者 profile 派複審者） ───────────────────
+// 用法（`--coordinator` 必帶，或設 env LLM_TEAM_COORDINATOR）：
+//   規劃：node .agents/skills/llm-team/council.mjs plan   --coordinator <claude|agy|codex> --prompt <file> --out <dir> [--tier standard|block] [--config <file>]
+//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--config <file>]
 //
-// 🔴 2026-09-13 三方共識：
-//   · 一般票：config.models.reviewers（預設 opus ＋ Gemini 3.1 Pro）兩位固定（作者≠審核者；n=2 對照證明互補）。
-//   · block 級或指定 --codex：三位全上（加 codex sol）。
-//   · codex 扣得快：每票最多 1 輪 ＋ 1 次釐清；超過回統整者。
-// 🔴 三位都是【唯讀】：agy `--mode plan`、codex `--sandbox read-only`。它們的回覆不構成授權。
-// 🔴 M1 8 GB：三位【依序】跑，不並行。
-// 🔴 Gemini／opus 走 agy 無頭：提示以 NO_EXEC_HEADER 開頭（否則它想跑指令 ⇒ 自動拒絕 ⇒ 零輸出）；codex 讀得到檔，不加。
+// 🔴 2026-09-14 三方定案（schema v2）：
+//   · 成員名單來自 config.profiles.<coordinator>：一般票 reviewers、block 票 blockReviewers（沒有 --codex 旗標、沒有 codexTier）。
+//   · 統整者與每位複審者不同 quotaBucket（不變式在 lib.mjs validateProfiles）。
+//   · codex 扣得快：每票最多 2 輪 ＋ 1 次釐清；超過回統整者。
+// 🔴 複審者都是【唯讀】：agy `--mode plan`、codex `--sandbox read-only`。它們的回覆不構成授權。
+// 🔴 M1 8 GB：預設並行但可 --sequential。
+// 🔴 agy 無頭：提示以 NO_EXEC_HEADER 開頭（否則它想跑指令 ⇒ 自動拒絕 ⇒ 零輸出）；codex 讀得到檔，不加。
+// 🔴 提示第一行是哨兵（REVIEW_PROMPT_SENTINEL／PLAN_PROMPT_SENTINEL）：codex 從 cwd 讀得到 AGENTS.md，薄索引靠它判「我是複審者」。
+// 🔴 輸出除了 <成員>.txt，還有 members.json（實際跑的成員身分三元組＋結果）——ticket run／publish 只認它（2026-09-14 codex 複審 Q5）。
 
 import fs from 'node:fs'
 import path from 'node:path'
 import {
   loadConfig,
   modelsFrom,
+  memberFileName,
   NO_EXEC_HEADER,
+  REVIEW_PROMPT_SENTINEL,
+  PLAN_PROMPT_SENTINEL,
   runAgyAsync,
   runCodexAsync,
   git,
@@ -45,8 +50,9 @@ export function buildReviewQuestions(riskDomains = []) {
 }
 
 export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, riskDomains = [] }) {
-  if (!writerModel) throw new Error('buildReviewPrompt 需要 writerModel（來自 config.models.writer）')
+  if (!writerModel) throw new Error('buildReviewPrompt 需要 writerModel（來自 config.writer.model）')
   return [
+    REVIEW_PROMPT_SENTINEL,
     `你是本 repo 的複審者（${tier === 'block' ? 'block 級' : '一般票'}）。作者是另一個模型（${writerModel}），你沒有它的對話脈絡，只看下面的 brief 與 diff。`,
     '',
     '【brief（作者拿到的原文）】',
@@ -64,21 +70,35 @@ export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, ri
   ].join('\n')
 }
 
-async function runOne(name, model, prompt, cwd, outDir, timeoutMs, deps = {}) {
+/**
+ * 跑一位成員。依 member.harness 派：agy ⇒ runAgyAsync（plan 模式、加 NO_EXEC_HEADER）、codex ⇒ runCodexAsync（effort 用 member.effort）。
+ * `claude` harness 不在此派（它只准當 coordinator，validateProfiles 已擋）；漏網 ⇒ throw。
+ * 輸出檔名用 memberFileName（agy/gemini ⇒ agy-gemini.txt）。
+ */
+async function runOne(member, prompt, cwd, outDir, timeoutMs, deps = {}) {
   const started = Date.now()
   const runCodexFn = deps.runCodexAsync || runCodexAsync
   const runAgyFn = deps.runAgyAsync || runAgyAsync
+  const { name, model, harness } = member
   let r
-  if (name === 'codex') r = await runCodexFn({ model, prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
-  else r = await runAgyFn({ model, mode: 'plan', prompt: NO_EXEC_HEADER + prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
+  if (harness === 'codex') {
+    r = await runCodexFn({ model, prompt, cwd, timeoutMs, effort: member.effort || 'high', env: deps.env, spawn: deps.spawn })
+  } else if (harness === 'agy') {
+    r = await runAgyFn({ model, mode: 'plan', prompt: NO_EXEC_HEADER + prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
+  } else {
+    throw new Error(`council 不派 harness=${harness}（成員 ${name}）：claude 只准當 coordinator`)
+  }
   const timedOut = r.timedOut === true
-  const text = timedOut ? '' : (name === 'codex' ? r.stdout : (r.result && r.result.response) || '')
-  fs.writeFileSync(path.join(outDir, `${name}.txt`), text)
-  fs.writeFileSync(path.join(outDir, `${name}.stderr.txt`), r.stderr || '')
+  const text = timedOut ? '' : (harness === 'codex' ? r.stdout : (r.result && r.result.response) || '')
+  const file = memberFileName(name)
+  fs.writeFileSync(path.join(outDir, `${file}.txt`), text)
+  fs.writeFileSync(path.join(outDir, `${file}.stderr.txt`), r.stderr || '')
   const empty = timedOut || !text.trim()
   return {
     name,
     model,
+    harness,
+    quotaBucket: member.quotaBucket,
     exit: r.exit ?? null,
     signal: r.signal || null,
     timedOut,
@@ -126,23 +146,33 @@ export async function main(argv, deps = {}) {
     return 2
   }
 
+  // 🔴 --coordinator 必帶（或 env LLM_TEAM_COORDINATOR）：名單由 profile 決定，缺 ⇒ exit 2 並列出可用 profiles。
+  const env = deps.env || process.env
+  let models
+  try {
+    models = modelsFrom(config, env, typeof a.coordinator === 'string' ? a.coordinator : null)
+  } catch (e) {
+    console.error(`🔴 ${e.message}`)
+    return 2
+  }
+
   fs.mkdirSync(outDir, { recursive: true })
-  const run = deps.runOne || ((name, model, prompt, cwd, outDir, timeoutMs) => runOne(name, model, prompt, cwd, outDir, timeoutMs, deps))
+  // deps.runOne 是測試接縫：維持 (name, model, prompt, cwd, outDir, timeoutMs, member) 形狀，member 是第 7 個參數。
+  const run = deps.runOne
+    ? (member, prompt, cwd, outDir, timeoutMs) => deps.runOne(member.name, member.model, prompt, cwd, outDir, timeoutMs, member)
+    : (member, prompt, cwd, outDir, timeoutMs) => runOne(member, prompt, cwd, outDir, timeoutMs, deps)
   const timeoutMs = Number(a['timeout-ms'] || 8 * 60 * 1000)
-  const models = modelsFrom(config)
   let prompt
   let cwd = process.cwd()
-  const defaultNames = ['opus', 'gemini']
-  let members = (models.planners || []).map((m, i) => [defaultNames[i] || `reviewer-${i + 1}`, m])
+  const tier = a.tier === 'block' ? 'block' : 'standard'
+  const members = tier === 'block' ? models.blockReviewers : models.reviewers
 
   if (sub === 'plan') {
     if (!a.prompt) return usage()
-    prompt = fs.readFileSync(a.prompt, 'utf8')
-    if (a.codex) members.push(['codex', models.codex])
+    prompt = PLAN_PROMPT_SENTINEL + '\n' + fs.readFileSync(a.prompt, 'utf8')
   } else if (sub === 'review') {
     if (!a.worktree || !a.base || !a.brief) return usage()
     cwd = path.resolve(a.worktree)
-    const tier = a.tier === 'block' ? 'block' : 'standard'
     const diffStat = gitFn(cwd, ['diff', '--stat', a.base])
     let diff = gitFn(cwd, ['diff', a.base])
     const untracked = gitFn(cwd, ['ls-files', '--others', '--exclude-standard'])
@@ -157,14 +187,13 @@ export async function main(argv, deps = {}) {
       diff,
       tier,
       diffStat,
-      writerModel: models.writer,
+      writerModel: models.writer.model,
       riskDomains: config.riskDomains || [],
     })
-    if (tier === 'block' || a.codex || config.codexTier === 'all') members.push(['codex', models.codex])
   } else return usage()
 
   if (members.length === 0) {
-    console.error('🔴 沒有任何複審者（config.models.reviewers 空且未加 --codex）')
+    console.error(`🔴 沒有任何複審者（profile ${models.coordinator.profile} 的 ${tier === 'block' ? 'blockReviewers' : 'reviewers'} 空）`)
     return 2
   }
 
@@ -172,7 +201,7 @@ export async function main(argv, deps = {}) {
 
   const heartbeatMs = deps.heartbeatMs || (a['heartbeat-ms'] ? Number(a['heartbeat-ms']) : 60 * 1000)
   const startTime = Date.now()
-  const memberStatus = members.map(([name]) => ({
+  const memberStatus = members.map(({ name }) => ({
     name,
     done: false,
     durationMs: 0,
@@ -199,15 +228,15 @@ export async function main(argv, deps = {}) {
     if (a.sequential) {
       rows = []
       for (let i = 0; i < members.length; i++) {
-        const [name, model] = members[i]
-        const r = await run(name, model, prompt, cwd, outDir, timeoutMs)
+        const m = members[i]
+        const r = { harness: m.harness, quotaBucket: m.quotaBucket, ...(await run(m, prompt, cwd, outDir, timeoutMs)) }
         memberStatus[i].done = true
         memberStatus[i].durationMs = Date.now() - startTime
         rows.push(r)
       }
     } else {
-      const promises = members.map(async ([name, model], i) => {
-        const r = await run(name, model, prompt, cwd, outDir, timeoutMs)
+      const promises = members.map(async (m, i) => {
+        const r = { harness: m.harness, quotaBucket: m.quotaBucket, ...(await run(m, prompt, cwd, outDir, timeoutMs)) }
         memberStatus[i].done = true
         memberStatus[i].durationMs = Date.now() - startTime
         return r
@@ -219,7 +248,7 @@ export async function main(argv, deps = {}) {
   }
 
   for (let i = 0; i < members.length; i++) {
-    const [name, model] = members[i]
+    const { name, model } = members[i]
     const r = rows[i]
     // 🔴 事故：2026-09-13 票 E 第 4 輪 opus 785 秒、串行等 15 分無輸出；陽性對照：llm-team.test.mjs「council timeout 到期：假 runOne 回 signal: SIGTERM ⇒ 表格印 不簽（timeout）、exit 非 0」；停止條件：agy 自己回報「模型忙碌」事件、能立即失敗那天，本判定改成讀該事件。
     const isTimeout = r.timedOut === true
@@ -235,11 +264,15 @@ export async function main(argv, deps = {}) {
       r.exit = null
     }
     ledgerAppend(path.join(outDir, 'ledger.ndjson'), {
-      schemaVersion: 1,
-      tool: 'agy-council',
+      schemaVersion: 2,
+      tool: 'llm-team-council',
       sub,
+      coordinator: models.coordinator.profile,
+      tier,
       name,
       model,
+      harness: r.harness,
+      quotaBucket: r.quotaBucket,
       exit: r.exit,
       signal: r.signal,
       ms: r.ms,
@@ -248,6 +281,28 @@ export async function main(argv, deps = {}) {
       overall: v.overall,
     })
   }
+
+  // 🔴 members.json：【實際跑的】成員（身分三元組來自 members[i]，不是 runner 回報的字串）＋結果。
+  //    ticket run 只從這份取名單、publish 回頭讀這份比對三元組（codex 複審 Q5-IDENTITY；helpers 在 lib.mjs §複審名單身分三元組）。
+  //    invalid ＝ 有輸出但抓不到「整份：簽／不簽」那行（格式不合、不算簽）。
+  const membersOut = members.map((m, i) => {
+    const r = rows[i]
+    return {
+      name: m.name,
+      harness: m.harness,
+      model: m.model,
+      quotaBucket: m.quotaBucket,
+      overall: r.verdicts.overall,
+      q: r.verdicts.q,
+      empty: r.empty === true,
+      timedOut: r.timedOut === true,
+      invalid: r.empty !== true && r.verdicts.overall === null,
+      exit: r.exit ?? null,
+      signal: r.signal || null,
+      ms: r.ms ?? null,
+    }
+  })
+  fs.writeFileSync(path.join(outDir, 'members.json'), JSON.stringify(membersOut, null, 2))
 
   // 摘要表：空輸出要顯眼——「沒話說」與「被拒」同形，都不算簽。
   console.log(`| 成員 | model | exit | 秒 | 整份 | 逐題 |`)
@@ -265,7 +320,7 @@ export async function main(argv, deps = {}) {
         : (r.empty ? '🔴 零輸出' : r.verdicts.overall || '?'))
     console.log(`| ${r.name} | ${r.model} | ${r.exit} | ${Math.round(r.ms / 1000)} | ${overallDisplay} | ${per} |`)
   }
-  console.log(`\n輸出：${outDir}/{${rows.map((r) => r.name).join(',')}}.txt`)
+  console.log(`\n輸出：${outDir}/{${rows.map((r) => memberFileName(r.name)).join(',')}}.txt＋members.json`)
   return anyEmpty ? 3 : 0
 }
 

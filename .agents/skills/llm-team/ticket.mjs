@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 // ─────────────────── llm-team 票流程（run / publish / summary） ───────────────────
 // 用法：
-//   run:     node .agents/skills/llm-team/ticket.mjs run --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main] [--config <file>]
+//   run:     node .agents/skills/llm-team/ticket.mjs run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main] [--config <file>]
 //   publish: node .agents/skills/llm-team/ticket.mjs publish --name <n> [--title "<t>"] [--config <file>]
 //   summary: node .agents/skills/llm-team/ticket.mjs summary --name <n> [--config <file>]
 //
+// 🔴 2026-09-14 schema v2：`--coordinator`（或 env LLM_TEAM_COORDINATOR）必帶——複審名單由 config.profiles.<coordinator> 決定
+//   （一般票 reviewers、block 票 blockReviewers）；summary.schemaVersion 2 帶 coordinator 與 reviewers（預期名單）。
+// 🔴 Q5（2026-09-14 codex 複審）：summary.review.members ＝ council 實際跑的名單（來自 review/members.json、含 harness/model/quotaBucket）；
+//   實際 ≠ 預期 ⇒ summary.rosterMismatch: true、run 回 3；publish 比對三元組並回頭讀 members.json，缺檔／不符 ⇒ 擋。
+// 🔴 P5（2026-09-14）：任何 writeExit !== 0（含 2）⇒ 不跑 --test、不開 council、仍寫 summary（review = null）（以前 exit 3 會拿半成品去複審、exit 2 沒 summary）。
+//
 // 🔴 2026-09-13 三方共識：
-//   · P5：ticket 預設停在「已複審的 worktree＋收貨摘要」；ticket publish 才 commit、push、開 draft PR；永不自動 merge。
+//   · ticket 預設停在「已複審的 worktree＋收貨摘要」；ticket publish 才 commit、push、開 draft PR；永不自動 merge。
 //   · P4：G1–G6 是寫手 wrapper 的自我約束，不是 repo 的門；門仍是 GitHub ruleset＋PR review。
 //   · 統整者一張票只花兩個回合：一回合 ticket 起跑，一回合收貨。
 
@@ -16,6 +22,7 @@ import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
   modelsFrom,
+  memberFileName,
   git,
   changedFiles,
   parseArgs,
@@ -24,6 +31,9 @@ import {
   assertSettingsAllowRegex,
   agySettingsPath,
   isDirectRun,
+  readMembersJson,
+  compareRoster,
+  rosterLabel,
 } from './lib.mjs'
 import { main as writeMain } from './write.mjs'
 import { main as councilMain, parseVerdicts } from './council.mjs'
@@ -78,12 +88,27 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
   const lines = [
     `=== 收貨摘要：${summary.ticket} (${summary.branch}) ===`,
     `改動檔: ${summary.changed.join(', ') || '(無)'}`,
-    `write exit: ${summary.writeExit} (共 ${summary.rounds} 輪) | verify exit: ${summary.verifyExit !== null ? summary.verifyExit : '-'}`,
-    `harness: ${harness} | q6Receipt: ${q6} | dispositions: ${dispCount}`,
+    `write exit: ${summary.writeExit} (共 ${summary.rounds} 輪)${summary.writeTimedOut ? '【寫手逾時】' : ''} | verify exit: ${summary.verifyExit !== null && summary.verifyExit !== undefined ? summary.verifyExit : '-'}`,
+    `harness: ${harness} | coordinator: ${summary.coordinator || '-'} | q6Receipt: ${q6} | dispositions: ${dispCount}`,
   ]
+
+  if (summary.review === null) {
+    lines.push(
+      summary.writeExit !== 0
+        ? '🔴 未複審（write 非 0，P5：不跑 --test、不開 council）'
+        : '🟡 未複審（寫手沒有改動任何檔）'
+    )
+  }
 
   if (summary.tierEscalatedBy && summary.tierEscalatedBy.length > 0) {
     lines.push(`tierEscalatedBy: ${summary.tierEscalatedBy.join(', ')}`)
+  }
+
+  if (summary.rosterMismatch === true) {
+    const d = summary.rosterDiff || {}
+    const missing = (d.missing || []).map(rosterLabel).join(', ') || '(無)'
+    const unexpected = (d.unexpected || []).map(rosterLabel).join(', ') || '(無)'
+    lines.push(`🔴 rosterMismatch：council 實際名單 ≠ profile 預期名單（缺：${missing}；多：${unexpected}${d.reason ? `；${d.reason}` : ''}）`)
   }
 
   if (summary.review?.exit !== undefined && summary.review?.exit !== null) {
@@ -148,19 +173,27 @@ export async function main(argv, deps = {}) {
       console.error(`🔴 多餘的位置參數（--allow 要每個檔各給一次）：${a._.join(' ')}`)
       return 2
     }
+    const RUN_USAGE =
+      '用法：run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main]'
     if (!a.name || !a.brief || !a.branch || !a.allow || a.allow.length === 0 || !a.test) {
-      console.error(
-        '用法：run --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main]'
-      )
+      console.error(RUN_USAGE)
       return 2
     }
 
     if (a.tier !== undefined && a.tier !== 'standard' && a.tier !== 'block') {
-      console.error(
-        '用法：run --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main]'
-      )
+      console.error(RUN_USAGE)
       return 2
     }
+
+    // 🔴 --coordinator 必帶（或 env LLM_TEAM_COORDINATOR）：缺或不在 profiles ⇒ exit 2 並列出可用 profiles
+    let models
+    try {
+      models = modelsFrom(config, env, typeof a.coordinator === 'string' ? a.coordinator : null)
+    } catch (e) {
+      console.error(`🔴 ${e.message}`)
+      return 2
+    }
+    const coordinatorProfile = models.coordinator.profile
 
     const branchPrefixes = config.branchPrefixes
     if (branchPrefixes.length > 0 && !branchPrefixes.some((p) => a.branch.startsWith(p))) {
@@ -285,9 +318,20 @@ export async function main(argv, deps = {}) {
     const writeExit = writeMainFn(writeArgs, deps)
     appendLifecycle(outDir, { event: 'writer-done', ticket: a.name, writeExit }, env)
 
-    // c. write 回 2 ⇒ 若為本次新建且寫手未改動檔，清理殘骸；直接 exit 2 不複審
+    // 🔴 P5：write 非 0（含 2＝守門擋下、3＝被拒／越界／逾時）⇒ 不跑 --test、不開 council；以前 exit 3 落到 changed.length > 0 就拿半成品去複審。
+    //    陽性對照 ticket.test.mjs「P5 writeMain 回 3 且有改檔 ⇒ councilMain 假函式沒被呼叫、runTest 沒被呼叫、summary.review === null」；
+    //    停止條件：run 流程改為事件驅動狀態機時重審。
+    const writeFailed = writeExit !== 0
+    const timeoutFile = path.join(writeOutDir, 'timeout.json')
+    const writeTimedOut = fs.existsSync(timeoutFile)
+    // 🔴 changed 一定要在清 worktree 之前量（下面 exit 2 可能把 worktree 移掉）。
+    const changed = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
+
+    // c. write 回 2 ⇒ 若為本次新建且寫手未改動檔，清理殘骸。
+    //    🔴 2026-09-14 codex 複審 Q2-SUMMARY：以前這裡直接 return 2，exit 2 就沒有 summary.json／收貨摘要，收貨稽核看不到這張票。
+    //    現在照樣清殘骸，但仍往下寫 summary（review: null、writeExit: 2、writeTimedOut）並印收貨摘要，最後才回 2。
+    //    陽性對照 ticket.test.mjs「Q2 writeMain 回 2 ⇒ summary.json 存在且 review null」。
     if (writeExit === 2) {
-      const changed = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
       if (createdWorktree && changed.length === 0) {
         try {
           gitFn(repoRoot, ['worktree', 'remove', worktree])
@@ -297,16 +341,13 @@ export async function main(argv, deps = {}) {
           console.error(`⚠️ 清理 worktree 與分支失敗：${e.message}`)
         }
       }
-      console.error('🔴 write 失敗（exit 2），直接退出不複審。')
-      return 2
+      console.error('🔴 write 失敗（exit 2），不複審；仍寫 summary.json 供收貨稽核。')
     }
-
-    // 只要 worktree 有改動就跑 --test 一次再複審
-    const changed = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
     let verifyExit = null
     let councilExit = null
+    const doReview = !writeFailed && changed.length > 0
 
-    if (changed.length > 0) {
+    if (doReview) {
       const t = testFn(a.test, worktree)
       verifyExit = t.exit
 
@@ -326,47 +367,60 @@ export async function main(argv, deps = {}) {
         reviewOutDir,
         '--tier',
         tier,
+        '--coordinator',
+        coordinatorProfile,
       ]
       if (configFile) councilArgs.push('--config', configFile)
       councilExit = await councilMainFn(councilArgs, deps)
     }
 
-    // 收集複審成員結果
-    const models = modelsFrom(config)
-    const defaultNames = ['opus', 'gemini']
-    const expectedReviewers = (models.planners || []).map((m, i) => ({
-      name: defaultNames[i] || `reviewer-${i + 1}`,
-      model: m,
-    }))
-    // codexTier=all 時 codex 出席 standard 票（council.mjs），summary 必須收它——否則它的不簽 publish 看不見。陽性對照「T36 codexTier=all 時 standard 票收 codex 到 summary，codex 不簽則 publish 擋下」
-    if (tier === 'block' || config.codexTier === 'all') {
-      expectedReviewers.push({ name: 'codex', model: models.codex })
-    }
+    // 預期名單直接來自 profile（一般票 reviewers、block 票 blockReviewers）。
+    // 陽性對照 ticket.test.mjs「T36 block 票收 blockReviewers（含 codex）、standard 票收 reviewers；codex 不簽則 publish 擋下」
+    const expectedReviewers = (tier === 'block' ? models.blockReviewers : models.reviewers).map(
+      ({ name, harness, model, quotaBucket }) => ({ name, harness, model, quotaBucket })
+    )
 
+    // 🔴 實際名單只從 council 寫的 review/members.json 取（codex 複審 Q5-IDENTITY）：不再按預期檔名讀文字、自貼預期身分。
+    //    缺檔／格式不合 ⇒ 視為「無法證明誰跑過」⇒ rosterMismatch；三元組多重集合不相等（少一位／多一位／同 name 不同 model）⇒ rosterMismatch ⇒ run 回 3。
+    //    陽性對照 ticket.test.mjs「Q5 run：members.json 少一位／多一位／同 name 不同 model ⇒ run 回 3 且 summary.rosterMismatch」
     const reviewMembers = []
     let anyEmpty = false
+    let rosterMismatch = false
+    let rosterDiff = null
 
-    if (changed.length > 0) {
-      for (const rev of expectedReviewers) {
-        const txtFile = path.join(reviewOutDir, `${rev.name}.txt`)
-        let text = ''
-        if (fs.existsSync(txtFile)) {
-          text = fs.readFileSync(txtFile, 'utf8')
+    if (doReview) {
+      const membersFile = path.join(reviewOutDir, 'members.json')
+      const actual = readMembersJson(membersFile)
+      if (!actual) {
+        rosterMismatch = true
+        rosterDiff = { missing: expectedReviewers, unexpected: [], reason: `缺 council 的 members.json 或格式不合法：${membersFile}` }
+      } else {
+        for (const m of actual) {
+          const txtFile = path.join(reviewOutDir, `${memberFileName(m.name)}.txt`)
+          const text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : ''
+          const v = parseVerdicts(text)
+          const empty = m.empty === true || m.timedOut === true || !text.trim()
+          if (empty) anyEmpty = true
+          reviewMembers.push({
+            name: m.name,
+            harness: m.harness,
+            model: m.model,
+            quotaBucket: m.quotaBucket,
+            overall: m.overall !== undefined ? m.overall : v.overall,
+            q: m.q && typeof m.q === 'object' ? m.q : v.q,
+            empty,
+            timedOut: m.timedOut === true,
+            text,
+          })
         }
-        const empty = !text.trim()
-        if (empty) anyEmpty = true
-        const v = parseVerdicts(text)
-        reviewMembers.push({
-          name: rev.name,
-          model: rev.model,
-          overall: v.overall,
-          q: v.q,
-          empty,
-          text,
-        })
+        const diff = compareRoster(expectedReviewers, actual)
+        if (diff.mismatch) {
+          rosterMismatch = true
+          rosterDiff = { missing: diff.missing, unexpected: diff.unexpected }
+        }
       }
       if (councilExit === 3) anyEmpty = true
-      appendLifecycle(outDir, { event: 'review-done', ticket: a.name, anyEmpty }, env)
+      appendLifecycle(outDir, { event: 'review-done', ticket: a.name, anyEmpty, rosterMismatch }, env)
     }
 
     // 計算 rounds
@@ -378,28 +432,37 @@ export async function main(argv, deps = {}) {
       if (roundFiles.length > 0) rounds = roundFiles.length
     }
 
-    // d. 寫 summary.json
-    const reviewObj = {
-      tier,
-      members: reviewMembers.map(({ name, model, overall, q }) => ({ name, model, overall, q })),
-      anyEmpty,
-    }
-    if (councilExit !== null && councilExit !== 0 && councilExit !== 3) {
-      reviewObj.exit = councilExit
+    // d. 寫 summary.json（schemaVersion 2：coordinator＝profile 名、reviewers＝該票的預期名單；write 失敗 ⇒ review: null）
+    let reviewObj = null
+    if (doReview) {
+      reviewObj = {
+        tier,
+        members: reviewMembers.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut })),
+        anyEmpty,
+        membersSource: 'review/members.json',
+      }
+      if (councilExit !== null && councilExit !== 0 && councilExit !== 3) {
+        reviewObj.exit = councilExit
+      }
     }
 
     const summary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       project: path.basename(repoRoot),
       ticket: a.name,
       branch: a.branch,
       base,
+      coordinator: coordinatorProfile,
+      reviewers: expectedReviewers,
       writeExit,
+      writeTimedOut,
       rounds,
       changed,
       verifyExit,
       ...(tierEscalatedBy ? { tierEscalatedBy } : {}),
       review: reviewObj,
+      rosterMismatch,
+      ...(rosterDiff ? { rosterDiff } : {}),
       coordinatorTurns: null,
       harness,
       lifecycle: 'lifecycle.ndjson',
@@ -415,11 +478,15 @@ export async function main(argv, deps = {}) {
     const receiptLines = buildReceiptSummaryLines(summary, reviewMembers, summaryPath)
     console.log(receiptLines.join('\n'))
 
+    // write exit 2（守門擋下、寫手沒起跑）⇒ run 也回 2，與寫手的碼一致（summary 已寫）。
+    if (writeExit === 2) return 2
     // 🔴 2026-09-13 事故：寫手第 1 輪被拒（write exit 3、改動 0 檔）run 仍 exit 0 假綠；陽性對照 ticket.test.mjs「T19 writeMain 回 3、changed 空 ⇒ run 回 3（陽性對照：把第 1 點拿掉就回 0）」；停止條件：run 流程改為事件驅動狀態機且能原生傳播子程序 exit code 時重審
     if (writeExit !== 0) return 3
     // 🔴 2026-09-13 事故：模板票 verify 紅（exit 1）run 仍 exit 0 假綠；陽性對照 ticket.test.mjs「T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3」；停止條件：run 流程改為事件驅動狀態機且能原生傳播驗收 exit code 時重審
     if (verifyExit !== null && verifyExit !== 0) return 3
     if (councilExit !== null && councilExit !== 0 && councilExit !== 3) return councilExit
+    // 🔴 實際名單 ≠ 預期名單 ⇒ 3（陽性對照 ticket.test.mjs「Q5 run：…⇒ run 回 3」）
+    if (rosterMismatch) return 3
     if (anyEmpty) return 3
     return 0
   }
@@ -476,6 +543,12 @@ export async function main(argv, deps = {}) {
     }
 
     // Fail-closed 檢查
+    // 🔴 2026-09-14 schema v2：舊版 summary（沒有 coordinator／reviewers 名單）不准 publish；陽性對照 ticket.test.mjs「publish：summary schemaVersion 1 ⇒ 2 且 gh 假函式沒被呼叫」
+    if (summary.schemaVersion !== 2) {
+      console.error(`🔴 publish：summary.schemaVersion 為 ${JSON.stringify(summary.schemaVersion)}（非 2），重跑 ticket run 產新 summary`)
+      return 2
+    }
+
     // 🔴 2026-09-13 事故：寫手失敗（writeExit 非 0）時若帶有髒改動可能被誤開 PR；陽性對照 ticket.test.mjs「T30 publish：summary writeExit:3 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或 publish 改為吃不可篡改之寫手證明時重審
     if (summary.writeExit !== 0) {
       console.error(`🔴 publish：writeExit 為 ${summary.writeExit}（非 0），不得開 PR`)
@@ -494,10 +567,39 @@ export async function main(argv, deps = {}) {
       return 2
     }
 
-    // 🔴 2026-09-13 事故：複審成員少於 2 位不足法定人數（quorum 崩潰）被單方開 PR；陽性對照 ticket.test.mjs「T31 publish：summary review.members 少於 2 位 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：summary schema 改版或三方仲裁協議改版時重審
+    // 🔴 2026-09-13 事故：複審成員不足法定人數（quorum 崩潰）被單方開 PR。
+    //    2026-09-14 schema v2 改：法定人數＝profile 名單【全員到齊】（summary.reviewers 每一位都在 review.members），且至少 1 位——
+    //    v2 一般票名單只有 1 位複審者＋裁決者，硬套「≥ 2」會把每張一般票都擋死。
+    //    陽性對照 ticket.test.mjs「T31 publish：review.members 少於 summary.reviewers 名單 ⇒ 2 且 gh 假函式沒被呼叫」；停止條件：三方仲裁協議改版時重審
     const reviewMembersList = summary.review?.members || []
-    if (!Array.isArray(reviewMembersList) || reviewMembersList.length < 2) {
-      console.error(`🔴 publish：複審成員少於 2 位（${reviewMembersList.length} 位），不得開 PR`)
+    const roster = Array.isArray(summary.reviewers) ? summary.reviewers : []
+    if (!Array.isArray(reviewMembersList) || reviewMembersList.length < 1 || roster.length < 1) {
+      console.error(`🔴 publish：複審成員或名單為空（members ${reviewMembersList.length} 位、reviewers 名單 ${roster.length} 位），不得開 PR`)
+      return 2
+    }
+    // 🔴 2026-09-14 codex 複審 Q5-IDENTITY：全員到齊要比【身分三元組】harness+model+quotaBucket（不比 name——同短名模型會冒充），
+    //    而且要回頭讀 council 寫的 review/members.json（不只信 summary 自己貼的）：run 已記 rosterMismatch、缺檔、三元組不符 ⇒ 都擋。
+    //    陽性對照 ticket.test.mjs「Q5 publish：同 name 不同 model ⇒ 2（只比 name 會放過）；少一位／多一位／缺 members.json／rosterMismatch:true ⇒ 2」
+    if (summary.rosterMismatch === true) {
+      console.error('🔴 publish：run 已判 rosterMismatch（council 實際名單 ≠ profile 預期名單），不得開 PR')
+      return 2
+    }
+    const membersFile = path.join(outDir, 'review', 'members.json')
+    const actualOnDisk = readMembersJson(membersFile)
+    if (!actualOnDisk) {
+      console.error(`🔴 publish：缺 council 的實際名單（或格式不合法）：${membersFile}，無法證明全員簽署，不得開 PR`)
+      return 2
+    }
+    const fmtDiff = (d) =>
+      `缺：${d.missing.map(rosterLabel).join(', ') || '(無)'}；多：${d.unexpected.map(rosterLabel).join(', ') || '(無)'}`
+    const diskDiff = compareRoster(roster, actualOnDisk)
+    if (diskDiff.mismatch) {
+      console.error(`🔴 publish：複審名單未全員到齊（review/members.json 身分三元組 ≠ summary.reviewers），${fmtDiff(diskDiff)}，不得開 PR`)
+      return 2
+    }
+    const summaryDiff = compareRoster(roster, reviewMembersList)
+    if (summaryDiff.mismatch) {
+      console.error(`🔴 publish：複審名單未全員到齊（summary.review.members 身分三元組 ≠ summary.reviewers），${fmtDiff(summaryDiff)}，不得開 PR`)
       return 2
     }
 
@@ -569,7 +671,7 @@ export async function main(argv, deps = {}) {
     // 組 pr-body.md
     const reviewOutDir = path.join(outDir, 'review')
     const reviewMembers = (summary.review?.members || []).map((m) => {
-      const txtFile = path.join(reviewOutDir, `${m.name}.txt`)
+      const txtFile = path.join(reviewOutDir, `${memberFileName(m.name)}.txt`)
       const text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : ''
       return { ...m, text }
     })
@@ -644,7 +746,7 @@ export async function main(argv, deps = {}) {
 
     const reviewOutDir = path.join(outDir, 'review')
     const reviewMembers = (summary.review?.members || []).map((m) => {
-      const txtFile = path.join(reviewOutDir, `${m.name}.txt`)
+      const txtFile = path.join(reviewOutDir, `${memberFileName(m.name)}.txt`)
       const text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : ''
       return { ...m, text }
     })
