@@ -1389,3 +1389,68 @@ diff —— 排除 lockfile 與 archive 目錄，任一個拿不到就整輪不�
 
 **這條的通則**：「我覺得清楚」不是證據。要驗的是「第一次看的讀者猜了什麼」，
 而作者不可能是第一次看的讀者。
+
+---
+
+## 多模型分工工具進模板目錄，不做 npm 套件也不用 subtree
+
+2026-09-13 三方共識（agy opus-4-6／Gemini 3.1 Pro／codex sol）。
+
+**決定**：多模型派工與票流程腳本（`lib.mjs`、`write.mjs`、`council.mjs`、`ticket.mjs`、`setup.mjs`）直接進模板（舊：`.github/scripts/llm-team/`）目錄出貨。
+
+**拒絕的替代**：
+1. **獨立 npm 套件**：發布到 npm 會引入打包構建、版本相依與安裝門檻，且這套工具目前僅在真實專案跑過三張票，過早承諾套件 API 與語意版本維護是負擔不是資產。
+2. **git subtree / git submodule**：衍生專案複製模板時一向是一次性複製乾淨目錄（不含 submodule/subtree 複雜度），增加 git 操作複雜度且可能被分支閘門絆倒。
+3. **只留在特定衍生專案**：在 web-agency-system 實測證明有效，但多專案各自維護腳本會立刻重演代碼漂移與錯誤判定。
+
+**為什麼**：
+- **零相依、複製即用**：只用 Node.js 內建模組（`node:fs`、`node:path`、`node:child_process`），無需額外 npm install 即可運作。
+- **更新怎麼傳**：模板 repo 是單一真源，衍生專案以「逐字拿」方式同步腳本檔案。專案特有設定（模型 ID、指令白名單、worktree 路徑等）全部集中在 `config.json`，那是專案唯一該修改的設定檔。
+- **治理白名單決定**：同時將 `.claude/skills/` 納入 `check-pr-branch.sh` 的 `governance/*` 白名單。理由：它與 `prompts/` 同性質，皆為給 LLM 的操作規則（模板出貨的一部分），修改 skill 同屬改動流程與治理層，應允許在 governance PR 中維護。
+
+### 2026-09-13 修正：程式真源移到維護者的 config repo，模板只放唯讀快照
+
+三方三輪共識、Fergus 定案。llm-team 的程式只有一份可編輯真源（維護者私人 config repo `home/skills/llm-team/`）；模板放的是唯讀快照 `.agents/skills/llm-team/`（舊：`.github/scripts/llm-team/`），由真源的 `export.mjs` 產生，帶 `VERSION`、`SOURCE.json`（記來源 commit）與 `MANIFEST.sha256`。
+
+**決定**：
+- **快照＋manifest＋export**：程式真源在維護者私人 repo，模板只收唯讀快照與 manifest；CI 與 `test-llm-team.sh` 以 `setup.mjs --sync-check` 驗 manifest 完整性（零漂移 exit 0、漂移 exit 1、缺快照 exit 2），防人手手動修改快照。
+- **Harness 中立位置**：agy 找 `.agents/skills/<name>/SKILL.md`，Claude Code 找 `.claude/skills/<name>/`。正本放 harness 中立的 `.agents/skills/llm-team/`，`.claude/skills/llm-team` 建 symlink 指過去。專案設定在 repo 根 `llm-team.config.json`。
+
+**拒絕的替代**：
+1. **(a) 模板不放程式只指向私人 repo**：衍生專案與其他人 clone 後無法直接使用，破壞「開箱即用、零相依」。
+2. **(b) 先 merge 再搬**：分兩步會產生「舊程式已刪、快照未到」的空窗期；必須在同一個 PR 內原子切換。
+3. **(c) 雙向同步**：允許多處修改再 merge 會重演狀態發散與版本漂移；堅持單一真源、單向 export。
+
+**沒有的**：
+- **CI 不會自動拉真源**：export 由維護者手動在真源執行後 commit 快照進模板，CI 只驗快照與 manifest 一致性，不發任何連外請求。
+
+---
+
+## 2026-09-14 全系統預設 pnpm
+
+Fergus 定案（起因：發現衍生專案 GuildHub-frontend 用 npm——「pnpm 就是要節省資源，結果別的專案用別的方式，這樣就失去初衷了」）。
+
+**決定**：模板與所有衍生專案一律用 pnpm，不用 npm。`package-lock.json` → `pnpm-lock.yaml`（`pnpm import` 產生）；`package.json` 加 `packageManager` 欄釘死版本；CI 與 `.github/scripts/` 的安裝／執行指令全面改寫（`npm ci` → `pnpm install --frozen-lockfile`、`npm run`／`npm test` → `pnpm run`／`pnpm test`、`npx <lockfile 鎖住的 CLI>` → `pnpm exec <CLI>`、`npx <一次性遠端套件>` → `pnpm dlx <套件>`）；`llm-team.config.json` 的 `allowCommandHeads`／`installCommand` 同步改 pnpm 系。
+
+**為什麼**：pnpm 省的是**同一台機器多個專案共用 content-addressable store**（不同 repo 各自一份 `node_modules` 是重複磁碟佔用）＋**嚴格性**（預設不做 hoisting、不放行 phantom dependency——沒宣告的相依會直接解析不到而炸掉，這對 LLM 寫的程式碼是額外一層守門）。它**不**省測試記憶體／CPU／Vercel 建置額度／LLM API 額度——這幾類問題各有自己的解法，不要拿「統一 pnpm」去頂替。
+
+**遷移順序**：先改這個模板（不改的話，下一個從模板複製出去的衍生專案又會生出 npm），衍生專案再逐字跟進，不回頭改。
+
+**`lockfile-lint` 拿掉的理由**：5.x 版只認 npm／yarn 的 lockfile 格式，不認 `pnpm-lock.yaml`。等價的閘門改成直接掃 `pnpm-lock.yaml` 裡有沒有非 `registry.npmjs.org` 來源的 resolution（`tarball:`／`repo:`／`commit:` 這幾種欄位只會出現在非 registry 來源；一般套件只記 `integrity`）——邏輯跟 `lockfile-lint --validate-https --allowed-hosts npm` 等價，只是換一種格式去驗同一件事。
+
+**拒絕的替代**：
+1. **只改衍生專案，模板留 npm**：模板是所有新專案的起點，留著 npm 會讓「系統統一用 pnpm」這件事每次複製模板都要重做一次，而且下一個忘記的人會直接把 npm 傳下去。
+2. **兩種套件管理並存（依專案自選）**：拿統一 pnpm 換取的 content-addressable store 共用，只有全部專案都用同一套管理工具才成立；並存等於沒有統一。
+
+**沒有的**：
+- **不代表任何效能保證**：這條決定省的是磁碟與嚴格性，不是速度或成本；不要拿它當其他效能問題的答案。
+
+## 2026-09-14　llm-team 名單改成「每種統整者一組 profile」（schema v2），用量是第一約束
+
+**決定**：`llm-team.config.json` 不再有一份全域複審名單（`models.reviewers`＋`codexTier`），改成 `profiles.<統整者>`（`claude`／`agy`／`codex` 各一組：寫手、一般票複審、block 級複審、一般票裁決、block 未決）；`ticket run`／`council`／`setup --check` 必帶 `--coordinator`。config 載入時機械驗不變式：統整者不在自己票的名單、統整者與複審／裁決者不同額度桶、`claude` 只准當統整者、寫手只准 agy、block 未決一律交人。快照多了 `codex-pretooluse.sh`（codex 當統整者時的破壞性指令守門，接 `~/.codex/hooks.json`）。
+
+**為什麼**：衍生專案 2026-09-14 實測，agy 當統整者一天就把 Gemini 額度吃光——根因是統整者與複審者同一個額度桶「一票雙吃」，不是寫手。三種 harness 的額度桶大小差很多（codex 只有 ChatGPT Plus），所以名單必須跟著「誰在統整」變，而且要機械驗，不能靠人記。`agy`／`codex` profile 只在 Claude 額度用完時才開，名單就只剩另一桶、裁決交人——這是兩桶的結構限制，不是可調參數。
+
+**拒絕的替代**：三份 config 檔各對一種統整者（規則會漂、`setup --check` 只讀一份）；讓 Claude 當 agy／codex 模式的複審者（那兩個模式的前提就是 Claude 沒額度）；gpt-oss 替補（未校準）。
+
+**沒有的**：不含額度預檢（四個桶都沒有可查剩餘額度的 API）——規則是「打到 429 ⇒ 該角色停線、記進交接檔、下個 session 開票前先讀」。

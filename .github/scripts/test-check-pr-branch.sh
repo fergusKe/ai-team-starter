@@ -213,14 +213,16 @@ esac
 # **正常 fixture 永遠走不到** —— 而走不到的分支沒有測試就是空話。
 # 2026-09-07 實測：把那四條各拿掉一條，整套仍然全綠（4 個突變全存活）。
 #
-# 所以用一支假的 npx 餵那四種回應。它只攔 `openspec status`，其餘原樣轉給真的
-# npx —— 攔太多的話這幾條測到的就不是被測的那一關。
+# 所以用一支假的 pnpm 餵那四種回應。它只攔 `pnpm exec openspec status`，其餘原樣轉給真的
+# pnpm —— 攔太多的話這幾條測到的就不是被測的那一關。
+# （2026-09-14 改 pnpm 前是假 npx；`pnpm exec` 會把 node_modules/.bin 排到 PATH 最前面，
+#  所以假的必須是 `pnpm` 本身而不是 `openspec`。）
 STUB="$ROOT/stub-bin"
 mkdir -p "$STUB"
-REAL_NPX="$(command -v npx)"
-cat > "$STUB/npx" <<STUBEOF
+REAL_PNPM="$(command -v pnpm)"
+cat > "$STUB/pnpm" <<STUBEOF
 #!/usr/bin/env bash
-if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "openspec" ] && [ "\$2" = "status" ]; then
+if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "exec" ] && [ "\$2" = "openspec" ] && [ "\$3" = "status" ]; then
   case "\$STATUS_MODE" in
     empty)   exit 0 ;;
     badjson) printf 'not-json\\n'; exit 0 ;;
@@ -231,9 +233,9 @@ if [ -n "\${STATUS_MODE:-}" ] && [ "\$1" = "openspec" ] && [ "\$2" = "status" ];
     exit7)   printf '%s\\n' '{"artifacts":[{"id":"specs","status":"done"}]}'; exit 7 ;;
   esac
 fi
-exec "$REAL_NPX" "\$@"
+exec "$REAL_PNPM" "\$@"
 STUBEOF
-chmod +x "$STUB/npx"
+chmod +x "$STUB/pnpm"
 
 run_status() { # run_status <期望exit> <STATUS_MODE> <說明> <訊息片段>
   local want="$1" mode="$2" desc="$3" needle="$4"
@@ -277,7 +279,7 @@ run_status 1 badjson "status 不是合法 JSON → 拒"   "不是合法 JSON"
 run_status 1 missing "artifacts 裡沒有 specs → 拒" "找不到 \`specs\` 這一項"
 run_status 1 unknown "status 是沒見過的值 → 拒"    "只接受 \`done\`"
 # 陽性對照：同一個 fixture、不攔 status 的話要綠。
-# 沒有它的話，上面四條可能只是「假 npx 把什麼都弄壞了」。
+# 沒有它的話，上面四條可能只是「假 pnpm 把什麼都弄壞了」。
 run_status 1 blocked  "status = blocked → 拒"         "被擋住"
 # 合法 JSON ＋ 非零退出碼。`|| true` 會吞掉 rc，實測整支閘門回 rc=0。
 run_status 1 exit7    "status 印了合法 JSON 但 exit 7 → 拒" "以 exit 7 結束"
@@ -357,13 +359,13 @@ run 1 main chore/symlink       "加 symlink"               sh -c 'ln -s /etc/pas
 run 1 main chore/binary        "加 binary（含 NUL）"       sh -c '{ printf PNG; head -c 4 /dev/zero; printf binary; } > blob.bin'
 run 1 main chore/huge          "超過 bytes 上限"           sh -c 'head -c 30000 /dev/zero | tr "\0" "a" > big.txt'
 run 1 main chore/minified      "一行 minified"             sh -c 'head -c 30000 /dev/zero | tr "\0" "x" | tr -d "\n" > min.js'
-run 0 main chore/lockfile-bump "大 lockfile 不計入大小"     sh -c 'head -c 40000 /dev/zero | tr "\0" "b" > package-lock.json'
+run 0 main chore/lockfile-bump "大 lockfile 不計入大小"     sh -c 'head -c 40000 /dev/zero | tr "\0" "b" > pnpm-lock.yaml'
 
 echo "── archive/ ──"
 run 1 main archive/demo-change "夾帶程式碼"                sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main archive/demo-change "順手改了 change"           sh -c 'echo "改" >> openspec/changes/demo-change/proposal.md'
-run 0 main archive/demo-change "archive + 補上 Purpose"    sh -c 'npx openspec archive demo-change --yes && perl -0pi -e "s/TBD - created by archiving change [^\n]*/示範能力的完整說明：這一份描述系統目前在這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md'
-run 1 main archive/demo-change "archive 但 Purpose 留 TBD"  sh -c 'npx openspec archive demo-change --yes'
+run 0 main archive/demo-change "archive + 補上 Purpose"    sh -c 'pnpm exec openspec archive demo-change --yes && perl -0pi -e "s/TBD - created by archiving change [^\n]*/示範能力的完整說明：這一份描述系統目前在這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md'
+run 1 main archive/demo-change "archive 但 Purpose 留 TBD"  sh -c 'pnpm exec openspec archive demo-change --yes'
 
 echo "── governance/ ──"
 run 0 main governance/fix-ci     "改 CI"                  sh -c 'echo "#" >> .github/workflows/ci.yml'
@@ -392,13 +394,13 @@ run 1 main chore/weird-name      "檔名含換行字元"                   sh -c
 
 echo "── archive 內容身分 ──"
 run 1 main archive/demo-change "archive 之後竄改被封存的規格"        sh -c '
-  npx openspec archive demo-change --yes
+  pnpm exec openspec archive demo-change --yes
   perl -0pi -e "s/TBD - created by archiving change [^\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
   f=$(ls -d openspec/changes/archive/*/specs/demo/spec.md)
   printf "\n#### Scenario: [DEMO-01-S09] 偷加的情境\n- **WHEN** a\n- **THEN** b\n" >> "$f"'
 
 run 1 main archive/demo-change "誘餌 archive 目錄不得遮蔽竄改"     sh -c '
-  npx openspec archive demo-change --yes
+  pnpm exec openspec archive demo-change --yes
   f=$(ls -d openspec/changes/archive/*/specs/demo/spec.md)
   # 誘餌：排序在真正的 archive 之後、內容乾淨。
   # 舊的 regex [^/]*<id>/ 會把它也算進來並覆蓋掉真的那一份 → 假通過。
@@ -410,18 +412,18 @@ run 1 main archive/demo-change "誘餌 archive 目錄不得遮蔽竄改"     sh 
   perl -0pi -e "s/TBD - created by archiving change [^\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md'
 
 run 1 main archive/demo-change "動到別的 change 的 archive"        sh -c '
-  npx openspec archive demo-change --yes
+  pnpm exec openspec archive demo-change --yes
   perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
   mkdir -p openspec/changes/archive/2026-01-01-undemo-change
   echo x > openspec/changes/archive/2026-01-01-undemo-change/proposal.md'
 
 run 1 main archive/demo-change "兩個目錄都配得上同一個 id"        sh -c '
-  npx openspec archive demo-change --yes
+  pnpm exec openspec archive demo-change --yes
   perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
   cp -R openspec/changes/archive/*-demo-change openspec/changes/archive/2099-01-01-demo-change'
 
 run 1 main archive/demo-change "archive 裡多出 main 沒有的檔案"   sh -c '
-  npx openspec archive demo-change --yes
+  pnpm exec openspec archive demo-change --yes
   perl -0pi -e "s/TBD - created by archiving change [^\\n]*/這一份描述系統目前在 demo 這個 capability 上的行為、邊界與失敗處理，是新加入的人要看的第一份文件。/" openspec/specs/demo/spec.md
   d=$(ls -d openspec/changes/archive/*-demo-change)
   echo "偷夾帶" > "$d/extra.md"'
@@ -432,9 +434,8 @@ run 1 main archive/nonexistent "archive 一個不存在的 change"      sh -c '
 
 echo "── chore 的 lockfile 與 LFS ──"
 run 1 main chore/lock-whitespace "lockfile 塞入大量合法空白"         sh -c 'python3 -c "
-import io,json
-d=json.load(io.open(\"package-lock.json\",encoding=\"utf-8\"))
-io.open(\"package-lock.json\",\"w\",encoding=\"utf-8\").write(json.dumps(d,indent=250))
+import io
+io.open(\"pnpm-lock.yaml\",\"a\",encoding=\"utf-8\").write(\"\\n\" * 1200000)
 "'
 run 1 main chore/lfs-attrs       "chore 改 .gitattributes"          sh -c 'echo "assets/* filter=lfs diff=lfs merge=lfs -text" > .gitattributes'
 run 1 main chore/lfs-pointer     "chore 加 LFS pointer"             sh -c 'printf "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 999999\n" > payload.bin'

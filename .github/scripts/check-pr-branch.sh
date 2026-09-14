@@ -22,7 +22,7 @@ set -euo pipefail
 BASE="${1:?用法: check-pr-branch.sh <base-ref> <head-ref>}"
 HEAD="${2:?用法: check-pr-branch.sh <base-ref> <head-ref>}"
 
-# chore/ 的 diff 上界（bytes）。不含 package-lock.json。
+# chore/ 的 diff 上界（bytes）。不含 pnpm-lock.yaml。
 # 為什麼用 bytes 不用行數：一行幾 MB 的 minified JS、一行 base64
 # 在行數上都是 1。bytes 一個上界同時涵蓋行數、單行長度與編碼把戲。
 CHORE_MAX_BYTES=20000
@@ -175,7 +175,7 @@ SPEC_FLAG_HINT
     # 腳本殺掉**（實測 exit 7），下面那段診斷訊息根本來不及印。方向雖然還是
     # fail-closed，但使用者只會看到一個沒有解釋的退出碼。
     STATUS_RC=0
-    STATUS_JSON="$(npx openspec status --change "$ID" --json 2>/dev/null)" || STATUS_RC=$?
+    STATUS_JSON="$(pnpm exec openspec status --change "$ID" --json 2>/dev/null)" || STATUS_RC=$?
     STATUS_JSON="$STATUS_JSON" STATUS_RC="$STATUS_RC" \
     python3 - "$ID" <<'SPEC_IDENTITY'
 import sys, os, json
@@ -243,7 +243,7 @@ if st != "done":
         "  認不得的值一律拒（fail-closed）—— 放行等於把判斷交給一個沒人讀過的字串。")
 SPEC_IDENTITY
 
-    npx openspec validate "$ID" --strict
+    pnpm exec openspec validate "$ID" --strict
 
     # Scenario 穩定 ID。
     #
@@ -403,12 +403,12 @@ SCENARIO_IDS
     # 算進去的話任何套件更新都會被擋），**但不是完全豁免**：
     # 完全豁免的話，在 lockfile 尾端塞幾 MB 合法 JSON 空白就能把
     # 「review 面積有上界」整個破掉 —— numstat 當它是文字、raw mode
-    # 是普通 100644、lockfile-lint 只驗來源不驗大小、npm ci 也接受。
-    BYTES="$(git diff --no-renames "$RANGE" -- . ':(exclude)package-lock.json' | wc -c | tr -d ' ')"
+    # 是普通 100644、lockfile-lint 只驗來源不驗大小、pnpm install --frozen-lockfile 也接受。
+    BYTES="$(git diff --no-renames "$RANGE" -- . ':(exclude)pnpm-lock.yaml' | wc -c | tr -d ' ')"
     [ "$BYTES" -le "$CHORE_MAX_BYTES" ] \
       || fail "chore 的 diff 是 ${BYTES} bytes，超過上限 ${CHORE_MAX_BYTES}（不含 lockfile）。要嘛拆小，要嘛它其實需要一份規格。"
 
-    LOCK_BYTES="$(git diff --no-renames "$RANGE" -- package-lock.json | wc -c | tr -d ' ')"
+    LOCK_BYTES="$(git diff --no-renames "$RANGE" -- pnpm-lock.yaml | wc -c | tr -d ' ')"
     [ "$LOCK_BYTES" -le "$CHORE_MAX_LOCKFILE_BYTES" ] \
       || fail "chore 的 lockfile diff 是 ${LOCK_BYTES} bytes，超過上限 ${CHORE_MAX_LOCKFILE_BYTES}。這個量級的相依性變動不該走 chore。"
 
@@ -515,11 +515,11 @@ ARCHIVE_IDENTITY
 
     # 兩個 validate 都要過。
     # --archived 驗 tasks 有沒有全部完成（這是整個流程裡唯一驗它的地方）。
-    npx openspec validate --archived --strict
+    pnpm exec openspec validate --archived --strict
     # --all 驗新生成的 main spec。archive 產生的 Purpose 是
     # 「TBD - created by archiving change <id>. Update Purpose after archive.」
     # 不改掉的話這一關會紅。**這正是要的** —— 沒有它，PR 全綠、合併後 main 才爆。
-    npx openspec validate --all --strict
+    pnpm exec openspec validate --all --strict
 
     echo "✓ archive：${ID}"
     ;;
@@ -545,11 +545,13 @@ ARCHIVE_IDENTITY
     # （它本來只是治理選擇 —— 那時機器不讀它。排程從它身上刪掉之後，
     # 剩下的關係是「索引」，而索引是可以驗的。）
     #
+    # `.claude/skills/` 也在清單裡：它跟 `prompts/` 一樣是給 LLM 的操作規則（模板出貨的一部分），改了它同屬改流程。`.agents/skills/` 同理（它是 agy 的 skill 位置，`.claude/skills/llm-team` 只是 symlink）。
+    #
     # 注意：這一關擋不住「在 PR 裡把 ci.yml 改成 run: true」。
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.gitignore$|AGENTS\.md|CLAUDE\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|package-lock\.json)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.claude/skills/|\.agents/skills/|llm-team\.config\.json$|\.gitignore$|AGENTS\.md|CLAUDE\.md|GEMINI\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|pnpm-lock\.yaml$|package-lock\.json$)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1

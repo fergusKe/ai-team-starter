@@ -23,7 +23,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 # 零份現況 spec 是合法狀態（剛從模板複製的專案）。問 OpenSpec，不要自己 glob——
 # 放一份帶 markdown 範例的 README 進去，glob 看得到 Scenario 而 OpenSpec 說沒有。
-SPECS_JSON="$(npx openspec list --specs --json 2>/dev/null)" || SPECS_JSON=""
+SPECS_JSON="$(pnpm exec openspec list --specs --json 2>/dev/null)" || SPECS_JSON=""
 if [ -n "$SPECS_JSON" ] && printf '%s' "$SPECS_JSON" | python3 -c '
 import json, sys
 try:
@@ -40,7 +40,7 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/scenario-cov.XXXXXXXX")"
 REPORT="$W/vitest.json"
 
 # 每次都用全新的暫存檔 —— 讀到上一次留下的報告是這種檢查最典型的說謊方式。
-if ! npx vitest run --reporter=json --outputFile="$REPORT" >"$W/vitest.log" 2>&1; then
+if ! pnpm exec vitest run --reporter=json --outputFile="$REPORT" >"$W/vitest.log" 2>&1; then
   echo "✗ 測試沒有全綠 —— 先把測試修綠，缺口清單在那之前沒有意義" >&2
   tail -20 "$W/vitest.log" >&2
   echo "測試輸出留在：$W" >&2

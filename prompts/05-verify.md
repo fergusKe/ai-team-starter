@@ -5,7 +5,7 @@
 ```bash
 openspec validate <change> --strict
 openspec status --change <change>
-npm run lint && npm run typecheck && npm test && npm run build
+pnpm run lint && pnpm run typecheck && pnpm test && pnpm run build
 ```
 
 逐條對照 `AGENTS.md` 的〈完成的定義〉：
@@ -23,7 +23,7 @@ npm run lint && npm run typecheck && npm test && npm run build
 - [ ] CI 在 PR 上綠燈
 - [ ] 規格沒寫的東西，你沒有順手做
 
-**特別檢查一件事**：`npm test` 有真的跑到測試嗎？
+**特別檢查一件事**：`pnpm test` 有真的跑到測試嗎？
 測試檔是零個的時候，有的 runner 直接失敗、有的直接通過 ——
 **兩種都不算驗證過**。要看到測試數量。
 

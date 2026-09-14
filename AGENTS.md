@@ -27,8 +27,8 @@ Repository 內其他文件與本檔衝突時，以本檔為準。
 
 ```bash
 git branch --show-current                  # 你在哪個 change 上
-npx openspec list                          # 有哪些 change
-npx openspec status --change <name>        # 已經在某個 change 上才跑；<name> 是上一行列出的其中一個
+pnpm exec openspec list                          # 有哪些 change
+pnpm exec openspec status --change <name>        # 已經在某個 change 上才跑；<name> 是上一行列出的其中一個
 bash .github/scripts/progress.sh           # 做到哪裡；剛複製的話還會列出待辦
 ```
 
@@ -388,6 +388,36 @@ ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）�
 就是 2**，因為還沒有任何現況 spec，這是正常的。
 它**抓不到**的：兩條決策語意衝突但沒寫 `Supersedes`（不推斷，人審）；證據測試其實是
 `test.skip`（路徑存在只代表有交卷）。
+
+### 多模型分工的票流程（**是寫手的自我約束，不是 repo 的門**）
+
+`.agents/skills/llm-team/` 放的是唯讀快照，以 `node .agents/skills/llm-team/setup.mjs --sync-check` 驗 manifest。
+快照**不准手改**——要改程式去真源改、重新 export；`SOURCE.json` 記來源 commit。
+
+```bash
+node .agents/skills/llm-team/setup.mjs --check --coordinator <claude|agy|codex>   # 對帳 config 不變式、守門、各角色 binary、該 harness 的 hooks
+node .agents/skills/llm-team/ticket.mjs run --coordinator <claude|agy|codex> --name <n> ...   # 寫手實作＋複審（名單由 profile 決定）
+node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
+```
+
+**為什麼分工。** 統整者（Claude Code／agy／codex 三種，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`／本檔）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
+動手寫，再由獨立模型複審。**寫手與複審名單只住 `llm-team.config.json` 的 `profiles.<統整者>`**（schema v2；本檔不寫死模型名；統整者與複審者不同額度桶、統整者不在自己票的名單、`claude` 只准當統整者——這些是 config 載入時機械驗的不變式，違反就拒開票）。`agy`／`codex` profile 是「Claude 額度用完」時的備用模式，名單只剩另一桶、裁決交人；`codex` 只做短票。省的是統整者回合，
+作者≠審核者避免「自己寫自己審」的盲區。
+**角色哨兵（本檔也會被 `council.mjs` 叫起的 codex 無頭複審者讀到）**：提示第一行是 `【llm-team 複審票】`／`【llm-team 規劃】` ⇒ 你是複審者／裁決者，只答提示裡的 Q 題（異議格式 `<ID> [BLOCK|PROC|NIT]`），不必讀本檔其餘段落。
+**codex 當統整者**：`codex -m <model> -c model_reasoning_effort="medium" --sandbox workspace-write -c 'sandbox_workspace_write.network_access=true'`（全域 config 維持 read-only、不用 danger-full-access）；守門走 `~/.codex/hooks.json` → 快照 `codex-pretooluse.sh`（`setup --check --coordinator codex` 對帳＋deny canary；hooks.json 要在互動 session 信任一次才載入，開工先在可拋棄目錄做一次 canary）。
+
+**寫手 wrapper 的自我約束（G1–G6 各擋什麼）。**
+- G1：worktree 不在 main 且乾淨（不污損主分支）。
+- G2：settings.json allow regex 對帳（防指令被拒靜默退出）。
+- G3：stream-json 判定工作成功而非程序成功（防 exit 0 假象）。
+- G4：越界改檔 fail-closed（不修、不還原、回統整者）。
+- G5：每輪寫 ndjson 台帳（留可稽核軌跡）。
+- G6：迴圈硬上限 ≤ 5 輪（防無窮空轉）。
+
+**信任邊界。** 本機閘可繞、不得當安全邊界；GitHub PR ruleset 才是唯一的門。
+產物與台帳在 `.local/llm-team/`。
+「不簽」不是紅燈，是統整者要讀的訊息；統整者必須親自開檔坐實每位審查者的 Q6，
+無誤才觸發 `publish`，永不自動 merge，最終由人核准合併。
 
 ### CI 的 workflow 檢查
 

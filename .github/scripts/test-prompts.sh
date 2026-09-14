@@ -14,7 +14,7 @@
 # 判準跟其他幾支一樣：**把修正改回去，這支要變紅。**
 #   02 的分支改回 feat/            → T1／T6 紅
 #   拿掉 gh pr create 的 --base main → T3 紅
-#   03 的 npx openspec 改回裸指令    → T4 紅
+#   03 的 pnpm exec openspec 改回裸指令 → T4 紅
 #   03 的 git pull 拿掉 --ff-only    → T5 紅
 #
 # 零依賴：bash + git + 系統 python3。**不打網路**：origin 是本機 bare repo，
@@ -90,9 +90,9 @@ BASEVAL="$(printf '%s\n' "$B02" | tr ' ' '\n' | grep -A1 -x -- '--base' | tail -
   && ok "02 的 --base 值精確等於 main" \
   || bad "02 的 --base 值精確等於 main" "實際：${BASEVAL:-（沒有 --base）}"
 
-# ── T4：提示檔裡的 openspec 一律是 npx openspec ────────────────────────────
+# ── T4：提示檔裡的 openspec 一律是 pnpm exec openspec（2026-09-14 前是 npx openspec） ────────────────────────────
 # 裸 openspec 解析到的是全域那份，不是 lockfile 鎖住的版本（README 有一整節）。
-BARE="$(printf '%s\n%s\n' "$B02" "$B03" | grep -nE '(^|[;&|(]|\s)openspec\s' | grep -v 'npx openspec' || true)"
+BARE="$(printf '%s\n%s\n' "$B02" "$B03" | grep -nE '(^|[;&|(]|\s)openspec\s' | grep -v 'pnpm exec openspec' || true)"
 [ -z "$BARE" ] && ok "提示檔裡沒有裸 openspec 指令" || bad "提示檔裡沒有裸 openspec 指令" "$BARE"
 
 # ── T5：更新 main 用 --ff-only（別在本機生出 merge commit）─────────────────
