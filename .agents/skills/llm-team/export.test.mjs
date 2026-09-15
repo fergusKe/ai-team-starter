@@ -1031,5 +1031,235 @@ describe('export.mjs 快照導出與驗證測試', () => {
     const allErr = errs.join('\n')
     assert.ok(allErr.includes('快照 test.sh 失敗'), `stderr 應包含「快照 test.sh 失敗」，實際：${allErr}`)
   })
+
+  test('exportAll: target 帶 postExport 且 runPostExport 回 0 ⇒ 被呼叫一次、收到 (root, argv)、照常 commit、回 0', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-success-')
+    const targets = [
+      { name: 't1-post', root: t1.dir, mode: 'main', postExport: ['x'] },
+    ]
+
+    const calls = []
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = exportAll(sourceDir, targets, {
+        deps: {
+          git: fakeGit,
+          runSyncCheck: () => 0,
+          runSnapshotTests: () => 0,
+          runPostExport: (root, argv) => {
+            calls.push({ root, argv })
+            return 0
+          },
+        },
+      })
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `exportAll 應回 0，實際：${code}`)
+    assert.equal(calls.length, 1, `runPostExport 應被呼叫 1 次，實際：${calls.length}`)
+    assert.equal(calls[0].root, t1.dir, `runPostExport root 應為 ${t1.dir}，實際：${calls[0]?.root}`)
+    assert.deepEqual(calls[0].argv, ['x'], `runPostExport argv 應為 ['x']，實際：${JSON.stringify(calls[0]?.argv)}`)
+    const commits = t1.g('rev-list', '--count', 'HEAD~1..HEAD').stdout.trim()
+    assert.equal(commits, '1', `commit 數應為 1，實際：${commits}`)
+    const allLog = logs.join('\n')
+    assert.ok(allLog.includes('▶ t1-post postExport：x'), `log 應含 ▶ t1-post postExport：x，實際：${allLog}`)
+  })
+
+  test('exportAll: runPostExport 回 1 ⇒ 回 3、沒有 commit、快照仍在工作樹、留在 branch、stderr 含提示', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-fail-')
+    const targets = [
+      { name: 't1-branch', root: t1.dir, mode: 'branch', postExport: ['some-guard'] },
+    ]
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = exportAll(sourceDir, targets, {
+        deps: {
+          git: fakeGit,
+          runSyncCheck: () => 0,
+          runSnapshotTests: () => 0,
+          runPostExport: () => 1,
+        },
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 3, `exportAll 應回 3，實際：${code}`)
+
+    // 沒有 commit（git log 在 tmp target 仍只有初始 commit）
+    const logLines = t1.g('log', '--oneline').stdout.trim().split('\n')
+    assert.equal(logLines.length, 1, `commit 數應為 1（僅初始 commit），實際：${logLines.length} 行：${JSON.stringify(logLines)}`)
+    assert.ok(logLines[0].includes('initial commit'), `僅有的 commit 應為 initial commit，實際：${logLines[0]}`)
+
+    // 快照檔仍在工作樹
+    const snap = path.join(t1.dir, '.agents', 'skills', 'llm-team')
+    assert.ok(fs.existsSync(snap), `快照目錄應留在工作樹：${snap}`)
+    assert.ok(fs.existsSync(path.join(snap, 'SOURCE.json')), '快照 SOURCE.json 應存在工作樹')
+
+    // branch 模式時當前分支仍是 chore/llm-team-1
+    const currBranch = t1.g('branch', '--show-current').stdout.trim()
+    assert.equal(currBranch, 'chore/llm-team-1', `當前分支應為 chore/llm-team-1，實際：${currBranch}`)
+
+    // stderr 含「postExport 失敗」與「git restore --staged --worktree」與「git branch -d chore/llm-team-1」
+    const allErr = errs.join('\n')
+    assert.ok(allErr.includes('postExport 失敗'), `stderr 應包含「postExport 失敗」，實際：${allErr}`)
+    assert.ok(allErr.includes('git restore --staged --worktree'), `stderr 應包含「git restore --staged --worktree」，實際：${allErr}`)
+    assert.ok(allErr.includes('git branch -d chore/llm-team-1'), `stderr 應包含「git branch -d chore/llm-team-1」，實際：${allErr}`)
+  })
+
+  test('exportAll: 沒有 postExport 欄位 ⇒ runPostExport 不被呼叫、回 0', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-no-pe-')
+    const targets = [
+      { name: 't1-no-pe', root: t1.dir, mode: 'main' },
+    ]
+
+    let callCount = 0
+    const code = exportAll(sourceDir, targets, {
+      deps: {
+        git: fakeGit,
+        runSyncCheck: () => 0,
+        runSnapshotTests: () => 0,
+        runPostExport: () => {
+          callCount++
+          return 0
+        },
+      },
+    })
+
+    assert.equal(code, 0, `exportAll 應回 0，實際：${code}`)
+    assert.equal(callCount, 0, `runPostExport 不應被呼叫，實際呼叫次數：${callCount}`)
+    const commits = t1.g('rev-list', '--count', 'HEAD~1..HEAD').stdout.trim()
+    assert.equal(commits, '1', `commit 數應為 1，實際：${commits}`)
+  })
+
+  test('exportAll: postExport 元素非字串 ⇒ 回 3、stderr 含「必須是字串陣列」、沒有 commit', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-invalid-')
+    const targets = [
+      { name: 't1-invalid', root: t1.dir, mode: 'main', postExport: ['a', 1] },
+    ]
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = exportAll(sourceDir, targets, {
+        deps: {
+          git: fakeGit,
+          runSyncCheck: () => 0,
+          runSnapshotTests: () => 0,
+        },
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 3, `exportAll 應回 3，實際：${code}`)
+    const allErr = errs.join('\n')
+    assert.ok(allErr.includes('必須是字串陣列'), `stderr 應包含「必須是字串陣列」，實際：${allErr}`)
+
+    const logLines = t1.g('log', '--oneline').stdout.trim().split('\n')
+    assert.equal(logLines.length, 1, `commit 數應為 1（沒有新 commit），實際：${logLines.length} 行`)
+    assert.ok(logLines[0].includes('initial commit'), `僅有的 commit 應為 initial commit，實際：${logLines[0]}`)
+  })
+
+  test('exportAll: 不注入 runPostExport（真 spawn）且 postExport: ["true"] ⇒ 回 0 且有 commit', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-true-')
+    const targets = [
+      { name: 't1-true', root: t1.dir, mode: 'main', postExport: ['true'] },
+    ]
+
+    const code = exportAll(sourceDir, targets, {
+      deps: {
+        git: fakeGit,
+        runSyncCheck: () => 0,
+        runSnapshotTests: () => 0,
+      },
+    })
+
+    assert.equal(code, 0, `exportAll 應回 0，實際：${code}`)
+    const commits = t1.g('rev-list', '--count', 'HEAD~1..HEAD').stdout.trim()
+    assert.equal(commits, '1', `commit 數應為 1，實際：${commits}`)
+  })
+
+  test('exportAll: 不注入 runPostExport（真 spawn）且 postExport: ["false"] ⇒ 回 3、沒有 commit', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-false-')
+    const targets = [
+      { name: 't1-false', root: t1.dir, mode: 'main', postExport: ['false'] },
+    ]
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = exportAll(sourceDir, targets, {
+        deps: {
+          git: fakeGit,
+          runSyncCheck: () => 0,
+          runSnapshotTests: () => 0,
+        },
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 3, `exportAll 應回 3，實際：${code}`)
+    const logLines = t1.g('log', '--oneline').stdout.trim().split('\n')
+    assert.equal(logLines.length, 1, `commit 數應為 1（沒有新 commit），實際：${logLines.length} 行`)
+    assert.ok(logLines[0].includes('initial commit'), `僅有的 commit 應為 initial commit，實際：${logLines[0]}`)
+    const allErr = errs.join('\n')
+    assert.ok(allErr.includes('postExport 失敗'), `stderr 應包含「postExport 失敗」，實際：${allErr}`)
+  })
+
+  test('exportAll: deps.runPostExport 回傳非數字（如 undefined）⇒ 回 3、stderr 含「postExport 失敗」與「不是數字」、沒有新 commit', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-pe-undefined-')
+    const targets = [
+      { name: 't1-undefined', root: t1.dir, mode: 'main', postExport: ['x'] },
+    ]
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = exportAll(sourceDir, targets, {
+        deps: {
+          git: fakeGit,
+          runSyncCheck: () => 0,
+          runSnapshotTests: () => 0,
+          runPostExport: () => undefined,
+        },
+      })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 3, `exportAll 應回 3，實際：${code}`)
+
+    const allErr = errs.join('\n')
+    assert.ok(allErr.includes('postExport 失敗'), `stderr 應包含「postExport 失敗」，實際：${allErr}`)
+    assert.ok(allErr.includes('不是數字'), `stderr 應包含「不是數字」，實際：${allErr}`)
+
+    const logLines = t1.g('log', '--oneline').stdout.trim().split('\n')
+    assert.equal(logLines.length, 1, `commit 數應為 1（僅初始 commit），實際：${logLines.length} 行：${JSON.stringify(logLines)}`)
+    assert.ok(logLines[0].includes('initial commit'), `僅有的 commit 應為 initial commit，實際：${logLines[0]}`)
+  })
 })
+
 

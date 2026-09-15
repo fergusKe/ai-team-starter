@@ -449,6 +449,66 @@ export function exportAll(sourceDir, targets, { force = false, deps = {}, git, s
       return 3
     }
 
+    // (d′) postExport：快照 test.sh 綠之後、git add 之前跑 target 專案自己維護的守門入口
+    // 事故：1.7.0 快照進 WAS d019b3627 時 --all 全綠、M4 完整 guards 才紅（git-env-hygiene 台帳），補票 f21cb3652 才過——快照自己的 test.sh 量不到 target 守門怎麼看它，所以這裡跑 target 自己的入口。
+    const postExport = Array.isArray(target.postExport) ? target.postExport : null
+    if (postExport && postExport.length > 0) {
+      if (postExport.some((x) => typeof x !== 'string')) {
+        console.error(`🔴 ${name} postExport 必須是字串陣列`)
+        const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+        console.error(`已完成的 target：${doneStr}；停在：${name}`)
+        return 3
+      }
+
+      console.log(`▶ ${name} postExport：${postExport.join(' ')}`)
+
+      let postCode = 0
+      let postErrMsg = ''
+      if (effectiveDeps.runPostExport) {
+        const res = effectiveDeps.runPostExport(root, postExport)
+        if (typeof res === 'number') {
+          postCode = res
+        } else if (res && typeof res === 'object' && typeof res.status === 'number') {
+          postCode = res.status
+          if (res.error?.message) postErrMsg = res.error.message
+        } else {
+          postCode = null
+          postErrMsg = 'runPostExport 回傳值不是數字'
+        }
+      } else {
+        const rPost = spawnSync(postExport[0], postExport.slice(1), {
+          cwd: root,
+          env: CLEAN_GIT_ENV,
+          encoding: 'utf8',
+          stdio: 'inherit',
+        })
+        if (rPost.status === null || rPost.status === undefined) {
+          postCode = null
+          postErrMsg = rPost.error?.message || ''
+        } else {
+          postCode = rPost.status
+          if (rPost.error?.message) {
+            postErrMsg = rPost.error.message
+          }
+        }
+      }
+
+      if (postCode !== 0) {
+        const exitInfo = postErrMsg ? `${postCode ?? 'null'}: ${postErrMsg}` : `${postCode ?? 'null'}`
+        const branch = mode === 'branch' ? branchName : 'main'
+        let restoreHint = `cd ${root} && git restore --staged --worktree .agents/skills/llm-team`
+        if (mode === 'branch') {
+          restoreHint += ` && git switch main && git branch -d ${branchName}`
+        }
+        console.error(
+          `🔴 ${name} postExport 失敗（exit ${exitInfo}）：快照已寫入、未 commit，留在分支 ${branch} 讓人看 diff；修好後重跑 --all 前先還原：${restoreHint}，未追蹤的新檔以 git status --porcelain .agents/skills/llm-team 列出後手動處理`,
+        )
+        const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+        console.error(`已完成的 target：${doneStr}；停在：${name}`)
+        return 3
+      }
+    }
+
     // (e) git add .agents/skills/llm-team（第一次匯出放了 llm-team.config.json 範本也一起 add）；git commit -F FILE
     const toAdd = ['.agents/skills/llm-team']
     if (fs.existsSync(path.join(root, 'llm-team.config.json'))) {

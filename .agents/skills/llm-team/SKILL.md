@@ -76,6 +76,8 @@ node home/skills/llm-team/export.mjs --all
 ```
 - `targets.json` 是 M1 環境事實（不進快照），定義了同步的目標 repo 與模式（`branch` 或 `main`）。
 - 依序對各目標進行工作樹檢查（不乾淨 ⇒ 停），跑 `exportTo` 快照匯出、`setup.mjs --sync-check` 與快照 `test.sh`。
+- `postExport` 是 target 自己維護的入口（WAS＝`pnpm run guards:llm-team-snapshot`，母體＝會讀 `.agents/` 內容的 node:test 守門；WAS 新增一道會咬快照的守門時要把它加進那個 script），在快照 `test.sh` 綠之後、`git add` 之前執行。
+- `postExport` 紅時（exit 非 0）整個 `--all` 停在該 target，留分支不 commit、印還原指令。
 - `web-agency-system`（`branch` 模式）：自動建立 `chore/llm-team-<VERSION>` 分支並 commit 快照，不 ff、不 push；接著依提示跑 `tools/m4-ship.sh`（M4 完整 guards）再 ff。
 - `GuildHub-frontend` 與 `ai-team-starter`（`main` 模式）：在乾淨 main 直接 commit 快照，不自動 push（由統整者決定）。
 - 任一 target 不乾淨、測試紅或 commit 失敗 ⇒ 整個 `--all` 停在該 target，不繼續後續專案。
