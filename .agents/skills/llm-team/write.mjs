@@ -39,7 +39,10 @@ import {
 export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads }) {
   const allowedLine =
     allowedHeads && allowedHeads.length
-      ? [`     你只准跑這些指令頭：${allowedHeads.join('、')}。其他任何指令一跑整輪就被殺、你的改動作廢——需要清單外的指令就停下回報。`]
+      ? [
+          `     你只准跑這些指令頭：${allowedHeads.join('、')}。其他任何指令一跑整輪就被殺、你的改動作廢——需要清單外的指令就停下回報。`,
+          '     引數裡不准出現 ; & | < > ` $（引號裡面也算）；管線只准接在兩個准許指令頭之間；grep 多樣式用多個 -e，不用 -E 的 (a|b)。跑到不合規指令一樣整輪被殺。',
+        ]
       : []
   const head = [
     WRITER_PROMPT_SENTINEL,
@@ -246,6 +249,7 @@ export function main(argv, deps = {}) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
         const response = (r.result && r.result.response) || ''
+        fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
           round,
@@ -264,6 +268,7 @@ export function main(argv, deps = {}) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
         const response = (r.result && r.result.response) || ''
+        fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
           round,
@@ -316,6 +321,7 @@ export function main(argv, deps = {}) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
         const response = (r.result && r.result.response) || ''
+        fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
           round,
@@ -333,6 +339,7 @@ export function main(argv, deps = {}) {
     fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout)
     fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr)
     const response = (r.result && r.result.response) || ''
+    fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
     const changed = changedFilesFn(worktree).filter((f) => !isIgnored(f))
     const oos = outOfScope(changed, allowlist)
     const entry = {

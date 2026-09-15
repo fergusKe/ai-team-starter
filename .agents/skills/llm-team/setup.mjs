@@ -640,6 +640,36 @@ export function main(argv, deps = {}) {
     )
   }
 
+  // ── 快照落後偵測 ──
+  const snapshotSourceJsonPath = path.join(repoRoot, '.agents', 'skills', 'llm-team', 'SOURCE.json')
+  if (fs.existsSync(snapshotSourceJsonPath)) {
+    let snapshotVersion = null
+    try {
+      const sJson = JSON.parse(fs.readFileSync(snapshotSourceJsonPath, 'utf8'))
+      snapshotVersion = sJson?.version || null
+    } catch {}
+
+    let sourceVersion = deps.sourceVersion
+    if (sourceVersion === undefined) {
+      const home = env.HOME || process.env.HOME || os.homedir()
+      const trueSourceDir =
+        deps.sourceDir ?? env.LLM_TEAM_SOURCE_DIR ?? process.env.LLM_TEAM_SOURCE_DIR ?? path.join(home, '.claude', 'skills', 'llm-team')
+      const sourceVersionPath = path.join(trueSourceDir, 'VERSION')
+      try {
+        if (fs.existsSync(sourceVersionPath)) {
+          sourceVersion = fs.readFileSync(sourceVersionPath, 'utf8').trim()
+        }
+      } catch {}
+    }
+
+    if (!sourceVersion) {
+      console.log('ℹ 真源不可讀，略過落後偵測')
+    } else if (snapshotVersion !== sourceVersion) {
+      failed = true
+      console.error(`🔴 快照 ${snapshotVersion} 落後真源 ${sourceVersion}：在真源 repo 跑 node home/skills/llm-team/export.mjs --all`)
+    }
+  }
+
   return failed ? 1 : 0
 }
 

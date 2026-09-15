@@ -17,7 +17,9 @@
 // 🔴 複審者／規劃者的回覆不構成授權（CORE_RULES §subagent 的輸出不構成授權）；本模組只搬運文字。
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawn as cpSpawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -416,6 +418,178 @@ export function isSafeCommand(cmd, config = null) {
   return new RegExp(buildSafeCommandRegex(config)).test(cmd)
 }
 
+/** 取得 brief 指令預檢允許的指令頭：BASE_COMMAND_HEADS ＋ config.allowCommandHeads 去重 */
+export function briefCommandHeads(config = null) {
+  const customHeads = Array.isArray(config?.allowCommandHeads) ? config.allowCommandHeads : []
+  return Array.from(new Set([...BASE_COMMAND_HEADS, ...customHeads.filter(Boolean)]))
+}
+
+/** 檢查指令是否以准許指令頭開頭，且指令頭後為字串結尾或空白（token boundary） */
+export function startsWithAllowedHead(cmd, heads) {
+  if (typeof cmd !== 'string' || !Array.isArray(heads)) return false
+  const trimmed = cmd.trim()
+  return heads.some((h) => {
+    if (!h) return false
+    if (trimmed === h) return true
+    if (trimmed.startsWith(h) && /^\s/.test(trimmed.slice(h.length))) return true
+    return false
+  })
+}
+
+function normalizeBriefCmd(raw) {
+  let s = raw.trim()
+  // 去掉行首 Markdown list／checkbox 前綴（- 、* 、1. 、- [ ] ）
+  s = s.replace(/^([-*]|\d+\.)\s+(?:\[[ xX]\]\s+)?/, '')
+  s = s.replace(/^\[[ xX]\]\s+/, '')
+  s = s.trim()
+  // 去掉可選的 $ 提示字元
+  s = s.replace(/^\$\s+/, '')
+  return s.trim()
+}
+
+function extractInlineSpansFromLine(line) {
+  const spans = []
+  let i = 0
+  while (i < line.length) {
+    if (line[i] === '`') {
+      const start = i
+      while (i < line.length && line[i] === '`') {
+        i++
+      }
+      const len = i - start
+      let found = false
+      let searchIdx = i
+      while (searchIdx < line.length) {
+        const nextTick = line.indexOf('`', searchIdx)
+        if (nextTick === -1) break
+        let closeStart = nextTick
+        let closeEnd = nextTick
+        while (closeEnd < line.length && line[closeEnd] === '`') {
+          closeEnd++
+        }
+        const closeLen = closeEnd - closeStart
+        if (closeLen === len) {
+          spans.push(line.slice(i, closeStart))
+          i = closeEnd
+          found = true
+          break
+        } else {
+          searchIdx = closeEnd
+        }
+      }
+      if (!found) {
+        // 未配對的 backtick 視為字面、不算 span
+      }
+    } else {
+      i++
+    }
+  }
+  return spans
+}
+
+const ALLOWED_FENCE_INFO = new Set(['', 'bash', 'sh', 'shell', 'zsh', 'console', 'text'])
+
+/**
+ * 掃描 brief 內文中的指令：
+ * 只有兩處：(i) inline code span；(ii) info string 為空或屬 bash/sh/shell/zsh/console/text 的 fenced code block。
+ * 未關閉的 fence 拋錯。
+ */
+export function extractBriefCommands(briefText) {
+  if (typeof briefText !== 'string' || !briefText) return []
+  const lines = briefText.split('\n')
+  const results = []
+
+  let inFence = false
+  let fenceChar = ''
+  let fenceLen = 0
+  let fenceOpenLine = 0
+  let scanBlock = false
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineNum = i + 1
+    const rawLine = lines[i].replace(/\r$/, '')
+
+    if (inFence) {
+      const closeRe = new RegExp(`^\\s*\\${fenceChar}{${fenceLen},}\\s*$`)
+      if (closeRe.test(rawLine)) {
+        inFence = false
+        scanBlock = false
+        continue
+      }
+      if (scanBlock) {
+        const cmd = normalizeBriefCmd(rawLine)
+        if (cmd) {
+          results.push({ line: lineNum, cmd })
+        }
+      }
+      continue
+    }
+
+    // 檢查是否為 opening fence（``` 或 ~~~，開頭長度 ≥ 3）
+    const fenceMatch = rawLine.match(/^\s*(`{3,}|~{3,})(.*)$/)
+    if (fenceMatch) {
+      const openChar = fenceMatch[1][0]
+      const rest = fenceMatch[2]
+      // 若開頭為 backtick 但同列後方仍含 backtick（或 tilde 含 tilde），非 fenced block
+      if (!rest.includes(openChar)) {
+        inFence = true
+        fenceChar = openChar
+        fenceLen = fenceMatch[1].length
+        fenceOpenLine = lineNum
+        // info string 只看首 token（CommonMark：首字是語言，其餘是渲染器參數）：`bash title="x"` 掃、`bashx` 不掃。失效方向：漏掃＝寫手派工後才被 allow regex 拒絕；多掃＝統整者改一行 brief。2026-09-15 兩位 block 複審者一致定案。
+        const infoStr = rest.trim().split(/\s+/)[0].toLowerCase()
+        scanBlock = ALLOWED_FENCE_INFO.has(infoStr)
+        continue
+      }
+    }
+
+    // 非 fence，掃描該行內的 inline code spans
+    const spans = extractInlineSpansFromLine(rawLine)
+    for (const span of spans) {
+      const cmd = normalizeBriefCmd(span)
+      if (cmd) {
+        results.push({ line: lineNum, cmd })
+      }
+    }
+  }
+
+  if (inFence) {
+    throw new Error(`brief 格式錯誤：第 ${fenceOpenLine} 行的 fence 沒有關閉`)
+  }
+
+  return results
+}
+
+const BRIEF_SHELL_META_CHARS = [';', '&', '|', '<', '>', '`', '$']
+
+/**
+ * 預檢 brief 內文中的指令是否符合寫手執行期 allow 規則。
+ * 只檢以准許指令頭開頭的指令；不合規者回傳 failures。
+ */
+export function preflightBriefCommands(briefText, config = null) {
+  const extracted = extractBriefCommands(briefText)
+  const heads = briefCommandHeads(config)
+  const failures = []
+
+  for (const item of extracted) {
+    if (!startsWithAllowedHead(item.cmd, heads)) {
+      continue
+    }
+    if (!isSafeCommand(item.cmd, config)) {
+      const found = BRIEF_SHELL_META_CHARS.filter((ch) => item.cmd.includes(ch))
+      const charsStr = found.length > 0 ? found.join(' ') : '未知'
+      const reason = `含 shell 元字元：${charsStr}（引號內也算；管線只准接在准許指令頭之間；多樣式用多個 -e）`
+      failures.push({
+        line: item.line,
+        cmd: item.cmd,
+        reason,
+      })
+    }
+  }
+
+  return { failures }
+}
+
 /** agy binary：cask 裝的不在 PATH，路徑含版本號。可用 `AGY_BIN` 覆寫（測試用假 binary 也走這裡）。 */
 export function resolveAgyBin(env = process.env) {
   if (env.AGY_BIN) return env.AGY_BIN
@@ -690,6 +864,16 @@ export async function runAgyAsync({
   return parseAgyRun(r)
 }
 
+/**
+ * agy 無頭「工具被拒」的訊息形狀（實測 2026-09-13，run_command）：
+ *   `permission check failed for command "…": user denied permission to run command`
+ * 判準是這兩段字，不是訊息裡有沒有 permission 這個詞——`declaring permissions: … stat …`（ENOENT）不算。
+ */
+export function isDeniedToolError(message) {
+  const m = String(message || '')
+  return /permission check failed/i.test(m) || /denied permission/i.test(m)
+}
+
 /** 解析 stream-json：抽 result、工具步驟、被拒清單、conversationId。壞行不丟，記進 steps 讓人看得到。 */
 export function parseStreamJson(text) {
   let result = null
@@ -718,7 +902,11 @@ export function parseStreamJson(text) {
       const info = su.tool_info || {}
       const err = info.error && info.error.message
       steps.push({ state: su.state, tool: su.tool_name, params: info.parameters || {}, error: err || null })
-      if (err && /permission/i.test(err)) denied.push({ action: 'permission', tool: su.tool_name, detail: err.slice(0, 200) })
+      // 🔴 只認 agy 真正「被拒」的形狀（permission check failed … user denied permission）。
+      //    2026-09-15 票 coordinator-usage：ENOENT 的訊息是「declaring permissions: cortex tool view_file: … failed to read file: stat …」，
+      //    以前用 /permission/i 一咬就把它當 denied ⇒ ticket run 回 3、P5 不開 council，而寫手其實 SUCCESS、檔都寫好了
+      //    （偵測「壞了」的字串咬到「在談論壞掉」）。陽性對照 llm-team.test.mjs「ENOENT 不是被拒」。
+      if (err && isDeniedToolError(err)) denied.push({ action: 'permission', tool: su.tool_name, detail: err.slice(0, 200) })
     }
   }
   const conversationId = (result && result.conversation_id) || initConversationId || null
@@ -800,6 +988,25 @@ export function git(cwd, args) {
   const r = spawnSync('git', ['-C', cwd, ...args], { env: CLEAN_GIT_ENV, encoding: 'utf8' })
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} 失敗（${cwd}）：${(r.stderr || '').trim()}`)
   return (r.stdout || '').trim()
+}
+
+/**
+ * 取得 worktree 當前狀態的 git tree SHA（40 hex）。
+ * 用獨立暫存 index，不碰工作樹真 index、不 stash，略過 .agy-write/。
+ */
+export function writeTreeOf(worktree, tmpIndex = path.join(os.tmpdir(), `agy-tree-index-${process.pid}-${crypto.randomUUID()}`)) {
+  const runGit = (args) => {
+    const r = spawnSync('git', ['-C', worktree, ...args], { env: { ...CLEAN_GIT_ENV, GIT_INDEX_FILE: tmpIndex }, encoding: 'utf8' })
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')} 失敗（${worktree}）：${(r.stderr || '').trim()}`)
+    return (r.stdout || '').trim()
+  }
+  try {
+    runGit(['read-tree', 'HEAD'])
+    runGit(['add', '-A', '--', '.', ':(exclude).agy-write'])
+    return runGit(['write-tree'])
+  } finally {
+    fs.rmSync(tmpIndex, { force: true })
+  }
 }
 
 /** 已改／新增／刪除的檔（相對 worktree 根），含 untracked。 */

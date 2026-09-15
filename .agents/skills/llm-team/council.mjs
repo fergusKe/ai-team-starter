@@ -2,7 +2,7 @@
 // ─────────────────── 規劃／複審會議（依統整者 profile 派複審者） ───────────────────
 // 用法（`--coordinator` 必帶，或設 env LLM_TEAM_COORDINATOR）：
 //   規劃：node .agents/skills/llm-team/council.mjs plan   --coordinator <claude|agy|codex> --prompt <file> --out <dir> [--tier standard|block] [--config <file>]
-//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--config <file>]
+//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--writer-report <file>] [--review-only] [--config <file>]
 //
 // 🔴 2026-09-14 三方定案（schema v2）：
 //   · 成員名單來自 config.profiles.<coordinator>：一般票 reviewers、block 票 blockReviewers（沒有 --codex 旗標、沒有 codexTier）。
@@ -49,15 +49,29 @@ export function buildReviewQuestions(riskDomains = []) {
   ].join('\n')
 }
 
-export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, riskDomains = [] }) {
+export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, riskDomains = [], roundStart, cumulative, writerReport, reviewOnly = false }) {
   if (!writerModel) throw new Error('buildReviewPrompt 需要 writerModel（來自 config.writer.model）')
-  return [
+  const sections = [
     REVIEW_PROMPT_SENTINEL,
     `你是本 repo 的複審者（${tier === 'block' ? 'block 級' : '一般票'}）。作者是另一個模型（${writerModel}），你沒有它的對話脈絡，只看下面的 brief 與 diff。`,
     '',
     '【brief（作者拿到的原文）】',
     brief,
     '',
+  ]
+
+  if (roundStart) {
+    const mb = (cumulative && cumulative.mergeBase) || ''
+    const stat = (cumulative && cumulative.stat) || ''
+    sections.push(
+      `【本輪範圍】本輪 diff 起點 ${roundStart}（此 sha → 工作樹）。下面【累計 stat】是自 merge-base ${mb} 起整張票所有輪的檔案清單——它對應的是各輪 brief 准動清單的【聯集】，前幾輪 brief 准動而本輪 brief 沒列的檔會在裡面，不是越界；本輪 brief 的准動清單只約束本輪 diff。main 上別人的 commit 不在這兩份裡。`,
+      '【累計 stat（自 merge-base）】',
+      stat,
+      '',
+    )
+  }
+
+  sections.push(
     '【git diff --stat】',
     diffStat,
     '',
@@ -66,8 +80,26 @@ export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, ri
     diff,
     '```',
     '',
-    buildReviewQuestions(riskDomains),
-  ].join('\n')
+  )
+
+  if (reviewOnly) {
+    sections.push(
+      '【review-only：本輪沒有寫手、沒有寫手回報】',
+      '這棵樹是統整者對已提交的分支叫的重新複審。Q3 只判 diff 裡的測試是否量到這次變更、陽性對照的設計對不對（拿掉哪段修法、哪條斷言該紅）；「作者沒交陽性對照證據」不構成不簽理由。執行證據由統整者在 Q6 親跑並入帳（accept --q6），Q6 照常要求。',
+      '',
+    )
+  } else if (writerReport !== null && writerReport !== undefined) {
+    sections.push(
+      '【寫手最後回報（作者自述，不是證據）】',
+      '它宣稱跑過的陽性對照（哪條測試紅在哪條斷言）只能拿來對照 diff：宣稱紅的那條斷言在不在 diff 的測試裡、拿掉的修法是不是 diff 裡的那段。對不上 ⇒ Q3 不簽並指出對不上的地方；對得上仍要求統整者 Q6 親跑。',
+      writerReport || '（寫手回報為空——write.mjs 失敗分支或寫手沒交回報）',
+      '',
+    )
+  }
+
+  sections.push(buildReviewQuestions(riskDomains))
+
+  return sections.join('\n')
 }
 
 /**
@@ -173,15 +205,39 @@ export async function main(argv, deps = {}) {
   } else if (sub === 'review') {
     if (!a.worktree || !a.base || !a.brief) return usage()
     cwd = path.resolve(a.worktree)
-    const diffStat = gitFn(cwd, ['diff', '--stat', a.base])
-    let diff = gitFn(cwd, ['diff', a.base])
+    const reviewOnly = a['review-only'] === true
+    const roundStart = a['round-start'] || null
+    const startPoint = roundStart || a.base
     const untracked = gitFn(cwd, ['ls-files', '--others', '--exclude-standard'])
-    for (const f of untracked.split('\n').filter(Boolean)) {
-      if (f.startsWith('.agy-write/')) continue
+    const untrackedFiles = untracked.split('\n').filter(Boolean).filter((f) => !f.startsWith('.agy-write/'))
+    let cumulative = null
+    if (roundStart) {
+      const mergeBase = gitFn(cwd, ['merge-base', a.base, 'HEAD'])
+      let cumulativeStat = gitFn(cwd, ['diff', '--stat', mergeBase])
+      // 🔴 2026-09-15 lt15-round-diff r1 複審（sol Q2）：累計 stat 若只用 git diff --stat，寫手新增的越界 untracked 檔對 Q1 隱形（fail-open）；本輪 diff 早就接了 untracked，累計也要。
+      const untrackedLines = untrackedFiles.map((f) => ` ${f} | 新檔（未追蹤）`)
+      if (untrackedLines.length > 0) {
+        cumulativeStat = (cumulativeStat ? cumulativeStat + '\n' : '') + untrackedLines.join('\n')
+      }
+      cumulative = { mergeBase, stat: cumulativeStat }
+    }
+    const diffStat = gitFn(cwd, ['diff', '--stat', startPoint])
+    let diff = gitFn(cwd, ['diff', startPoint])
+    for (const f of untrackedFiles) {
       diff += `\n--- /dev/null\n+++ b/${f}\n` + fs.readFileSync(path.join(cwd, f), 'utf8').split('\n').map((l) => '+' + l).join('\n')
     }
     const cap = Number(a['diff-cap'] || 120000)
     if (diff.length > cap) diff = diff.slice(0, cap) + `\n…（截斷，原長 ${diff.length} 字元）`
+    let writerReport = null
+    if (a['writer-report']) {
+      const rawReport = fs.readFileSync(a['writer-report'], 'utf8')
+      const reportCap = 20000
+      if (rawReport.length > reportCap) {
+        writerReport = rawReport.slice(0, reportCap) + `\n…（截斷，原長 ${rawReport.length} 字元）`
+      } else {
+        writerReport = rawReport
+      }
+    }
     prompt = buildReviewPrompt({
       brief: fs.readFileSync(a.brief, 'utf8'),
       diff,
@@ -189,6 +245,10 @@ export async function main(argv, deps = {}) {
       diffStat,
       writerModel: models.writer.model,
       riskDomains: config.riskDomains || [],
+      roundStart,
+      cumulative,
+      writerReport,
+      reviewOnly,
     })
   } else return usage()
 

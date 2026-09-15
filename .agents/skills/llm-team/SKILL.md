@@ -45,14 +45,42 @@ publish 對舊 summary（≠ 2）直接擋，要求名單**全員到齊**（三�
 - **Gemini 桶 limit ⇒ 票流程全線停到 reset**（寫手在 Gemini 桶，沒有替補）；`claude` profile 可改走 Claude subagent 流程（CLAUDE.md §派工機制）。
 - 任一桶 429 ⇒ **該角色停線、不找替補**；統整者把停線事實記進 `_handoff.md` 檔頭。
 - 複審每票上限 **2 輪 ＋ 1 次釐清**；超過回統整者。
+- 第 N 輪複審看的是「本輪起點 sha → 工作樹」的 diff；Q1 的分母是自 merge-base 的累計 stat；main 上別人的 commit 不在射程。summary 記 roundStartSha／mergeBase／targetTipSha／review.reviewedTree（land 用）。複審 prompt 附寫手最後回報（自述非證據，供對照 Q3）；verify 輸出存 OUTDIR/verify.txt；累計 stat 是各輪 brief 准動清單的聯集。
 - `codex` profile 只做短票：≤ 5 檔、可逆、非風險域（`riskDomains`）。
 - `agy`／`codex` profile 只在 Claude 額度用完時使用 ⇒ 名單只有 agy＋codex 兩桶，一般票裁決交 Fergus。
 
-brief 五段：①目標（含使用者真實踩到的情境）②只准動的檔案③事實（行號、既有測試怎麼 mock）④要做的事（編號）⑤驗收指令與回報格式；模板專案另有 `prompts/07-ticket.md` 長版。
+brief 五段：①目標（含使用者真實踩到的情境）②只准動的檔案③事實（行號、既有測試怎麼 mock）④要做的事（編號）⑤驗收指令與回報格式；模板專案另有 `prompts/07-ticket.md` 長版。**陽性對照由統整者 Q6 親跑，brief 不要求寫手做**（2026-09-16 council：三次逾時都死在寫手做陽性對照那一步、暫改沒還原）；brief 要寫的是『拿掉哪段修法、哪條斷言該紅』讓複審者能對照 diff。
+🔴 brief 裡給寫手的指令一律放 inline code span 或 bash fence——`ticket.mjs run` 會用 allow regex 預檢這兩處（只檢以准許指令頭開頭的），不合規 ⇒ exit 2 不派工；規則同寫手執行期：引數不准含 ; & | < > ` $（引號內也算），管線只准接在准許指令頭之間。統整者自己要跑的指令（pnpm、bash…）不以准許頭開頭，不在射程；要舉不合規的反例，span 內前面加「反例：」讓它不以指令頭開頭。占位符不要寫尖括號（會被當成 < >），寫 FILE。
+
+## 統整者呼叫預算
+
+- **為什麼**：統整者每次工具呼叫＝一次帶完整 context 的 API 呼叫（實測 100–170k token／次）；省的是**次數**，不是每次的字。
+- **規則**：
+  - ① **不輪詢**：長任務背景跑、用通知或 until-loop 一次等完。
+  - ② **收貨兩次呼叫**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）＋`node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（accept 由統整者先跑，land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。
+  - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。
+  - ④ **每票 accept 後量測**：`node .agents/skills/llm-team/usage.mjs --ticket <票> --write`，數字記進專案的 handoff／台帳。`gross`＝牆上視窗上限（含夾票與非票工作）；`exclusive`＝排除被其他票視窗夾走的部分，**仍含非票工作**（release／compact／回答 Fergus 沒有標記），比票時看 exclusive、稽核時看 gross。
+  - ⑤ **量法門檻**：連續 10 張票 apiCalls 中位數比基線降 ≥40% 且重工率不惡化，**只納 `usage.measurable:true` 且同口徑（輪數、真跑次數）**的票。
+  - ⑥ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省。
+- `usage.mjs` 只在統整者 harness 是 claude 時量得到，其他 harness 記 `measurable:false`。找 transcript 的順序＝sessionId 直達（lifecycle run-start 的 `sessionId`，來自 Claude Code env `CLAUDE_CODE_SESSION_ID`；agy／codex 統整者沒有 ⇒ 走字面掃描）→ cwd slug → main repo slug → 全部子目錄（跨專案 session 開的票也找得到）；`--projects-dir` 只掃指定目錄。
 
 ## 快照與真源
 
 真源在 fergus-claude-config `home/skills/llm-team/`，專案裡是快照，改程式回真源改、跑 `node ~/.claude/skills/llm-team/export.mjs --to <專案根>`，`setup --sync-check` 驗 manifest；真源新增檔不算漂移（export 時自動歸為 sourceNew 同步過去，只有目標目錄已存在同名檔但未入 manifest 才是手動漂移 unlisted）。
+
+### 版本同步（改一處全專案生效）
+
+真源改完程式並 bump `VERSION` 後，在真源 repo 跑：
+```bash
+node home/skills/llm-team/export.mjs --all
+```
+- `targets.json` 是 M1 環境事實（不進快照），定義了同步的目標 repo 與模式（`branch` 或 `main`）。
+- 依序對各目標進行工作樹檢查（不乾淨 ⇒ 停），跑 `exportTo` 快照匯出、`setup.mjs --sync-check` 與快照 `test.sh`。
+- `web-agency-system`（`branch` 模式）：自動建立 `chore/llm-team-<VERSION>` 分支並 commit 快照，不 ff、不 push；接著依提示跑 `tools/m4-ship.sh`（M4 完整 guards）再 ff。
+- `GuildHub-frontend` 與 `ai-team-starter`（`main` 模式）：在乾淨 main 直接 commit 快照，不自動 push（由統整者決定）。
+- 任一 target 不乾淨、測試紅或 commit 失敗 ⇒ 整個 `--all` 停在該 target，不繼續後續專案。
+- 統整者開場跑 `setup.mjs --check` 會主動進行「快照落後偵測」，比對快照與真源版本；若快照版本落後真源版本則擋下報紅（exit 1），並印出引導指令。
+
 
 ## 標準程序骨架
 
@@ -69,10 +97,14 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
      --brief <brief-file> \
      --branch feat/<id>--<slice> \
      --allow <path>... \
-     --test "<acceptance-command>"
+     --test "<acceptance-command>" \
+     [--review-only] \
+     [--write-timeout-ms <ms>]
    ```
    *注意：`--allow` 每檔一次（例如 `--allow a --allow b`，不可串在同一個旗標後，多餘位置參數會報錯）。*
-   *P5：寫手 exit 非 0（2＝守門擋下、3＝被拒／越界／逾時）⇒ 不跑 `--test`、不開 council，**一律寫 summary.json**（`review: null`）並印收貨摘要；exit 2 且本次新建的空 worktree 照舊清掉、run 回 2；逾時另有 `writeTimedOut: true`（來自 `write/timeout.json`）。*
+   *P5：寫手 exit 非 0（2＝守門擋下、3＝被拒／越界／逾時）⇒ 不跑 `--test`、不開 council，**一律寫 summary.json**（`review: null`）並印收貨摘要；exit 2 且本次新建的空 worktree 照舊清掉、run 回 2；逾時另有 `writeTimedOut: true`（來自 `OUTDIR/write/run-K/timeout.json`，只看本次 run）。1.6 (i) 起 write 產物在 `OUTDIR/write/run-K/`（K＝lifecycle 第幾個 run-start），每次 run 隔離、不覆寫；`summary.run`。*
+   *`--review-only`：何時用：複審者因寫手回報空白不簽、名單覆寫後重審；前置：worktree 存在且乾淨、HEAD 領先 base；效果：不派寫手、`--round-start`＝merge-base、舊 q6Receipt／dispositions 作廢、`summary.changed`＝merge-base..HEAD 已提交改動檔，可直接 `accept`／`land`；複審 prompt 標明無寫手回報、Q3 只判設計、證據看 Q6。*
+   *`--write-timeout-ms <ms>`（預設 25 分＝1,500,000；config `writer.timeoutMs` 可設專案預設；CLI 覆蓋 config）。*
 3. **收貨與坐實：**
    - 複審者並行、8 分鐘 timeout、心跳（每 60 秒印進度，超時以「不簽（timeout）」計）；名單＝一般票 `reviewers`、block 票 `blockReviewers`。
    - 複審提示第一行是哨兵 `【llm-team 複審票】`（規劃是 `【llm-team 規劃】`）：codex 複審者從 cwd 讀得到 AGENTS.md，薄索引靠它判「你是複審者，只答 Q 題，不必讀正本」（GEMINI.md 對寫手用 `【llm-team 寫手票】` 同一招）。

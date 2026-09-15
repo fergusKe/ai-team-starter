@@ -4,6 +4,7 @@
 //   node .agents/skills/llm-team/export.mjs --to <targetRepoRoot> [--force]
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -18,6 +19,10 @@ export const EXPORT_FILES = [
   'setup.mjs',
   'llm-team.test.mjs',
   'ticket.test.mjs',
+  'batch.mjs',
+  'batch.test.mjs',
+  'usage.mjs',
+  'usage.test.mjs',
   'export.mjs',
   'export.test.mjs',
   'agy-pretooluse.sh',
@@ -333,20 +338,195 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
   return { ok: true, status: 0, targetDir }
 }
 
-export function main(argv, deps = {}) {
-  const a = parseArgs(argv)
-  if (!a.to) {
-    console.error('用法：node export.mjs --to <targetRepoRoot> [--force]')
-    return 2
+/**
+ * 依 targets.json 對所有專案 repo 匯出快照＋各自 commit
+ */
+export function exportAll(sourceDir, targets, { force = false, deps = {}, git, spawn } = {}) {
+  const targetList = Array.isArray(targets) ? targets : (targets?.targets || [])
+  const effectiveDeps = { ...deps }
+  if (git) effectiveDeps.git = effectiveDeps.git || git
+
+  const versionPath = path.join(sourceDir, 'VERSION')
+  const version = fs.existsSync(versionPath) ? fs.readFileSync(versionPath, 'utf8').trim() : '1'
+
+  let sourceCommit = ''
+  if (effectiveDeps.git) {
+    try {
+      sourceCommit = effectiveDeps.git(['rev-parse', 'HEAD'], sourceDir)
+    } catch {}
+  }
+  if (!sourceCommit) {
+    const rCommit = spawnSync('git', ['-C', sourceDir, 'rev-parse', 'HEAD'], { env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    if (rCommit.status === 0) {
+      sourceCommit = (rCommit.stdout || '').trim()
+    }
   }
 
-  const sourceDir = path.dirname(fileURLToPath(import.meta.url))
-  const targetRoot = path.resolve(a.to)
-  const res = exportTo(sourceDir, targetRoot, { force: Boolean(a.force), deps })
-  if (!res.ok) {
-    return res.status || 2
+  const completed = []
+
+  for (const target of targetList) {
+    const { name, root, mode } = target
+
+    // (a) root 不存在 ⇒ console.error('⏭ <name>：目錄不存在（不是這台機器），跳過')，繼續下一個
+    if (!fs.existsSync(root)) {
+      console.error(`⏭ ${name}：目錄不存在（不是這台機器），跳過`)
+      continue
+    }
+
+    // (b) git status --porcelain 非空 ⇒ 🔴 印 `<name> 工作樹不乾淨` 並 return 3，停止後續 target
+    const rStatus = spawnSync('git', ['status', '--porcelain'], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    if ((rStatus.stdout || '').trim().length > 0) {
+      console.error(`🔴 ${name} 工作樹不乾淨`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    // (c) mode==='branch'：git switch -c chore/llm-team-<VERSION>（分支已存在 ⇒ 🔴 停）；mode==='main'：git branch --show-current 必須是 main（不是 ⇒ 🔴 停）
+    const branchName = `chore/llm-team-${version}`
+    if (mode === 'branch') {
+      const rCheckBranch = spawnSync('git', ['rev-parse', '--verify', `refs/heads/${branchName}`], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+      if (rCheckBranch.status === 0) {
+        console.error(`🔴 ${name} 分支已存在：${branchName}`)
+        const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+        console.error(`已完成的 target：${doneStr}；停在：${name}`)
+        return 3
+      }
+      const rSwitch = spawnSync('git', ['switch', '-c', branchName], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+      if (rSwitch.status !== 0) {
+        console.error(`🔴 ${name} 切換分支失敗：${(rSwitch.stderr || rSwitch.stdout || '').trim()}`)
+        const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+        console.error(`已完成的 target：${doneStr}；停在：${name}`)
+        return 3
+      }
+    } else if (mode === 'main') {
+      const rBranch = spawnSync('git', ['branch', '--show-current'], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+      const currBranch = (rBranch.stdout || '').trim()
+      if (currBranch !== 'main') {
+        console.error(`🔴 ${name} 當前分支不是 main（目前在 ${currBranch || 'detached HEAD'}）`)
+        const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+        console.error(`已完成的 target：${doneStr}；停在：${name}`)
+        return 3
+      }
+    }
+
+    // (d) exportTo(sourceDir, root, {force:true})；接著 node <root>/.agents/skills/llm-team/setup.mjs --sync-check；接著 bash <root>/.agents/skills/llm-team/test.sh
+    const expRes = exportTo(sourceDir, root, { force: true, deps: effectiveDeps })
+    if (!expRes.ok) {
+      console.error(`🔴 ${name} exportTo 失敗`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    let syncCode
+    if (effectiveDeps.runSyncCheck) {
+      syncCode = effectiveDeps.runSyncCheck(root)
+    } else {
+      const setupScript = path.join(root, '.agents', 'skills', 'llm-team', 'setup.mjs')
+      const rSync = spawnSync(process.execPath, [setupScript, '--sync-check'], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+      syncCode = rSync.status
+    }
+    if (syncCode !== 0) {
+      console.error(`🔴 ${name} setup.mjs --sync-check 失敗（exit ${syncCode}）`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    let testCode
+    if (effectiveDeps.runSnapshotTests) {
+      testCode = effectiveDeps.runSnapshotTests(root)
+    } else {
+      const testScript = path.join(root, '.agents', 'skills', 'llm-team', 'test.sh')
+      const rTest = spawnSync('bash', [testScript], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+      testCode = rTest.status
+    }
+    if (testCode !== 0) {
+      console.error(`🔴 ${name} 快照 test.sh 失敗（exit ${testCode}）`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    // (e) git add .agents/skills/llm-team（第一次匯出放了 llm-team.config.json 範本也一起 add）；git commit -F FILE
+    const toAdd = ['.agents/skills/llm-team']
+    if (fs.existsSync(path.join(root, 'llm-team.config.json'))) {
+      toAdd.push('llm-team.config.json')
+    }
+    const rAdd = spawnSync('git', ['add', ...toAdd], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    if (rAdd.status !== 0) {
+      console.error(`🔴 ${name} git add 失敗：${(rAdd.stderr || rAdd.stdout || '').trim()}`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    const shortSourceCommit = sourceCommit ? sourceCommit.slice(0, 7) : 'unknown'
+    const commitMsg = `llm-team ${version} 快照（來源 ${shortSourceCommit}；sync-check 漂移 0；快照 test.sh 綠）\n`
+    const msgFile = path.join(os.tmpdir(), `commit-msg-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`)
+    fs.writeFileSync(msgFile, commitMsg, 'utf8')
+    const rCommit = spawnSync('git', ['commit', '-F', msgFile], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    try { fs.unlinkSync(msgFile) } catch {}
+    if (rCommit.status !== 0) {
+      console.error(`🔴 ${name} git commit 失敗：${(rCommit.stderr || rCommit.stdout || '').trim()}`)
+      const doneStr = completed.map((c) => c.name).join('、') || '(無)'
+      console.error(`已完成的 target：${doneStr}；停在：${name}`)
+      return 3
+    }
+
+    // (f) 印一行結果：✅ <name> <mode> <branch> <sha>；branch 模式再印 → 接著跑 tools/m4-ship.sh（M4 完整 guards）再 ff。main 模式不 push（印「本機 main 已 commit，push 由統整者決定」）
+    const rSha = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    const sha = (rSha.stdout || '').trim()
+    const branch = mode === 'branch' ? branchName : 'main'
+    console.log(`✅ ${name} ${mode} ${branch} ${sha}`)
+    if (mode === 'branch') {
+      console.log('→ 接著跑 tools/m4-ship.sh（M4 完整 guards）再 ff')
+    } else {
+      console.log('本機 main 已 commit，push 由統整者決定')
+    }
+    completed.push({ name, mode, branch, sha })
+  }
+
+  console.log('\n--- 匯出總表 ---')
+  for (const c of completed) {
+    console.log(`✅ ${c.name} (${c.mode} ${c.branch} ${c.sha})`)
   }
   return 0
+}
+
+export function main(argv, deps = {}) {
+  const a = parseArgs(argv)
+  const sourceDir = deps.sourceDir || path.dirname(fileURLToPath(import.meta.url))
+
+  if (a.all) {
+    const targetsFile = path.resolve(a.targets || path.join(sourceDir, 'targets.json'))
+    if (!fs.existsSync(targetsFile)) {
+      console.error(`🔴 targets 檔不存在：${targetsFile}`)
+      return 2
+    }
+    let targetsData
+    try {
+      targetsData = JSON.parse(fs.readFileSync(targetsFile, 'utf8'))
+    } catch (e) {
+      console.error(`🔴 targets 檔解析失敗：${e.message}`)
+      return 2
+    }
+    const targets = Array.isArray(targetsData) ? targetsData : (targetsData.targets || [])
+    return exportAll(sourceDir, targets, { force: Boolean(a.force), deps })
+  }
+
+  if (a.to) {
+    const targetRoot = path.resolve(a.to)
+    const res = exportTo(sourceDir, targetRoot, { force: Boolean(a.force), deps })
+    if (!res.ok) {
+      return res.status || 2
+    }
+    return 0
+  }
+
+  console.error('用法：\n  node export.mjs --to <targetRepoRoot> [--force]\n  node export.mjs --all [--targets FILE] [--force]')
+  return 2
 }
 
 if (isDirectRun(import.meta.url)) {

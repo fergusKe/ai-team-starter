@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import {
@@ -30,6 +31,7 @@ import {
   SAFE_COMMAND_REGEX,
   isSafeCommand,
   parseStreamJson,
+  isDeniedToolError,
   parseAgyRun,
   spawnTimedOut,
   buildCodexArgs,
@@ -51,6 +53,11 @@ import {
   compareRoster,
   readMembersJson,
   isRosterEntry,
+  extractBriefCommands,
+  briefCommandHeads,
+  startsWithAllowedHead,
+  preflightBriefCommands,
+  writeTreeOf,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
 import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
@@ -592,6 +599,128 @@ describe('SAFE_COMMAND_REGEX：只放行安全指令的串接', () => {
   })
 })
 
+describe('extractBriefCommands／preflightBriefCommands', () => {
+  test('(a) inline span `grep -e "|| x" f` ⇒ 1 條 failure、line 正確、reason 含 |', () => {
+    const brief = '說明文字\n`grep -e "|| x" f`\n結尾'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `應有 1 條 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.equal(failures[0].line, 2, `line 應為 2，實際看到：${failures[0]?.line}`)
+    assert.equal(failures[0].cmd, 'grep -e "|| x" f', `cmd 應為 grep -e "|| x" f，實際看到：${failures[0]?.cmd}`)
+    assert.match(failures[0].reason, /\|/, `reason 應含 |，實際看到：${failures[0]?.reason}`)
+  })
+
+  test('(b) 同一指令放在 ```bash fence 內 ⇒ 同結果，line 是 fence 內那一行', () => {
+    const brief = '# 標題\n```bash\ngrep -e "|| x" f\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `應有 1 條 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.equal(failures[0].line, 3, `line 應為 fence 內那一行（3），實際看到：${failures[0]?.line}`)
+    assert.equal(failures[0].cmd, 'grep -e "|| x" f', `cmd 應為 grep -e "|| x" f，實際看到：${failures[0]?.cmd}`)
+    assert.match(failures[0].reason, /\|/, `reason 應含 |，實際看到：${failures[0]?.reason}`)
+  })
+
+  test('(c) 放在 ```ts fence 內 ⇒ 0 failures', () => {
+    const brief = '# 標題\n```ts\ngrep -e "|| x" f\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 0, `ts fence 內應為 0 failures，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(c2) ```bash title="x" fence 內 `date > out` ⇒ 1 failure、reason 含 >', () => {
+    const brief = '# 標題\n```bash title="x"\ndate > out\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `bash title="x" fence 內應有 1 條 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.match(failures[0]?.reason ?? '', />/, `reason 應含 >，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(c3) ```bashx fence 內同一行 ⇒ 0 failures', () => {
+    const brief = '# 標題\n```bashx\ndate > out\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 0, `bashx fence 內應為 0 failures，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(c4) ```sh { .class } fence 內同一行 ⇒ 1 failure', () => {
+    const brief = '# 標題\n```sh { .class }\ndate > out\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `sh { .class } fence 內應有 1 條 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.match(failures[0]?.reason ?? '', />/, `reason 應含 >，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(d) 純文字行「grep 樣式不准含 `|`」⇒ 0 failures（| 那個 span 不以指令頭開頭）', () => {
+    const brief = 'grep 樣式不准含 `|`\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 0, `非准許指令頭 span 應為 0 failures，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(e) `grep -e x f | head -3` ⇒ 0 failures（管線接在准許頭之間）', () => {
+    const brief = '`grep -e x f | head -3`\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 0, `准許指令頭間的管線應為 0 failures，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(f) `$(cat f)` ⇒ 0 failures（不以准許頭開頭，不在射程）而 `cat $(ls)` ⇒ 1 failure 含 $', () => {
+    const brief1 = '`$(cat f)`\n'
+    const res1 = preflightBriefCommands(brief1)
+    assert.equal(res1.failures.length, 0, `$(cat f) 不在射程應為 0 failures，實際看到：${JSON.stringify(res1.failures)}`)
+
+    const brief2 = '`cat $(ls)`\n'
+    const res2 = preflightBriefCommands(brief2)
+    assert.equal(res2.failures.length, 1, `cat $(ls) 應有 1 failure，實際看到：${JSON.stringify(res2.failures)}`)
+    assert.match(res2.failures[0].reason, /\$/, `reason 應含 $，實際看到：${res2.failures[0]?.reason}`)
+  })
+
+  test('(g) `grepper -x f` ⇒ 0 failures（token boundary）', () => {
+    const brief = '`grepper -x f`\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 0, `grepper 非准許頭應為 0 failures，實際看到：${JSON.stringify(failures)}`)
+  })
+
+  test('(h) config allowCommandHeads: [\'pnpm vitest run\'] 時 `pnpm vitest run a | b` ⇒ 1 failure，沒有那個 head 時 ⇒ 0（不在射程）', () => {
+    const brief = '`pnpm vitest run a | b`\n'
+    const resWith = preflightBriefCommands(brief, { allowCommandHeads: ['pnpm vitest run'] })
+    assert.equal(resWith.failures.length, 1, `有 custom head 時應有 1 failure，實際看到：${JSON.stringify(resWith.failures)}`)
+
+    const resWithout = preflightBriefCommands(brief, {})
+    assert.equal(resWithout.failures.length, 0, `無 custom head 時應為 0 failures，實際看到：${JSON.stringify(resWithout.failures)}`)
+  })
+
+  test('(i) 未關閉 fence ⇒ throw 且訊息含行號', () => {
+    const brief = '第 1 行\n第 2 行\n```bash\nls -la\n'
+    assert.throws(
+      () => preflightBriefCommands(brief),
+      (err) => {
+        assert.match(err.message, /brief 格式錯誤：第 3 行的 fence 沒有關閉/, `訊息應含行號 3，實際看到：${err.message}`)
+        return true
+      }
+    )
+  })
+
+  test('(j) 雙 backtick span `` grep -e "a`b" f `` ⇒ 1 failure 含 `', () => {
+    const brief = '`` grep -e "a`b" f ``\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `雙 backtick span 應有 1 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.match(failures[0].reason, /`/, `reason 應含反引號 \`，實際看到：${failures[0]?.reason}`)
+  })
+
+  test('(k) list 前綴與 $ 提示都會被剝：- $ grep -e "|" f ⇒ 1 failure 且 cmd 欄是剝完的字串', () => {
+    const brief = '```bash\n- $ grep -e "|" f\n```\n'
+    const { failures } = preflightBriefCommands(brief)
+    assert.equal(failures.length, 1, `應有 1 failure，實際看到：${JSON.stringify(failures)}`)
+    assert.equal(failures[0].cmd, 'grep -e "|" f', `cmd 欄應為剝完的字串，實際看到：${failures[0]?.cmd}`)
+    assert.match(failures[0].reason, /\|/, `reason 應含 |，實際看到：${failures[0]?.reason}`)
+  })
+
+  test('(l) ; & | < > ` $ 七個字元逐一表格測試：grep -e "<c>" f 各 1 failure、reason 含該字元', () => {
+    const chars = [';', '&', '|', '<', '>', '`', '$']
+    for (const c of chars) {
+      const cmd = `grep -e "${c}" f`
+      const brief = '`` ' + cmd + ' ``\n'
+      const { failures } = preflightBriefCommands(brief)
+      assert.equal(failures.length, 1, `字元 [${c}] 應有 1 failure，實際看到：${JSON.stringify(failures)}`)
+      assert.equal(failures[0].cmd, cmd, `cmd 應為 ${cmd}，實際看到：${failures[0]?.cmd}`)
+      assert.ok(failures[0].reason.includes(c), `reason 應含字元 [${c}]，實際看到：${failures[0]?.reason}`)
+    }
+  })
+})
+
 describe('parseStreamJson：判「工作成功」不是「程序成功」', () => {
   test('被拒那輪：response 空、denied 兩筆（result 一筆＋步驟 permission 一筆）', () => {
     const text = execFileSync(makeFakeAgy(), [], { env: { ...process.env, FAKE_AGY_MODE: 'denied' }, encoding: 'utf8' })
@@ -600,6 +729,23 @@ describe('parseStreamJson：判「工作成功」不是「程序成功」', () =
     assert.equal(p.denied.length, 2)
     assert.ok(p.denied.some((d) => d.tool === 'RunCommand'), JSON.stringify(p.denied))
     assert.equal(p.steps[0].tool, 'run_command')
+  })
+  test('🔴 陽性對照（2026-09-15 票 coordinator-usage 真咬到）：ENOENT 的「declaring permissions … stat …」不是被拒；真被拒的形狀才是', () => {
+    const enoent = JSON.stringify({
+      event: 'step_update',
+      step_update: {
+        step_index: 28, state: 'ERROR', step_type: 'tool', tool_name: 'view_file',
+        tool_info: { name: 'view_file', parameters: { AbsolutePath: '/repo/.local/x/lifecycle.ndjson' },
+          error: { type: 'TOOL_ERROR', message: 'declaring permissions: cortex tool view_file: convert tool call for permissions: model output error: invalid tool call error (invalid_args) failed to read file: stat /repo/.local/x/lifecycle.ndjson: no such file or directory' } },
+      },
+    })
+    const ok = JSON.stringify({ event: 'result', result: { status: 'SUCCESS', conversation_id: 'c1', response: '做完了', denied_actions: [] } })
+    const p = parseStreamJson(`${enoent}\n${ok}`)
+    assert.equal(p.denied.length, 0, `ENOENT 被當成 denied：${JSON.stringify(p.denied)}`)
+    assert.equal(p.steps[0].state, 'ERROR', '步驟錯誤仍要留在 steps 讓人看得到')
+    assert.ok(isDeniedToolError('permission check failed for command "pwd; ls -la": user denied permission to run command'))
+    assert.ok(!isDeniedToolError('declaring permissions: cortex tool view_file: failed to read file: stat /x: no such file or directory'))
+    assert.ok(!isDeniedToolError(''))
   })
   test('壞行不丟：記進 steps.unparsed', () => {
     const p = parseStreamJson('not json\n{"event":"result","result":{"response":"ok"}}')
@@ -615,6 +761,58 @@ describe('changedFiles：porcelain 解析不吃第一個字', () => {
     fs.appendFileSync(path.join(repo.dir, 'add.mjs'), '// touched\n')
     fs.writeFileSync(path.join(repo.dir, 'new.mjs'), 'x')
     assert.deepEqual(changedFiles(repo.dir).sort(), ['add.mjs', 'new.mjs'])
+  })
+})
+
+describe('writeTreeOf：暫存 index 取得乾淨 tree sha', () => {
+  test('(a) writeTreeOf：repo 有已 commit 檔＋一個未 commit 修改＋一個 untracked 新檔＋.agy-write/x ⇒ 回 40 hex；用 git ls-tree -r TREE --name-only 斷言含新檔、不含 .agy-write/x；呼叫前後 git diff --cached --name-only 皆空（真 index 沒被動）；暫存 index 檔已刪', () => {
+    const repo = makeRepo()
+    // makeRepo 已 commit add.mjs
+    // 一個未 commit 修改
+    fs.appendFileSync(path.join(repo.dir, 'add.mjs'), '// uncommitted\n')
+    // 一個 untracked 新檔
+    fs.writeFileSync(path.join(repo.dir, 'untracked.txt'), 'new file\n')
+    // .agy-write/x
+    fs.mkdirSync(path.join(repo.dir, '.agy-write'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, '.agy-write', 'x'), 'agy internal\n')
+
+    assert.equal(repo.g('diff', '--cached', '--name-only').trim(), '', '呼叫前真 index cached 應為空')
+    const tmpIndex = path.join(os.tmpdir(), `agy-tree-index-${process.pid}-${crypto.randomUUID()}`)
+
+    const tree = writeTreeOf(repo.dir, tmpIndex)
+
+    assert.match(tree, /^[0-9a-f]{40}$/, 'writeTreeOf 應回傳 40 hex SHA')
+    assert.equal(repo.g('diff', '--cached', '--name-only').trim(), '', '呼叫後真 index cached 應為空')
+    assert.equal(fs.existsSync(tmpIndex), false, '暫存 index 檔已刪')
+
+    const lsTree = repo.g('ls-tree', '-r', tree, '--name-only').trim().split('\n')
+    assert.ok(lsTree.includes('untracked.txt'), '含新檔')
+    assert.ok(lsTree.includes('add.mjs'), '含已 commit 但修改的檔')
+    assert.ok(!lsTree.includes('.agy-write/x'), '不含 .agy-write/x')
+
+    // (a2) writeTreeOf 補斷言：對已修改檔用 git ls-tree TREE -- FILE 取 blob sha，與 git hash-object FILE（工作樹現況）相等；且與 git rev-parse HEAD:FILE（修改前）不等
+    const lsTreeOut = repo.g('ls-tree', tree, '--', 'add.mjs').trim()
+    const blobSha = lsTreeOut.split(/\s+/)[2]
+    const workingSha = repo.g('hash-object', path.join(repo.dir, 'add.mjs')).trim()
+    const headSha = repo.g('rev-parse', 'HEAD:add.mjs').trim()
+    assert.equal(blobSha, workingSha, 'writeTreeOf 的已修改檔 blob sha 應等於工作樹現況 (hash-object)')
+    assert.notEqual(blobSha, headSha, 'writeTreeOf 的已修改檔 blob sha 應與修改前 HEAD blob sha 不等')
+  })
+
+  test('(a2) writeTreeOf 補斷言：對已修改檔用 git ls-tree TREE -- FILE 取 blob sha，與 git hash-object FILE（工作樹現況）相等；且與 git rev-parse HEAD:FILE（修改前）不等', () => {
+    const repo = makeRepo()
+    // makeRepo 已 commit add.mjs
+    const headSha = repo.g('rev-parse', 'HEAD:add.mjs').trim()
+    // 一個未 commit 修改
+    fs.appendFileSync(path.join(repo.dir, 'add.mjs'), '// uncommitted modifications\n')
+    const workingSha = repo.g('hash-object', path.join(repo.dir, 'add.mjs')).trim()
+
+    const tree = writeTreeOf(repo.dir)
+
+    const lsTreeOut = repo.g('ls-tree', tree, '--', 'add.mjs').trim()
+    const blobSha = lsTreeOut.split(/\s+/)[2]
+    assert.equal(blobSha, workingSha, `blob sha (${blobSha}) 應與工作樹現況 (${workingSha}) 相等`)
+    assert.notEqual(blobSha, headSha, `blob sha (${blobSha}) 應與修改前 HEAD (${headSha}) 不等`)
   })
 })
 
@@ -720,6 +918,33 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
     assert.match(p2, /node --test/)
     assert.match(p2, /你只准跑這些指令頭：/)
   })
+  test('buildWriterPrompt 有 allowedHeads 時輸出含「引號裡面也算」，沒有 allowedHeads 時不含', () => {
+    const withHeads = buildWriterPrompt({
+      brief: 'B',
+      worktree: '/w',
+      allowlist: ['a.ts'],
+      round: 1,
+      allowedHeads: ['pwd', 'node --test'],
+    })
+    assert.match(withHeads, /引號裡面也算/, `有 allowedHeads 時應含「引號裡面也算」，實際：${withHeads}`)
+
+    const withoutHeads = buildWriterPrompt({
+      brief: 'B',
+      worktree: '/w',
+      allowlist: ['a.ts'],
+      round: 1,
+      allowedHeads: [],
+    })
+    assert.doesNotMatch(withoutHeads, /引號裡面也算/, `無 allowedHeads 時不應含「引號裡面也算」，實際：${withoutHeads}`)
+
+    const noHeads = buildWriterPrompt({
+      brief: 'B',
+      worktree: '/w',
+      allowlist: ['a.ts'],
+      round: 1,
+    })
+    assert.doesNotMatch(noHeads, /引號裡面也算/, `未傳 allowedHeads 時不應含「引號裡面也算」，實際：${noHeads}`)
+  })
   test('main 級陽性對照：config allowCommandHeads 傳入 write.main ⇒ deps.runAgy 攔到的 prompt 含 npm test 與 node --test', () => {
     const repo = makeRepo({ allowCommandHeads: ['npm test'] })
     const brief = path.join(tmpdir('brief-'), 'brief.md')
@@ -761,6 +986,8 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
     assert.ok(capturedPrompt, 'deps.runAgy 應攔截到 prompt')
     assert.match(capturedPrompt, /npm test/, 'prompt 應包含自訂的 npm test 指令頭')
     assert.match(capturedPrompt, /node --test/, 'prompt 應包含內建基底的 node --test 指令頭')
+    assert.ok(fs.existsSync(path.join(outDir, 'round-1.response.md')), 'round-1.response.md 應存在')
+    assert.equal(fs.readFileSync(path.join(outDir, 'round-1.response.md'), 'utf8'), 'ok')
   })
   test('installCommand 非空時於第 1 輪前在 worktree 執行並寫入台帳 installExit', () => {
     const repo = makeRepo({ installCommand: 'echo installed > install.txt' })
@@ -950,6 +1177,461 @@ describe('council.mjs：複審與三方會議', () => {
       console.log = origLog
     }
     assert.ok(fs.readFileSync(path.join(outDir2, 'prompt.md'), 'utf8').startsWith(REVIEW_PROMPT_SENTINEL + '\n'))
+  })
+  test('(b) council review 帶 --round-start：repo 先 commit A（base 起點）、分支上 commit B（改 f1）、main 上另 commit C（改 other.txt，foreign）、工作樹再改 f2 未 commit；--base main --round-start B_SHA ⇒ prompt.md 的本輪 diff 只含 f2、不含 f1、不含 other.txt；累計 stat 含 f1 與 f2、不含 other.txt；含「merge-base <A 的 sha>」。陽性對照（寫成斷言）：同一 repo 用舊法 git diff --stat main 的輸出含 other.txt', async () => {
+    const repo = makeRepo()
+    // 1. Commit A（base 起點，包含 f2.txt）
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f2.txt'), 'f2 line 1\n')
+    repo.g('add', 'f2.txt')
+    repo.g('commit', '-m', 'commit A: base start')
+    const shaA = repo.g('rev-parse', 'HEAD').trim()
+
+    // 2. 分支切出（從 A），commit B（改 f1）
+    repo.g('checkout', '-b', 'feat/branch-b', shaA)
+    fs.writeFileSync(path.join(repo.dir, 'f1.txt'), 'f1 line 1\n')
+    repo.g('add', 'f1.txt')
+    repo.g('commit', '-m', 'commit B: f1')
+    const shaB = repo.g('rev-parse', 'HEAD').trim()
+
+    // 3. main 上另 commit C（改 other.txt，foreign）
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'other.txt'), 'other foreign\n')
+    repo.g('add', 'other.txt')
+    repo.g('commit', '-m', 'commit C: foreign')
+
+    // 4. 切回分支 feat/branch-b，工作樹再改 f2 未 commit
+    repo.g('checkout', 'feat/branch-b')
+    fs.appendFileSync(path.join(repo.dir, 'f2.txt'), 'f2 line 2 modified\n')
+
+    // 陽性對照（寫成斷言）：同一 repo 用舊法 git diff --stat main 的輸出含 other.txt——證明舊尺確實會把 foreign 檔算進來
+    const oldDiffStat = repo.g('diff', '--stat', 'main')
+    assert.ok(oldDiffStat.includes('other.txt'), '舊法 git diff --stat main 的輸出含 other.txt')
+
+    // 5. council review 帶 --round-start
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+    const outDir = path.join(repo.dir, '.review-b')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--round-start', shaB,
+        '--brief', briefFile,
+        '--out', outDir,
+        '--tier', 'standard',
+      ], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+
+    // 斷言：含「merge-base <A 的 sha>」
+    assert.ok(promptText.includes(`merge-base ${shaA}`), '含「merge-base <A 的 sha>」')
+    assert.ok(promptText.includes('聯集'), 'prompt 應含「聯集」一詞')
+    assert.ok(!promptText.includes('Q1 對 brief 的「只准動」用累計 stat'), 'prompt 不應含「Q1 對 brief 的「只准動」用累計 stat」舊句')
+
+    // 斷言：累計 stat 含 f1 與 f2、不含 other.txt
+    const cumuStart = promptText.indexOf('【累計 stat（自 merge-base）】')
+    const diffStatStart = promptText.indexOf('【git diff --stat】')
+    assert.ok(cumuStart !== -1 && diffStatStart !== -1, 'prompt 應含累計 stat 與 git diff --stat 標題')
+    const cumulativeStat = promptText.slice(cumuStart, diffStatStart)
+    assert.ok(cumulativeStat.includes('f1.txt'), '累計 stat 含 f1')
+    assert.ok(cumulativeStat.includes('f2.txt'), '累計 stat 含 f2')
+    assert.ok(!cumulativeStat.includes('other.txt'), '累計 stat 不含 other.txt')
+
+    // 斷言：本輪 diff 只含 f2、不含 f1、不含 other.txt
+    const diffFenceStart = promptText.indexOf('```diff\n') + 8
+    const diffFenceEnd = promptText.indexOf('\n```', diffFenceStart)
+    assert.ok(diffFenceStart !== -1 && diffFenceEnd !== -1, 'prompt 應含 diff code fence')
+    const roundDiff = promptText.slice(diffFenceStart, diffFenceEnd)
+    assert.ok(roundDiff.includes('f2.txt'), '本輪 diff 含 f2')
+    assert.ok(!roundDiff.includes('f1.txt'), '本輪 diff 不含 f1')
+    assert.ok(!roundDiff.includes('other.txt'), '本輪 diff 不含 other.txt')
+  })
+  test('(b2) council review 帶 --round-start（untracked 新檔）：與 (b) 同構，但 f2 不 git add（純 untracked），另加 .agy-write/junk 檔 ⇒ prompt.md 的【累計 stat】段含 f2 且含「新檔（未追蹤）」、不含 .agy-write；本輪 diff 含 +++ b/f2。斷言訊息帶實際 prompt 片段。陽性對照（寫成斷言）：直接 git diff --stat MERGEBASE 的輸出不含 f2——證明沒接 untracked 的尺確實漏', async () => {
+    const repo = makeRepo()
+    // 1. Commit A（base 起點，不包含 f2.txt）
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'base.txt'), 'base line 1\n')
+    repo.g('add', 'base.txt')
+    repo.g('commit', '-m', 'commit A: base start')
+    const shaA = repo.g('rev-parse', 'HEAD').trim()
+
+    // 2. 分支切出（從 A），commit B（改 f1）
+    repo.g('checkout', '-b', 'feat/branch-b2', shaA)
+    fs.writeFileSync(path.join(repo.dir, 'f1.txt'), 'f1 line 1\n')
+    repo.g('add', 'f1.txt')
+    repo.g('commit', '-m', 'commit B: f1')
+    const shaB = repo.g('rev-parse', 'HEAD').trim()
+
+    // 3. main 上另 commit C（改 other.txt，foreign）
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'other.txt'), 'other foreign\n')
+    repo.g('add', 'other.txt')
+    repo.g('commit', '-m', 'commit C: foreign')
+
+    // 4. 切回分支 feat/branch-b2，工作樹建立 f2.txt（純 untracked，不 git add！）與 .agy-write/junk 檔
+    repo.g('checkout', 'feat/branch-b2')
+    fs.writeFileSync(path.join(repo.dir, 'f2.txt'), 'f2 line untracked\n')
+    fs.mkdirSync(path.join(repo.dir, '.agy-write'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, '.agy-write', 'junk'), 'junk internal\n')
+
+    // 陽性對照（寫成斷言）：直接 git diff --stat MERGEBASE 的輸出不含 f2——證明沒接 untracked 的尺確實漏
+    const mergeBase = repo.g('merge-base', 'main', 'HEAD').trim()
+    assert.equal(mergeBase, shaA, 'mergeBase 應為 commit A')
+    const rawCumulativeStat = repo.g('diff', '--stat', mergeBase)
+    assert.ok(!rawCumulativeStat.includes('f2.txt'), '陽性對照：直接 git diff --stat MERGEBASE 的輸出不含 f2——證明沒接 untracked 的尺確實漏')
+
+    // 5. council review 帶 --round-start
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+    const outDir = path.join(repo.dir, '.review-b2')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--round-start', shaB,
+        '--brief', briefFile,
+        '--out', outDir,
+        '--tier', 'standard',
+      ], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+
+    // 斷言：累計 stat 段
+    const cumuStart = promptText.indexOf('【累計 stat（自 merge-base）】')
+    const diffStatStart = promptText.indexOf('【git diff --stat】')
+    assert.ok(cumuStart !== -1 && diffStatStart !== -1, 'prompt 應含累計 stat 與 git diff --stat 標題')
+    const cumulativeStat = promptText.slice(cumuStart, diffStatStart)
+
+    // 斷言：含 f2 且含「新檔（未追蹤）」、不含 .agy-write（斷言訊息帶實際 prompt 片段）
+    assert.ok(cumulativeStat.includes('f2.txt'), `累計 stat 含 f2，實際 prompt 片段：\n${cumulativeStat}`)
+    assert.ok(cumulativeStat.includes('新檔（未追蹤）'), `累計 stat 應含「新檔（未追蹤）」，實際 prompt 片段：\n${cumulativeStat}`)
+    assert.ok(!cumulativeStat.includes('.agy-write'), `累計 stat 不應含 .agy-write，實際 prompt 片段：\n${cumulativeStat}`)
+
+    // 斷言：本輪 diff 含 +++ b/f2（斷言訊息帶實際 prompt 片段）
+    const diffFenceStart = promptText.indexOf('```diff\n') + 8
+    const diffFenceEnd = promptText.indexOf('\n```', diffFenceStart)
+    assert.ok(diffFenceStart !== -1 && diffFenceEnd !== -1, 'prompt 應含 diff code fence')
+    const roundDiff = promptText.slice(diffFenceStart, diffFenceEnd)
+    assert.ok(roundDiff.includes('+++ b/f2.txt'), `本輪 diff 應含 +++ b/f2，實際 prompt 片段：\n${roundDiff}`)
+  })
+  test('(c) 不帶 --round-start ⇒ prompt.md 不含「【本輪範圍】」，且 diff 與 git diff BASE 相同', async () => {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f2.txt'), 'f2 line 1\n')
+    repo.g('add', 'f2.txt')
+    repo.g('commit', '-m', 'commit A')
+    repo.g('checkout', '-b', 'feat/branch-c')
+    fs.appendFileSync(path.join(repo.dir, 'f2.txt'), 'f2 line 2\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+    const outDir = path.join(repo.dir, '.review-c')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDir,
+        '--tier', 'standard',
+      ], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+    assert.ok(!promptText.includes('【本輪範圍】'), 'prompt.md 不含「【本輪範圍】」')
+
+    const diffFenceStart = promptText.indexOf('```diff\n') + 8
+    const diffFenceEnd = promptText.indexOf('\n```', diffFenceStart)
+    const promptDiff = promptText.slice(diffFenceStart, diffFenceEnd)
+    const expectedBaseDiff = repo.g('diff', 'main').trim()
+    assert.equal(promptDiff, expectedBaseDiff, 'diff 與 git diff BASE 相同')
+  })
+  test('council review 帶 --writer-report ⇒ prompt.md 含【寫手最後回報】、含報告內容、且該段在 ``` 結束的 diff 區塊之後；不帶 ⇒ 不含', async () => {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt')
+    repo.g('commit', '-m', 'commit A')
+    repo.g('checkout', '-b', 'feat/wr-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'line 2 modified\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+    const reportFile = path.join(tmpdir('report-'), 'report.md')
+    fs.writeFileSync(reportFile, 'T51 紅在 ticket.test.mjs:3516 code 應為 2 實際 0')
+
+    const outDirWithReport = tmpdir('review-with-report-')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      // 1. 帶 --writer-report
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDirWithReport,
+        '--tier', 'standard',
+        '--writer-report', reportFile,
+      ], deps)
+
+      // 2. 不帶 --writer-report
+      const outDirNoReport = tmpdir('review-no-report-')
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDirNoReport,
+        '--tier', 'standard',
+      ], deps)
+
+      const promptWith = fs.readFileSync(path.join(outDirWithReport, 'prompt.md'), 'utf8')
+      const promptWithout = fs.readFileSync(path.join(outDirNoReport, 'prompt.md'), 'utf8')
+
+      // 斷言：帶 report ⇒ 含【寫手最後回報】、含報告內容
+      assert.ok(promptWith.includes('【寫手最後回報（作者自述，不是證據）】'), '帶 report 時 prompt 應含【寫手最後回報】')
+      assert.ok(promptWith.includes('T51 紅在 ticket.test.mjs:3516 code 應為 2 實際 0'), '帶 report 時 prompt 應含報告內容')
+
+      // 斷言：該段在 ``` 結束的 diff 區塊之後
+      const diffEnd = promptWith.indexOf('```diff\n')
+      assert.ok(diffEnd !== -1, 'prompt 應含 ```diff')
+      const diffFenceClose = promptWith.indexOf('\n```', diffEnd)
+      assert.ok(diffFenceClose !== -1, 'prompt 應含 diff 區塊結束的 ```')
+      const reportHeaderIdx = promptWith.indexOf('【寫手最後回報（作者自述，不是證據）】')
+      assert.ok(reportHeaderIdx > diffFenceClose, '【寫手最後回報】應在 ``` 結束的 diff 區塊之後')
+
+      // 斷言：不帶 report ⇒ 不含
+      assert.ok(!promptWithout.includes('【寫手最後回報（作者自述，不是證據）】'), '不帶 report 時 prompt 不應含【寫手最後回報】')
+      assert.ok(!promptWithout.includes('T51 紅在 ticket.test.mjs:3516'), '不帶 report 時 prompt 不應含報告內容')
+    } finally {
+      console.log = origLog
+    }
+  })
+  test('council review --writer-report 指向空檔 ⇒ prompt.md 含【寫手最後回報】且含「寫手回報為空」', async () => {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt')
+    repo.g('commit', '-m', 'commit A')
+    repo.g('checkout', '-b', 'feat/wr-empty')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'line 2 modified\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+    const emptyReportFile = path.join(tmpdir('report-'), 'empty-report.md')
+    fs.writeFileSync(emptyReportFile, '')
+
+    const outDir = tmpdir('review-empty-report-')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDir,
+        '--tier', 'standard',
+        '--writer-report', emptyReportFile,
+      ], deps)
+
+      const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+      assert.ok(promptText.includes('【寫手最後回報（作者自述，不是證據）】'), '空檔 report 時 prompt 應含【寫手最後回報】')
+      assert.ok(promptText.includes('寫手回報為空'), '空檔 report 時 prompt 應含「寫手回報為空」')
+    } finally {
+      console.log = origLog
+    }
+  })
+  test('buildReviewPrompt 純函式：writerReport: "" 含區塊標題；null 與省略參數不含且兩者字串相等', () => {
+    const baseArgs = {
+      brief: 'brief text',
+      diff: 'diff text',
+      tier: 'standard',
+      diffStat: '1 file changed',
+      writerModel: 'gemini-3.1-pro-high',
+    }
+
+    const promptEmpty = buildReviewPrompt({ ...baseArgs, writerReport: '' })
+    const promptNull = buildReviewPrompt({ ...baseArgs, writerReport: null })
+    const promptOmitted = buildReviewPrompt({ ...baseArgs })
+
+    assert.ok(promptEmpty.includes('【寫手最後回報（作者自述，不是證據）】'), 'writerReport: "" 應含【寫手最後回報】區塊標題')
+    assert.ok(promptEmpty.includes('寫手回報為空'), 'writerReport: "" 應含「寫手回報為空」')
+
+    assert.ok(!promptNull.includes('【寫手最後回報（作者自述，不是證據）】'), 'writerReport: null 不應含【寫手最後回報】區塊標題')
+    assert.ok(!promptOmitted.includes('【寫手最後回報（作者自述，不是證據）】'), '省略 writerReport 不應含【寫手最後回報】區塊標題')
+
+    assert.equal(promptNull, promptOmitted, 'writerReport: null 與省略參數產生的 prompt 應完全相等')
+  })
+  test('buildReviewPrompt 純函式：reviewOnly: true ⇒ 含 review-only 區塊與「不構成不簽理由」，且不含【寫手最後回報】（即使給 writerReport）；reviewOnly: false 與省略字串相等且不含 review-only 區塊', () => {
+    const baseArgs = {
+      brief: 'brief text',
+      diff: 'diff text',
+      tier: 'standard',
+      diffStat: '1 file changed',
+      writerModel: 'gemini-3.1-pro-high',
+    }
+
+    const promptROWithReport = buildReviewPrompt({ ...baseArgs, reviewOnly: true, writerReport: 'X' })
+    const promptFalse = buildReviewPrompt({ ...baseArgs, reviewOnly: false })
+    const promptOmitted = buildReviewPrompt({ ...baseArgs })
+
+    const roHeader = '【review-only：本輪沒有寫手、沒有寫手回報】'
+    const phrase = '不構成不簽理由'
+    const wrHeader = '【寫手最後回報'
+
+    assert.ok(promptROWithReport.includes(roHeader), `reviewOnly: true 應含「${roHeader}」，實際 prompt：\n${promptROWithReport}`)
+    assert.ok(promptROWithReport.includes(phrase), `reviewOnly: true 應含「${phrase}」，實際 prompt：\n${promptROWithReport}`)
+    assert.ok(!promptROWithReport.includes(wrHeader), `reviewOnly: true 即使給 writerReport: 'X' 也不應含「${wrHeader}」，實際 prompt：\n${promptROWithReport}`)
+
+    assert.ok(!promptFalse.includes(roHeader), `reviewOnly: false 不應含「${roHeader}」，實際 prompt：\n${promptFalse}`)
+    assert.ok(!promptOmitted.includes(roHeader), `省略 reviewOnly 不應含「${roHeader}」，實際 prompt：\n${promptOmitted}`)
+    assert.equal(promptFalse, promptOmitted, `reviewOnly: false 與省略參數產生的 prompt 應完全相等，實際 false 長度 ${promptFalse.length}，omitted 長度 ${promptOmitted.length}`)
+  })
+  test('council review --review-only ⇒ prompt.md 含 review-only 區塊、不含【寫手最後回報】；不帶旗標 ⇒ 不含 review-only 區塊', async () => {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt')
+    repo.g('commit', '-m', 'commit A')
+    repo.g('checkout', '-b', 'feat/ro-prompt-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'line 2 modified\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+
+    const outDirWithRO = tmpdir('review-with-ro-')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      // 1. 帶 --review-only
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDirWithRO,
+        '--tier', 'standard',
+        '--review-only',
+      ], deps)
+
+      // 2. 不帶 --review-only
+      const outDirNoRO = tmpdir('review-no-ro-')
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDirNoRO,
+        '--tier', 'standard',
+      ], deps)
+
+      const promptWith = fs.readFileSync(path.join(outDirWithRO, 'prompt.md'), 'utf8')
+      const promptWithout = fs.readFileSync(path.join(outDirNoRO, 'prompt.md'), 'utf8')
+
+      const roHeader = '【review-only：本輪沒有寫手、沒有寫手回報】'
+      const wrHeader = '【寫手最後回報'
+
+      assert.ok(promptWith.includes(roHeader), `帶 --review-only 時 OUT/prompt.md 應含「${roHeader}」，實際 prompt.md：\n${promptWith}`)
+      assert.ok(!promptWith.includes(wrHeader), `帶 --review-only 時 OUT/prompt.md 不應含「${wrHeader}」，實際 prompt.md：\n${promptWith}`)
+
+      assert.ok(!promptWithout.includes(roHeader), `不帶 --review-only 時 OUT/prompt.md 不應含「${roHeader}」，實際 prompt.md：\n${promptWithout}`)
+    } finally {
+      console.log = origLog
+    }
+  })
+  test('council review --writer-report 超過 20000 字元 ⇒ 含「截斷」與原長', async () => {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt')
+    repo.g('commit', '-m', 'commit A')
+    repo.g('checkout', '-b', 'feat/wr-long')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'line 2 modified\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 測試 brief\n內容\n')
+
+    const longReportFile = path.join(tmpdir('report-'), 'long-report.md')
+    const longReport = 'A'.repeat(25000)
+    fs.writeFileSync(longReportFile, longReport)
+
+    const outDir = tmpdir('review-long-')
+    const deps = {
+      runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }),
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      await councilMain([
+        'review',
+        '--coordinator', 'claude',
+        '--worktree', repo.dir,
+        '--base', 'main',
+        '--brief', briefFile,
+        '--out', outDir,
+        '--tier', 'standard',
+        '--writer-report', longReportFile,
+      ], deps)
+    } finally {
+      console.log = origLog
+    }
+
+    const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
+    assert.ok(promptText.includes('截斷'), '超過 20000 字元應含「截斷」')
+    assert.ok(promptText.includes('25000'), '超過 20000 字元應註明原長 25000')
+    assert.match(promptText, /截斷，原長 25000 字元/, 'prompt 應含「截斷，原長 25000 字元」')
   })
   test('review：兩位 agy（假 binary 回「不簽」）⇒ 表格印 不簽、exit 0；零輸出成員 ⇒ exit 3', async () => {
     const repo = makeRepo()
@@ -1626,6 +2308,8 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
 
     assert.equal(code, 3)
     assert.match(errs.join('\n'), /🔴 G3 前置：拿不到 conversation id，不續話/)
+    assert.ok(fs.existsSync(path.join(outDir, 'round-1.response.md')), 'round-1.response.md 應存在')
+    assert.equal(fs.readFileSync(path.join(outDir, 'round-1.response.md'), 'utf8'), 'ok')
     const ledgerPath = path.join(outDir, 'ledger.ndjson')
     const lines = fs.readFileSync(ledgerPath, 'utf8').trim().split('\n')
     const lastEntry = JSON.parse(lines[lines.length - 1])
@@ -2221,6 +2905,55 @@ describe('git 環境剝除：cleanGitEnv 真實生效', () => {
     assert.equal(capturedSpawnEnv.GIT_DIR, undefined, 'GIT_DIR 應被刪除')
     assert.equal(capturedSpawnEnv.GIT_WORK_TREE, undefined, 'GIT_WORK_TREE 應被刪除')
     assert.equal(capturedSpawnEnv.PATH, '/custom/bin', 'PATH 應被保留')
+  })
+
+  // 🔴 事故：2026-09-15 WAS release 被 tools/git-env-hygiene.test.mjs 擋（.agents/skills/llm-team/lib.mjs:1000 writeTreeOf 用 { env, encoding } 簡寫，字面閘看不到 env:）
+  //    陽性對照：lib.mjs writeTreeOf 改回 { env, encoding } ⇒ 本測試紅列出 lib.mjs:1000；母體改成掃不到檔 ⇒ 總數 ≥ 3 紅
+  //    停止條件：WAS 那道閘改成行為級（真的 spawn 並檢查子行程 env）時，本測試可退成純分母檢查
+  test('靜態：本 skill 每個 git spawn 呼叫點都帶剝除過的 env 字面', () => {
+    const dir = fileURLToPath(new URL('.', import.meta.url))
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs'))
+    const ENV_REGEX = /\benv\s*:\s*(?:CLEAN_GIT_ENV|CLEAN_ENV|cleanGitEnv\s*\(|\{\s*\.{3}\s*(?:CLEAN_GIT_ENV|CLEAN_ENV))/
+    const CALL_REGEX = /\b(?:spawnSync|execFileSync|execSync|spawn|execFile)\s*\(\s*['"]git['"]\s*[,)]/g
+
+    let totalGitCalls = 0
+    const violations = []
+
+    for (const file of files) {
+      const fullPath = path.join(dir, file)
+      const content = fs.readFileSync(fullPath, 'utf8')
+      CALL_REGEX.lastIndex = 0
+      let match
+      while ((match = CALL_REGEX.exec(content)) !== null) {
+        totalGitCalls++
+        const parenIndex = content.indexOf('(', match.index)
+        let depth = 1
+        let closeIndex = -1
+        for (let i = parenIndex + 1; i < content.length; i++) {
+          const ch = content[i]
+          if (ch === '(') {
+            depth++
+          } else if (ch === ')') {
+            depth--
+            if (depth === 0) {
+              closeIndex = i
+              break
+            }
+          }
+        }
+        const line = content.slice(0, match.index).split('\n').length
+        if (depth !== 0 || closeIndex === -1) {
+          throw new Error(`括號計數失敗：${file}:${line}`)
+        }
+        const argsText = content.slice(parenIndex + 1, closeIndex)
+        if (!ENV_REGEX.test(argsText)) {
+          violations.push(`${file}:${line}`)
+        }
+      }
+    }
+
+    assert.deepEqual(violations, [], `這些 git 子行程沒有剝除 git 環境變數(缺 env: CLEAN_GIT_ENV):\n    ${violations.join('\n    ')}`)
+    assert.ok(totalGitCalls >= 3, `掃到的 git 呼叫點總數應 >= 3，實際為 ${totalGitCalls}`)
   })
 })
 
@@ -3146,6 +3879,97 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     assert.equal(resG1, customGuard)
     assert.ok(cG1.includes(resG1), 'resolveGuardPath 找到的值必在 candidates 陣列內')
     assert.equal(resG1, cG1[0])
+  })
+
+  test('setup.mjs --check: 快照 SOURCE.json.version "1.6.7"、deps.sourceVersion "1.6.8" ⇒ 回 1、stderr 含「落後真源」與「export.mjs --all」', () => {
+    const base = makeValidSetupDeps(null)
+    const good = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(good, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '$HOME/.claude/hooks/block-dangerous.sh' }] }] } }))
+    const deps = { ...base, env: { ...base.env, CLAUDE_SETTINGS: good } }
+
+    const snapshotDir = path.join(deps.repoRoot, '.agents', 'skills', 'llm-team')
+    fs.mkdirSync(snapshotDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(snapshotDir, 'SOURCE.json'),
+      JSON.stringify({ version: '1.6.7', sourceCommit: 'abcdef0', exportedAt: '2026-09-15' })
+    )
+    deps.sourceVersion = '1.6.8'
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'claude'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 1)
+    const allErr = errs.join('\n')
+    assert.ok(allErr.includes('落後真源'), `stderr 應包含「落後真源」，實際：${allErr}`)
+    assert.ok(allErr.includes('export.mjs --all'), `stderr 應包含「export.mjs --all」，實際：${allErr}`)
+  })
+
+  test('setup.mjs --check: 快照 SOURCE.json.version 與 deps.sourceVersion 相等 ⇒ 不因此紅', () => {
+    const base = makeValidSetupDeps(null)
+    const good = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(good, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '$HOME/.claude/hooks/block-dangerous.sh' }] }] } }))
+    const deps = { ...base, env: { ...base.env, CLAUDE_SETTINGS: good } }
+
+    const snapshotDir = path.join(deps.repoRoot, '.agents', 'skills', 'llm-team')
+    fs.mkdirSync(snapshotDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(snapshotDir, 'SOURCE.json'),
+      JSON.stringify({ version: '1.6.8', sourceCommit: 'abcdef0', exportedAt: '2026-09-15' })
+    )
+    deps.sourceVersion = '1.6.8'
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'claude'], deps)
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 0)
+  })
+
+  test('setup.mjs --check: 真源不可讀（deps.sourceDir 指到不存在目錄）⇒ 印「略過」不紅', () => {
+    const base = makeValidSetupDeps(null)
+    const good = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(good, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '$HOME/.claude/hooks/block-dangerous.sh' }] }] } }))
+    const deps = { ...base, env: { ...base.env, CLAUDE_SETTINGS: good } }
+
+    const snapshotDir = path.join(deps.repoRoot, '.agents', 'skills', 'llm-team')
+    fs.mkdirSync(snapshotDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(snapshotDir, 'SOURCE.json'),
+      JSON.stringify({ version: '1.6.8', sourceCommit: 'abcdef0', exportedAt: '2026-09-15' })
+    )
+    deps.sourceDir = path.join(tmpdir('nonexistent-src-'), 'does-not-exist')
+    delete deps.sourceVersion
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'claude'], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    const allLog = logs.join('\n')
+    assert.ok(allLog.includes('略過'), `stdout 應包含「略過」，實際：${allLog}`)
+  })
+
+  test('setup.mjs --check: 沒有快照 ⇒ 略過', () => {
+    const base = makeValidSetupDeps(null)
+    const good = path.join(tmpdir('claude-settings-'), 'settings.json')
+    fs.writeFileSync(good, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '$HOME/.claude/hooks/block-dangerous.sh' }] }] } }))
+    const deps = { ...base, env: { ...base.env, CLAUDE_SETTINGS: good } }
+    deps.sourceVersion = '1.6.8'
+    const code = setupMain(['--check', '--coordinator', 'claude'], deps)
+    assert.equal(code, 0)
   })
 })
 
