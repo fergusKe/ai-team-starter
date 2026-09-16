@@ -62,6 +62,14 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
   - ④ **每票 accept 後量測**：`node .agents/skills/llm-team/usage.mjs --ticket <票> --write`，數字記進專案的 handoff／台帳。`gross`＝牆上視窗上限（含夾票與非票工作）；`exclusive`＝排除被其他票視窗夾走的部分，**仍含非票工作**（release／compact／回答 Fergus 沒有標記），比票時看 exclusive、稽核時看 gross。
   - ⑤ **量法門檻（A 案）**：每專案各自一組，不跨專案混；`accept` 必標 `--caliber docs|tool|feature`（缺標的票不納入）；基線＝該專案該口徑最早 5 張、凍結不滾動；之後不重疊每連續 10 張一窗；判定＝`coordinatorUsageExclusive.apiCalls` 中位數比基線降 ≥40% **且** 重工率（`summary.run ≥ 2` 的比例）不高於基線；每滿一窗跑 `node .agents/skills/llm-team/usage.mjs --cohort <口徑>` 把那一行抄進專案 handoff；缺 `run` 欄位的票只能給 🟡 provisional；**停止條件**：連續兩窗口徑稽核（統整者抽 5 張重標）誤標率 >20% ⇒ 這把尺廢止、回到只記數字不判定。
   - ⑥ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省；把大票拆成很多小票灌低單票中位數（要看專案總呼叫數有沒有反而漲）；難票錯標／漏標口徑（漏標＝不納，等於把難票藏起來）。
+  - ⑦ **修尺停損（尺預算；2026-09-16 WAS 實證後三專案共用）**：「尺」＝量 repo 自己一不一致的守門／台帳／登記表（產物 vs 台帳、env 有沒有登記、產生區塊有沒有重產、文件引用有沒有指到）。實證：WAS 一個 session 37 次 merge 點 ship 紅 8 次，**8 次全是尺的自我維護、0 次產品缺陷**；每把尺都要一本台帳、每張功能票都要餵一次，尺壞了再造一把尺是補不完的洞。規則（各專案在自己的 DISPATCH／AGENTS 寫到期日與覆寫）：
+    - **S1 尺凍結**：停損期內不開任何「新尺／新守門／新台帳／新規則／記憶整理」票；尺壞了**不修**，在 handoff 記一行（哪把尺、怎麼壞、用什麼直接量法代替），用直接量法（跑真的、開瀏覽器、唯讀查 production）把手上的功能票做完。
+    - **S2 唯一例外**：壞尺會讓手上功能票的**核心接受條件假綠**才票內修；≤30 分鐘、不新增測試檔、不新增台帳或通用規則；超時改用最接近實物且安全的直接證據，production 只准唯讀；無法安全直接驗證就標「未驗證」交人裁決，不得宣稱通過。
+    - **S3 ship 紅燈**：只要求 regen／台帳同步／登記表更新的紅，只做最小修正、不強化那把尺；同一斷言連續 5 次 ship 內 ≥2 次純自我維護紅且都沒指出產品行為／部署安全／權限隔離／資料完整性缺陷 ⇒ 降成警告並記 handoff，到期由人決定恢復／保留／刪。
+    - **S4 記憶整理**：停損期內不複核保鮮閘、不清幽靈；只有人的新裁決才寫記憶。
+    - **S5 到期回報**：同一把尺（commit 路徑占比分別列、不相加；ship 總數與紅燈成分；完成的縱切數），不為回報新增工具。
+    - **哪些尺留**：能在**事故前**擋部署可行性、租戶／權限隔離、資料完整性、重試冪等的產品契約尺留著；狀態盤點、台帳同步、文件一致性、一次性驗收類不再新增。
+    - 票選擇：停損期內只開「改變使用者畫面、或 production 一個數字」的票；治理類只列不開，要人點頭。複審：只有五類（平台強制原語／金流／租戶隔離・認證・密鑰／Schema-DDL／改守門本身）走 block，其餘單簽一輪、不開 council。
 - config repo 現有 15 張 llm-team 工具票以 `usage.mjs --tag-caliber tool --ticket <票> --grandfathered` 追認為第一份 `tool` 結論；前 8 張無 `run` ⇒ 只能 provisional。
 - `usage.mjs` 只在統整者 harness 是 claude 時量得到，其他 harness 記 `measurable:false`。找 transcript 的順序＝sessionId 直達（lifecycle run-start 的 `sessionId`，來自 Claude Code env `CLAUDE_CODE_SESSION_ID`；agy／codex 統整者沒有 ⇒ 走字面掃描）→ cwd slug → main repo slug → 全部子目錄（跨專案 session 開的票也找得到）；`--projects-dir` 只掃指定目錄。
 
