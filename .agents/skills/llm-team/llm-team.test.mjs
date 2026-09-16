@@ -2190,20 +2190,25 @@ describe('spawnAsync 非同步子行程執行', () => {
   })
 
   test('spawnAsync timeout 後忽略 SIGTERM ⇒ killGraceMs 到期升級送 SIGKILL 且 signal 為 SIGKILL', async () => {
+    // timeout 不能設 100：子行程要先跑到 `process.on("SIGTERM", …)` 那行才算註冊好 handler，
+    // 忙碌機器上 node 子行程啟動超過 100ms 是常態；一旦 SIGTERM 在 handler 註冊前就送達，
+    // 子行程會直接被 SIGTERM 殺掉，斷言會假紅（2026-09-16 M4 loadavg 8 實測：
+    // actual 'SIGTERM' expected 'SIGKILL'；同一份程式碼在 loadavg 3 時三次都綠）。
+    // 這是測試本身的競態，不是 lib 的 bug：spawnAsync 的計時器從 spawn 那一刻就啟動是刻意設計，不改 lib.mjs。
     const code = [
       'process.on("SIGTERM", function(){})',
       'setInterval(function(){}, 1000)',
     ].join('\n')
     const start = Date.now()
     let watchdogTimer = null
-    const pending = spawnAsync('node', ['-e', code], { timeout: 100, killGraceMs: 100 })
+    const pending = spawnAsync('node', ['-e', code], { timeout: 1000, killGraceMs: 100 })
     assert.ok(pending.child && typeof pending.child.kill === 'function', 'spawnAsync 的 Promise 要掛 .child')
     const race = await Promise.race([
       pending,
       new Promise(function (resolve) {
         watchdogTimer = setTimeout(function () {
           resolve('WATCHDOG')
-        }, 3000)
+        }, 4000)
       }),
     ])
     if (watchdogTimer) clearTimeout(watchdogTimer)
@@ -2214,11 +2219,11 @@ describe('spawnAsync 非同步子行程執行', () => {
       } catch {
         /* 可能已退出 */
       }
-      assert.fail('spawnAsync 在 3 秒內沒有 resolve：SIGKILL 升級沒生效')
+      assert.fail('spawnAsync 在 4 秒內沒有 resolve：SIGKILL 升級沒生效')
     }
     const r = race
     const elapsed = Date.now() - start
-    assert.ok(elapsed < 1000, `應在 1 秒內結束，實際耗時 ${elapsed}ms`)
+    assert.ok(elapsed < 3000, `應在 3 秒內結束，實際耗時 ${elapsed}ms`)
     assert.equal(r.status, null)
     assert.equal(r.signal, 'SIGKILL')
     assert.equal(r.timedOut, true)
