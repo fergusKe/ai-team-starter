@@ -40,6 +40,9 @@ const KNOWN_FLAGS = new Set([
   '--json',
   '--help',
   '-h',
+  '--tag-caliber',
+  '--cohort',
+  '--grandfathered',
 ])
 
 const VALUE_FLAGS = new Set([
@@ -49,7 +52,11 @@ const VALUE_FLAGS = new Set([
   '--transcript',
   '--from',
   '--to',
+  '--tag-caliber',
+  '--cohort',
 ])
+
+const CALIBERS = Object.freeze(['docs', 'tool', 'feature'])
 
 const NOTIFICATION_PREFIXES = Object.freeze([
   '<task-notification>',
@@ -819,6 +826,118 @@ async function* streamJsonLines(filePath) {
   }
 }
 
+// ── Cohort 判定 ────────────────────────────────────────────────────────────
+
+function median(nums) {
+  const sorted = [...nums].sort((a, b) => a - b)
+  const n = sorted.length
+  const mid = Math.floor(n / 2)
+  if (n % 2 === 1) return sorted[mid]
+  return (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+function reworkOf(group) {
+  let n = 0
+  let of = 0
+  let unknown = 0
+  for (const s of group) {
+    if (typeof s.run === 'number') {
+      of++
+      if (s.run >= 2) n++
+    } else {
+      unknown++
+    }
+  }
+  return { n, of, unknown }
+}
+
+/**
+ * 事故（2026-09-15）：config repo 15 張 llm-team 工具票混口徑直接量出「中位數 48→19、−60%」，但前 8 張是 1.6.7 之前開的、
+ *   summary 沒有 `run` 欄位 ⇒ 重工率不可比（sol Q3：只能 provisional）；沒有 caliber 標籤時把 docs 小票混進來也會壓低中位數——這支工具的存在理由就是讓那種數字只能印 🟡 不能印 ✅。
+ *
+ * 純函式：對一批票 summary 依 caliber 做同口徑 cohort 判定（A 案）。
+ *   - 母體＝caliber 相符、usage.measurable===true、coordinatorUsageExclusive.apiCalls 為數字、
+ *     usageWindow.from 為字串的票；依 usageWindow.from 字串升冪排序。
+ *   - 基線＝前 5 張（不足 5 ⇒ 回傳 short:true、median:null、windows:[]）。
+ *   - 之後不重疊每連續 10 張一窗（k 從 1 起）；最後不滿 10 張的窗 partial:true、verdict:null。
+ *   - 中位數：排序後奇數取中、偶數取中間兩數平均（不四捨五入）。
+ *   - dropPct = (baseline 中位數 − 窗中位數) / baseline 中位數 × 100（保留小數，印時才 toFixed(1)）。
+ *   - 重工 = { n: run>=2 的張數, of: 有 run 欄位的張數, unknown: 缺 run 欄位的張數 }；重工率 = n/of。
+ *   - 判定：dropPct>=40 且基線與窗 unknown 都是 0 且窗重工率 <= 基線重工率 ⇒ 'pass'；
+ *          dropPct>=40 但任一組 unknown>0 ⇒ 'provisional'；
+ *          其餘（dropPct<40，或都可比但窗重工率 > 基線）⇒ 'fail'。
+ */
+export function cohortReport(summaries, caliber) {
+  const ticketName = (s) => s.ticket ?? s.name
+
+  const list = Array.isArray(summaries) ? summaries : []
+  const filtered = list.filter((s) =>
+    s &&
+    s.caliber === caliber &&
+    s.usage?.measurable === true &&
+    typeof s.coordinatorUsageExclusive?.apiCalls === 'number' &&
+    typeof s.usageWindow?.from === 'string'
+  )
+  filtered.sort((a, b) => {
+    if (a.usageWindow.from < b.usageWindow.from) return -1
+    if (a.usageWindow.from > b.usageWindow.from) return 1
+    return 0
+  })
+
+  if (filtered.length < 5) {
+    return {
+      caliber,
+      baseline: { tickets: filtered.map(ticketName), median: null, rework: reworkOf(filtered), short: true },
+      windows: [],
+    }
+  }
+
+  const baselineGroup = filtered.slice(0, 5)
+  const baselineMedian = median(baselineGroup.map((s) => s.coordinatorUsageExclusive.apiCalls))
+  const baselineRework = reworkOf(baselineGroup)
+  const baseline = {
+    tickets: baselineGroup.map(ticketName),
+    median: baselineMedian,
+    rework: baselineRework,
+  }
+
+  const rest = filtered.slice(5)
+  const windows = []
+  let k = 1
+  for (let i = 0; i < rest.length; i += 10) {
+    const group = rest.slice(i, i + 10)
+    const partial = group.length < 10
+    const groupMedian = median(group.map((s) => s.coordinatorUsageExclusive.apiCalls))
+    const groupRework = reworkOf(group)
+    const dropPct = (baselineMedian - groupMedian) / baselineMedian * 100
+
+    let verdict = null
+    if (!partial) {
+      const bothComparable = baselineRework.unknown === 0 && groupRework.unknown === 0
+      if (dropPct >= 40 && bothComparable && (groupRework.n / groupRework.of) <= (baselineRework.n / baselineRework.of)) {
+        verdict = 'pass'
+      } else if (dropPct >= 40 && !bothComparable) {
+        verdict = 'provisional'
+      } else {
+        verdict = 'fail'
+      }
+    }
+
+    windows.push({
+      k,
+      tickets: group.map(ticketName),
+      median: groupMedian,
+      dropPct,
+      rework: groupRework,
+      verdict,
+      partial,
+    })
+    k++
+  }
+
+  return { caliber, baseline, windows }
+}
+
 // ── CLI 主流程 ─────────────────────────────────────────────────────────────
 
 export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
@@ -864,8 +983,13 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
     return 0
   }
 
+  if (flags['--tag-caliber'] !== undefined && flags['--cohort'] !== undefined) {
+    console.error('🔴 --tag-caliber 與 --cohort 不可同時使用')
+    return 2
+  }
+
   const ticket = flags['--ticket']
-  if (!ticket) {
+  if (!ticket && flags['--cohort'] === undefined) {
     console.error('缺少必填旗標：--ticket')
     return 2
   }
@@ -893,6 +1017,118 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
 
   // 解析 localDir
   const localDir = resolve(repoRoot, config.outDir || '.local/llm-team')
+
+  // --tag-caliber：只標 caliber，不找 transcript、不需要 config 以外的任何東西
+  // 🔴 用旗標存在性判斷是否進入本模式（不是真假值）：`--tag-caliber ''` 也要落在這裡被判非法值，
+  //   不能因為空字串是 falsy 就掉出本區塊、繼續往下跑到找 transcript 的路徑。
+  if (flags['--tag-caliber'] !== undefined) {
+    // 防守：互斥檢查已擋掉「--tag-caliber 加 --cohort」那條路徑，但 --tag-caliber 本身一定要有 --ticket，
+    // 不靠上面那個「沒有 --cohort 才必填」的檢查繞著走——這裡直接再檢一次，缺了就不讓它掉進下面的 join(ticket) 拋錯。
+    if (!ticket) {
+      console.error('缺少必填旗標：--ticket')
+      return 2
+    }
+    const caliber = flags['--tag-caliber']
+    if (!CALIBERS.includes(caliber)) {
+      console.error('🔴 --tag-caliber 只准 docs｜tool｜feature')
+      return 2
+    }
+    const tagSummaryFile = join(localDir, ticket, 'summary.json')
+    if (!existsSync(tagSummaryFile)) {
+      console.error(`🔴 summary.json 不存在：${tagSummaryFile}`)
+      return 1
+    }
+    let tagSummary
+    try {
+      tagSummary = JSON.parse(readFileSync(tagSummaryFile, 'utf8'))
+    } catch (e) {
+      console.error(`🔴 summary.json 解析失敗：${e.message}`)
+      return 1
+    }
+    // 已標＝欄位存在性，不是真假值：既有 caliber:null／'' 也算已標過，不能被覆寫。
+    if (Object.prototype.hasOwnProperty.call(tagSummary, 'caliber')) {
+      console.error(`🔴 已標 ${JSON.stringify(tagSummary.caliber)}，不覆寫`)
+      return 2
+    }
+    tagSummary.caliber = caliber
+    tagSummary.caliberBy = 'coordinator'
+    if (flags['--grandfathered']) {
+      tagSummary.caliberGrandfathered = true
+    }
+    writeFileSync(tagSummaryFile, JSON.stringify(tagSummary, null, 2) + '\n')
+    console.error(`已標 ${ticket} caliber=${caliber}`)
+    return 0
+  }
+
+  // --cohort：對 localDir 底下每張票的 summary.json 做同口徑 cohort 判定，只讀檔、不找 transcript
+  // 🔴 同樣用旗標存在性判斷（不是真假值），理由同 --tag-caliber。
+  if (flags['--cohort'] !== undefined) {
+    const caliber = flags['--cohort']
+    if (!CALIBERS.includes(caliber)) {
+      console.error('🔴 --cohort 只准 docs｜tool｜feature')
+      return 2
+    }
+
+    let cohortEntries = []
+    try {
+      cohortEntries = existsSync(localDir) ? readdirSync(localDir, { withFileTypes: true }) : []
+    } catch (e) {
+      console.error(`🔴 讀取 localDir 失敗：${e.message}`)
+      return 1
+    }
+
+    const summaries = []
+    for (const entry of cohortEntries) {
+      if (!entry.isDirectory()) continue
+      const otherSummaryFile = join(localDir, entry.name, 'summary.json')
+      if (!existsSync(otherSummaryFile)) {
+        console.error(`ℹ 略過 ${entry.name}：沒有 summary.json`)
+        continue
+      }
+      let s
+      try {
+        s = JSON.parse(readFileSync(otherSummaryFile, 'utf8'))
+      } catch (e) {
+        console.error(`ℹ 略過壞 summary.json：${otherSummaryFile}（${e.message}）`)
+        continue
+      }
+      // 缺 ticket 欄位時補目錄名，僅供印名單，不寫回檔案（summaries 只在記憶體內給 cohortReport 用）。
+      // 只在 ticket／name 都是 nullish 時才補——已有 ticket:'' 之類的假值不該被目錄名蓋掉。
+      if (s.ticket == null && s.name == null) s.ticket = entry.name
+      summaries.push(s)
+    }
+
+    const report = cohortReport(summaries, caliber)
+
+    if (flags['--json']) {
+      console.log(JSON.stringify(report))
+      return 0
+    }
+
+    if (report.baseline.short) {
+      console.log(`基線未滿 ${report.baseline.tickets.length}/5`)
+      return 0
+    }
+
+    for (const w of report.windows) {
+      if (w.partial) {
+        console.log(`窗 ${w.k} 未滿 ${w.tickets.length}/10（暫不判）`)
+        continue
+      }
+      const verdictStr = w.verdict === 'pass' ? '✅ 過門檻' : (w.verdict === 'provisional' ? '🟡 provisional' : '🔴 未過')
+      const baselineUnknownSuffix = report.baseline.rework.unknown > 0 ? `（${report.baseline.rework.unknown} 張無 run 欄位）` : ''
+      const windowUnknownSuffix = w.rework.unknown > 0 ? `（${w.rework.unknown} 張無 run 欄位）` : ''
+      console.log(
+        `窗 ${w.k}：票 ${w.tickets.join(',')}；中位數 ${w.median}（基線 ${report.baseline.median}，降 ${w.dropPct.toFixed(1)}%）；` +
+        `重工率 ${w.rework.n}/${w.rework.of}${windowUnknownSuffix}（基線 ${report.baseline.rework.n}/${report.baseline.rework.of}${baselineUnknownSuffix}）；` +
+        `判定 ${verdictStr}`
+      )
+      if (w.verdict === 'provisional') {
+        console.log('重工率不可比：缺 run 欄位')
+      }
+    }
+    return 0
+  }
 
   // 讀取 summary.json 並做 harness 判定
   const summaryFile = join(localDir, ticket, 'summary.json')

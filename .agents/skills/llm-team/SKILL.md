@@ -60,8 +60,9 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
   - ② **收貨兩次呼叫**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）＋`node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（accept 由統整者先跑，land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。
   - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。
   - ④ **每票 accept 後量測**：`node .agents/skills/llm-team/usage.mjs --ticket <票> --write`，數字記進專案的 handoff／台帳。`gross`＝牆上視窗上限（含夾票與非票工作）；`exclusive`＝排除被其他票視窗夾走的部分，**仍含非票工作**（release／compact／回答 Fergus 沒有標記），比票時看 exclusive、稽核時看 gross。
-  - ⑤ **量法門檻**：連續 10 張票 apiCalls 中位數比基線降 ≥40% 且重工率不惡化，**只納 `usage.measurable:true` 且同口徑（輪數、真跑次數）**的票。
-  - ⑥ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省。
+  - ⑤ **量法門檻（A 案）**：每專案各自一組，不跨專案混；`accept` 必標 `--caliber docs|tool|feature`（缺標的票不納入）；基線＝該專案該口徑最早 5 張、凍結不滾動；之後不重疊每連續 10 張一窗；判定＝`coordinatorUsageExclusive.apiCalls` 中位數比基線降 ≥40% **且** 重工率（`summary.run ≥ 2` 的比例）不高於基線；每滿一窗跑 `node .agents/skills/llm-team/usage.mjs --cohort <口徑>` 把那一行抄進專案 handoff；缺 `run` 欄位的票只能給 🟡 provisional；**停止條件**：連續兩窗口徑稽核（統整者抽 5 張重標）誤標率 >20% ⇒ 這把尺廢止、回到只記數字不判定。
+  - ⑥ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省；把大票拆成很多小票灌低單票中位數（要看專案總呼叫數有沒有反而漲）；難票錯標／漏標口徑（漏標＝不納，等於把難票藏起來）。
+- config repo 現有 15 張 llm-team 工具票以 `usage.mjs --tag-caliber tool --ticket <票> --grandfathered` 追認為第一份 `tool` 結論；前 8 張無 `run` ⇒ 只能 provisional。
 - `usage.mjs` 只在統整者 harness 是 claude 時量得到，其他 harness 記 `measurable:false`。找 transcript 的順序＝sessionId 直達（lifecycle run-start 的 `sessionId`，來自 Claude Code env `CLAUDE_CODE_SESSION_ID`；agy／codex 統整者沒有 ⇒ 走字面掃描）→ cwd slug → main repo slug → 全部子目錄（跨專案 session 開的票也找得到）；`--projects-dir` 只掃指定目錄。
 
 ## 快照與真源

@@ -1356,7 +1356,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // 1. accept 寫入 disposition 與 q6
     const acceptCode = await ticketMain(
-      ['accept', '--name', 't25', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'agy/opus:Q1=rejected:"範圍縮減裁決"'],
+      ['accept', '--name', 't25', '--caliber', 'tool', '--q6', '已確認 Q1 不影響主流程', '--disposition', 'agy/opus:Q1=rejected:"範圍縮減裁決"'],
       deps
     )
     assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
@@ -2104,7 +2104,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // 2. 測試 accept --disposition opus:overall=rejected:"..." 寫入
     const acceptCode = await ticketMain(
-      ['accept', '--name', 't33', '--q6', '親自坐實', '--disposition', 'agy/opus:overall=rejected:"整體風險已控制"'],
+      ['accept', '--name', 't33', '--caliber', 'tool', '--q6', '親自坐實', '--disposition', 'agy/opus:overall=rejected:"整體風險已控制"'],
       deps
     )
     assert.equal(acceptCode, 0, `accept 應回 0，實際為 ${acceptCode}`)
@@ -6292,6 +6292,75 @@ describe('ticket.mjs 票流程測試', () => {
     for (let i = 0; i < lines2.length; i++) {
       assert.equal(lines2[i].sessionId, null, `第 ${i} 行 (${lines2[i].event}) sessionId 應為 null，實際為 ${lines2[i].sessionId}`)
     }
+  })
+
+  test('(h) accept 沒 --caliber ⇒ 2、stderr 含「--caliber 必填」、summary 沒被寫入 caliber', async () => {
+    const repo = makeRepo()
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-h')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 2,
+      coordinator: 'claude',
+      ticket: 't-h',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['accept', '--name', 't-h', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2)
+    assert.match(errs.join('\n'), /--caliber 必填/)
+    const s = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(s.caliber, undefined)
+  })
+
+  test('(i) accept --caliber feature ⇒ 0、summary.caliber === "feature"、caliberBy === "coordinator"', async () => {
+    const repo = makeRepo()
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-i')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 2,
+      coordinator: 'claude',
+      ticket: 't-i',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const code = await ticketMain(['accept', '--name', 't-i', '--caliber', 'feature', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
+    assert.equal(code, 0)
+    const s = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(s.caliber, 'feature')
+    assert.equal(s.caliberBy, 'coordinator')
+  })
+
+  test('(j) accept --caliber xyz ⇒ 2', async () => {
+    const repo = makeRepo()
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-j')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 2,
+      coordinator: 'claude',
+      ticket: 't-j',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['accept', '--name', 't-j', '--caliber', 'xyz', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(code, 2)
   })
 })
 

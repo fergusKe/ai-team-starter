@@ -26,6 +26,7 @@ import {
   main as cliMain,
   loadOtherWindows,
   attributeRecord,
+  cohortReport,
 } from './usage.mjs'
 
 const TOOL_PATH = fileURLToPath(new URL('./usage.mjs', import.meta.url))
@@ -2119,4 +2120,474 @@ test('並列：B 的 run-start 與 A 相同時刻 ⇒ exclusive null、exclusive
     console.log = origLog
     console.error = origError
   }
+})
+
+// ── 16. cohortReport（1.7 (c)）──────────────────────────────────────────────
+
+const makeCohortSummary = ({ ticket, apiCalls, run, caliber = 'tool', measurable = true, from }) => {
+  const s = {
+    ticket,
+    caliber,
+    usage: { measurable },
+    coordinatorUsageExclusive: { apiCalls },
+    usageWindow: { from },
+  }
+  if (run !== undefined) s.run = run
+  return s
+}
+
+// 事故重現的 15 張時間序 exclusive apiCalls：前 8 張沒有 run，後 7 張 run:1
+const COHORT_15_VALUES = [48, 28, 43, 102, 131, 6, 52, 76, 78, 6, 14, 24, 8, 10, 54]
+const isoAt = (i) => `2026-09-01T00:${String(i).padStart(2, '0')}:00.000Z`
+
+test('cohortReport (a)：真實事故 15 張 fixture（前 8 張無 run、後 7 張 run:1）⇒ 基線中位數 48、單一窗中位數 19、dropPct≈60.4166、provisional，rework.unknown 5/3', () => {
+  const summaries = COHORT_15_VALUES.map((apiCalls, i) => makeCohortSummary({
+    ticket: `t${i + 1}`,
+    apiCalls,
+    run: i < 8 ? undefined : 1,
+    from: isoAt(i),
+  }))
+
+  const report = cohortReport(summaries, 'tool')
+
+  assert.equal(report.baseline.median, 48, `基線中位數應為 48，實際：${report.baseline.median}`)
+  assert.equal(report.windows.length, 1, `應恰好 1 個窗，實際：${report.windows.length}`)
+  assert.equal(report.windows[0].median, 19, `窗中位數應為 19，實際：${report.windows[0].median}`)
+  assert.ok(
+    Math.abs(report.windows[0].dropPct - 60.4166) < 0.5,
+    `dropPct 應約 60.4166（(48-19)/48*100），實際：${report.windows[0].dropPct}`
+  )
+  assert.equal(report.windows[0].verdict, 'provisional', `判定應為 provisional，實際：${report.windows[0].verdict}`)
+  assert.equal(report.windows[0].partial, false, `partial 應為 false，實際：${report.windows[0].partial}`)
+  assert.equal(report.baseline.rework.unknown, 5, `基線 rework.unknown 應為 5（前 5 張全在無 run 的前 8 張內），實際：${report.baseline.rework.unknown}`)
+  assert.equal(report.windows[0].rework.unknown, 3, `窗 rework.unknown 應為 3（第 6-8 張仍在無 run 的前 8 張內），實際：${report.windows[0].rework.unknown}`)
+})
+
+test('cohortReport (b)：15 張全有 run（基線 1 張 run:2、窗 1 張 run:2）且窗中位數降 ≥40% ⇒ pass', () => {
+  const baselineRuns = [2, 1, 1, 1, 1]
+  const windowRuns = [2, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  const summaries = [
+    ...baselineRuns.map((run, i) => makeCohortSummary({ ticket: `b${i + 1}`, apiCalls: 100, run, from: isoAt(i) })),
+    ...windowRuns.map((run, i) => makeCohortSummary({ ticket: `w${i + 1}`, apiCalls: 50, run, from: isoAt(5 + i) })),
+  ]
+
+  const report = cohortReport(summaries, 'tool')
+
+  assert.equal(report.baseline.median, 100, `基線中位數應為 100，實際：${report.baseline.median}`)
+  assert.equal(report.windows[0].median, 50, `窗中位數應為 50，實際：${report.windows[0].median}`)
+  assert.equal(report.windows[0].dropPct, 50, `dropPct 應為 50，實際：${report.windows[0].dropPct}`)
+  assert.equal(report.baseline.rework.unknown, 0, `基線 rework.unknown 應為 0，實際：${report.baseline.rework.unknown}`)
+  assert.equal(report.windows[0].rework.unknown, 0, `窗 rework.unknown 應為 0，實際：${report.windows[0].rework.unknown}`)
+  assert.equal(report.windows[0].verdict, 'pass', `判定應為 pass（重工率 1/10=0.1 ≤ 基線 1/5=0.2），實際：${report.windows[0].verdict}`)
+})
+
+test('cohortReport (c)：降幅 ≥40% 但窗 3 張 run:2、基線 0 張 run:2 ⇒ fail', () => {
+  const baselineRuns = [1, 1, 1, 1, 1]
+  const windowRuns = [2, 2, 2, 1, 1, 1, 1, 1, 1, 1]
+  const summaries = [
+    ...baselineRuns.map((run, i) => makeCohortSummary({ ticket: `b${i + 1}`, apiCalls: 100, run, from: isoAt(i) })),
+    ...windowRuns.map((run, i) => makeCohortSummary({ ticket: `w${i + 1}`, apiCalls: 50, run, from: isoAt(5 + i) })),
+  ]
+
+  const report = cohortReport(summaries, 'tool')
+
+  assert.equal(report.windows[0].dropPct, 50, `dropPct 應為 50（≥40），實際：${report.windows[0].dropPct}`)
+  assert.equal(report.baseline.rework.n, 0, `基線重工張數應為 0，實際：${report.baseline.rework.n}`)
+  assert.equal(report.windows[0].rework.n, 3, `窗重工張數應為 3，實際：${report.windows[0].rework.n}`)
+  assert.equal(report.windows[0].verdict, 'fail', `判定應為 fail（窗重工率 3/10 > 基線 0/5），實際：${report.windows[0].verdict}`)
+})
+
+test('cohortReport (d)：只 12 張合格票 ⇒ windows[0].partial===true、verdict===null、tickets.length===7', () => {
+  const values = [48, 28, 43, 102, 131, 6, 52, 76, 78, 6, 14, 24]
+  const summaries = values.map((apiCalls, i) => makeCohortSummary({
+    ticket: `t${i + 1}`,
+    apiCalls,
+    run: 1,
+    from: isoAt(i),
+  }))
+
+  const report = cohortReport(summaries, 'tool')
+
+  assert.equal(report.windows.length, 1, `應恰好 1 個（未滿）窗，實際：${report.windows.length}`)
+  assert.equal(report.windows[0].partial, true, `windows[0].partial 應為 true，實際：${report.windows[0].partial}`)
+  assert.equal(report.windows[0].verdict, null, `windows[0].verdict 應為 null，實際：${report.windows[0].verdict}`)
+  assert.equal(report.windows[0].tickets.length, 7, `windows[0].tickets.length 應為 7（12-5），實際：${report.windows[0].tickets.length}`)
+})
+
+test('cohortReport (e)：混入 caliber 不同 3 張、measurable:false 2 張、缺 apiCalls 1 張 ⇒ 母體計數＝基線 tickets＋各窗 tickets 總數恰等於合格張數 15', () => {
+  const validSummaries = COHORT_15_VALUES.map((apiCalls, i) => makeCohortSummary({
+    ticket: `v${i + 1}`,
+    apiCalls,
+    run: 1,
+    from: isoAt(i),
+  }))
+  const junkSummaries = [
+    makeCohortSummary({ ticket: 'junk-caliber-1', apiCalls: 10, run: 1, caliber: 'docs', from: isoAt(15) }),
+    makeCohortSummary({ ticket: 'junk-caliber-2', apiCalls: 10, run: 1, caliber: 'feature', from: isoAt(16) }),
+    makeCohortSummary({ ticket: 'junk-caliber-3', apiCalls: 10, run: 1, caliber: 'docs', from: isoAt(17) }),
+    makeCohortSummary({ ticket: 'junk-unmeasurable-1', apiCalls: 10, run: 1, measurable: false, from: isoAt(18) }),
+    makeCohortSummary({ ticket: 'junk-unmeasurable-2', apiCalls: 10, run: 1, measurable: false, from: isoAt(19) }),
+    { ticket: 'junk-no-apicalls', caliber: 'tool', usage: { measurable: true }, coordinatorUsageExclusive: {}, usageWindow: { from: isoAt(20) }, run: 1 },
+  ]
+
+  const report = cohortReport([...validSummaries, ...junkSummaries], 'tool')
+
+  const total = report.baseline.tickets.length + report.windows.reduce((sum, w) => sum + w.tickets.length, 0)
+  assert.equal(total, 15, `母體計數（基線＋各窗 tickets 總數）應恰等於合格張數 15，實際：${total}`)
+  assert.ok(
+    report.baseline.tickets.every((t) => t.startsWith('v')) &&
+    report.windows.every((w) => w.tickets.every((t) => t.startsWith('v'))),
+    `所有納入的票都應是 v 開頭的合格票，實際 baseline：${JSON.stringify(report.baseline.tickets)}，windows：${JSON.stringify(report.windows.map((w) => w.tickets))}`
+  )
+})
+
+test('cohortReport (k)：15 張全有 run（run 全 1），基線 apiCalls 48,28,43,102,131（中位數 48）、窗 10 張全部 40（中位數 40，dropPct≈16.67，未達 40% 門檻）⇒ fail', () => {
+  const baselineValues = [48, 28, 43, 102, 131]
+  const summaries = [
+    ...baselineValues.map((apiCalls, i) => makeCohortSummary({ ticket: `k-b${i + 1}`, apiCalls, run: 1, from: isoAt(i) })),
+    ...Array.from({ length: 10 }, (_, i) => makeCohortSummary({ ticket: `k-w${i + 1}`, apiCalls: 40, run: 1, from: isoAt(5 + i) })),
+  ]
+
+  const report = cohortReport(summaries, 'tool')
+
+  assert.equal(report.baseline.median, 48, `基線中位數應為 48，實際：${report.baseline.median}`)
+  assert.equal(report.windows[0].median, 40, `窗中位數應為 40，實際：${report.windows[0].median}`)
+  assert.ok(
+    Math.abs(report.windows[0].dropPct - 16.6667) < 0.5,
+    `dropPct 應約 16.6667（(48-40)/48*100），實際：${report.windows[0].dropPct}`
+  )
+  assert.equal(report.windows[0].verdict, 'fail', `降幅未達 40% 門檻應判 fail，實際：${report.windows[0].verdict}`)
+})
+
+test('cohortReport (o)：對亂序輸入（(a) 的 15 張 fixture 陣列反轉）⇒ baseline.tickets／windows[0].tickets 仍依 usageWindow.from 升冪排序（拿掉 filtered.sort 就會紅）', () => {
+  const summaries = COHORT_15_VALUES.map((apiCalls, i) => makeCohortSummary({
+    ticket: `t${i + 1}`,
+    apiCalls,
+    run: i < 8 ? undefined : 1,
+    from: isoAt(i),
+  }))
+  const shuffled = [...summaries].reverse()
+
+  const report = cohortReport(shuffled, 'tool')
+
+  const expectedBaseline = ['t1', 't2', 't3', 't4', 't5']
+  const expectedWindow = ['t6', 't7', 't8', 't9', 't10', 't11', 't12', 't13', 't14', 't15']
+  assert.deepEqual(
+    report.baseline.tickets, expectedBaseline,
+    `baseline.tickets 應仍依 usageWindow.from 升冪排序，實際：${JSON.stringify(report.baseline.tickets)}`
+  )
+  assert.deepEqual(
+    report.windows[0].tickets, expectedWindow,
+    `windows[0].tickets 應仍依 usageWindow.from 升冪排序，實際：${JSON.stringify(report.windows[0].tickets)}`
+  )
+  assert.equal(report.baseline.median, 48, `反轉輸入不應改變基線中位數（若排序被拿掉會算到別組），實際：${report.baseline.median}`)
+  assert.equal(report.windows[0].median, 19, `反轉輸入不應改變窗中位數（若排序被拿掉會算到別組），實際：${report.windows[0].median}`)
+})
+
+// ── 17. --tag-caliber（CLI）──────────────────────────────────────────────────
+
+// 同時攔截 stdout／stderr，回傳合併字串；訊息斷言不綁定哪一條 stream。
+async function runCliCapturingBoth(args, opts) {
+  let combined = ''
+  const origLog = console.log
+  const origError = console.error
+  console.log = (...a) => { combined += a.join(' ') + '\n' }
+  console.error = (...a) => { combined += a.join(' ') + '\n' }
+  let exitCode
+  try {
+    exitCode = await cliMain(args, opts)
+  } finally {
+    console.log = origLog
+    console.error = origError
+  }
+  return { exitCode, combined }
+}
+
+test('--tag-caliber：首次標記寫入 caliber/caliberBy/caliberGrandfathered 且保留其他欄位；已標記後再標 ⇒ exit 2 且檔案逐字不變；非法值 ⇒ exit 2；summary.json 不存在 ⇒ exit 1', async () => {
+  const root = tmp()
+  const ticket = 'tag-ticket-x'
+  const localDir = join(root, '.local/llm-team')
+
+  const initialSummary = {
+    schemaVersion: 2,
+    project: 'tag-test-project',
+    ticket,
+    coordinator: 'claude',
+    comparable: false,
+    dispositions: ['keep-intact'],
+  }
+  write(localDir, `${ticket}/summary.json`, JSON.stringify(initialSummary, null, 2) + '\n')
+  const cfgPath = makeFixtureConfig(root)
+  const summaryFile = join(localDir, `${ticket}/summary.json`)
+
+  const first = await runCliCapturingBoth([
+    '--tag-caliber', 'tool',
+    '--ticket', ticket,
+    '--config', cfgPath,
+    '--grandfathered',
+  ], { cwd: root, repoRoot: root })
+
+  assert.equal(first.exitCode, 0, `首次標記應 exit 0，實際：${first.exitCode}`)
+  assert.match(first.combined, /已標 tag-ticket-x caliber=tool/, `stdout＋stderr 應印確認訊息，實際：${first.combined}`)
+
+  const written = JSON.parse(readFileSync(summaryFile, 'utf8'))
+  assert.equal(written.caliber, 'tool', `caliber 應為 tool，實際：${written.caliber}`)
+  assert.equal(written.caliberBy, 'coordinator', `caliberBy 應為 coordinator，實際：${written.caliberBy}`)
+  assert.equal(written.caliberGrandfathered, true, `caliberGrandfathered 應為 true，實際：${written.caliberGrandfathered}`)
+  // 其他欄位保留
+  assert.equal(written.schemaVersion, 2)
+  assert.equal(written.project, 'tag-test-project')
+  assert.equal(written.coordinator, 'claude')
+  assert.deepEqual(written.dispositions, ['keep-intact'])
+
+  const beforeSecond = readFileSync(summaryFile, 'utf8')
+  const second = await runCliCapturingBoth([
+    '--tag-caliber', 'feature',
+    '--ticket', ticket,
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+  assert.equal(second.exitCode, 2, `已標記過的票再標應 exit 2，實際：${second.exitCode}`)
+  assert.match(second.combined, /已標 "tool"，不覆寫/, `stdout＋stderr 應指明舊值 "tool"，實際：${second.combined}`)
+  const afterSecond = readFileSync(summaryFile, 'utf8')
+  assert.equal(afterSecond, beforeSecond, '再跑一次不應改動檔案內容（逐字相同）')
+
+  const third = await runCliCapturingBoth([
+    '--tag-caliber', 'xyz',
+    '--ticket', ticket,
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+  assert.equal(third.exitCode, 2, `非法 caliber 值應 exit 2，實際：${third.exitCode}`)
+  assert.match(third.combined, /只准 docs｜tool｜feature/, `stdout＋stderr 應指明合法值範圍，實際：${third.combined}`)
+
+  const fourth = await runCliCapturingBoth([
+    '--tag-caliber', 'docs',
+    '--ticket', 'no-such-ticket',
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+  assert.equal(fourth.exitCode, 1, `summary.json 不存在應 exit 1，實際：${fourth.exitCode}`)
+  assert.match(fourth.combined, /summary\.json 不存在/, `stdout＋stderr 應指明 summary.json 不存在，實際：${fourth.combined}`)
+})
+
+test('--tag-caliber (l)：空字串值（VALUE_FLAGS 給 --tag-caliber \'\'）⇒ exit 2、訊息含「只准 docs」、summary 檔逐字不變（不准掉進找 transcript 的路徑）', async () => {
+  const root = tmp()
+  const ticket = 'tag-ticket-empty'
+  const localDir = join(root, '.local/llm-team')
+  const initialSummary = {
+    schemaVersion: 2,
+    ticket,
+    coordinator: 'claude',
+    comparable: false,
+  }
+  const summaryFile = join(localDir, `${ticket}/summary.json`)
+  write(localDir, `${ticket}/summary.json`, JSON.stringify(initialSummary, null, 2) + '\n')
+  const cfgPath = makeFixtureConfig(root)
+  const before = readFileSync(summaryFile, 'utf8')
+
+  const result = await runCliCapturingBoth([
+    '--tag-caliber', '',
+    '--ticket', ticket,
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+
+  assert.equal(result.exitCode, 2, `--tag-caliber '' 應 exit 2，實際：${result.exitCode}`)
+  assert.match(result.combined, /只准 docs/, `訊息應含「只准 docs」，實際：${result.combined}`)
+  const after = readFileSync(summaryFile, 'utf8')
+  assert.equal(after, before, 'summary 檔案應逐字不變')
+})
+
+test('--tag-caliber (m)：既有 caliber:null 的 summary 再 --tag-caliber tool ⇒ exit 2、訊息含「不覆寫」、檔案逐字不變（已標＝欄位存在性，不是真假值）', async () => {
+  const root = tmp()
+  const ticket = 'tag-ticket-null-caliber'
+  const localDir = join(root, '.local/llm-team')
+  const initialSummary = {
+    schemaVersion: 2,
+    ticket,
+    coordinator: 'claude',
+    comparable: false,
+    caliber: null,
+  }
+  const summaryFile = join(localDir, `${ticket}/summary.json`)
+  write(localDir, `${ticket}/summary.json`, JSON.stringify(initialSummary, null, 2) + '\n')
+  const cfgPath = makeFixtureConfig(root)
+  const before = readFileSync(summaryFile, 'utf8')
+
+  const result = await runCliCapturingBoth([
+    '--tag-caliber', 'tool',
+    '--ticket', ticket,
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+
+  assert.equal(result.exitCode, 2, `caliber:null 也算已標，應 exit 2，實際：${result.exitCode}`)
+  assert.match(result.combined, /不覆寫/, `訊息應含「不覆寫」，實際：${result.combined}`)
+  const after = readFileSync(summaryFile, 'utf8')
+  assert.equal(after, before, 'summary 檔案應逐字不變')
+})
+
+test('--tag-caliber (q)：--tag-caliber tool --cohort tool --ticket x（兩個模式旗標同時出現）⇒ exit 2 且含「不可同時使用」', async () => {
+  const root = tmp()
+  const cfgPath = makeFixtureConfig(root)
+
+  const result = await runCliCapturingBoth([
+    '--tag-caliber', 'tool',
+    '--cohort', 'tool',
+    '--ticket', 'x',
+    '--config', cfgPath,
+  ], { cwd: root, repoRoot: root })
+
+  assert.equal(result.exitCode, 2, `兩個模式旗標同時出現應 exit 2，實際：${result.exitCode}`)
+  assert.match(result.combined, /不可同時使用/, `訊息應含「不可同時使用」，實際：${result.combined}`)
+})
+
+// ── 18. --cohort（CLI）───────────────────────────────────────────────────────
+
+test('--cohort tool --json：對 tmp localDir（15 個子目錄各一份 summary.json）⇒ exit 0、stdout 解析後 windows[0].median===19；同 localDir --cohort docs（無合格票）⇒ exit 0、stdout 含「基線未滿 0/5」；不需要 --ticket；壞 JSON 的 summary.json 被略過且 stderr 印一行', async () => {
+  const root = tmp()
+  const localDir = join(root, '.local/llm-team')
+
+  COHORT_15_VALUES.forEach((apiCalls, i) => {
+    const ticket = `ct${i + 1}`
+    const summary = makeCohortSummary({
+      ticket,
+      apiCalls,
+      run: i < 8 ? undefined : 1,
+      from: isoAt(i),
+    })
+    write(localDir, `${ticket}/summary.json`, JSON.stringify(summary, null, 2) + '\n')
+  })
+  const cfgPath = makeFixtureConfig(root)
+
+  let stdoutOutput = ''
+  const origLog = console.log
+  console.log = (...args) => { stdoutOutput += args.join(' ') + '\n' }
+  let exitCode
+  try {
+    exitCode = await cliMain([
+      '--cohort', 'tool',
+      '--config', cfgPath,
+      '--json',
+    ], { cwd: root, repoRoot: root })
+  } finally {
+    console.log = origLog
+  }
+
+  assert.equal(exitCode, 0, `--cohort tool --json 應 exit 0，實際：${exitCode}`)
+  const parsed = JSON.parse(stdoutOutput.trim())
+  assert.equal(parsed.windows[0].median, 19, `windows[0].median 應為 19，實際：${parsed.windows[0].median}`)
+
+  let stdoutOutput2 = ''
+  console.log = (...args) => { stdoutOutput2 += args.join(' ') + '\n' }
+  let exitCode2
+  try {
+    exitCode2 = await cliMain([
+      '--cohort', 'docs',
+      '--config', cfgPath,
+    ], { cwd: root, repoRoot: root })
+  } finally {
+    console.log = origLog
+  }
+  assert.equal(exitCode2, 0, `--cohort docs（無合格票）應 exit 0，實際：${exitCode2}`)
+  assert.match(stdoutOutput2, /基線未滿 0\/5/, `stdout 應含「基線未滿 0/5」，實際：${stdoutOutput2}`)
+
+  // 壞 JSON 的 summary.json 略過且 stderr 印一行；同時證明 --cohort 不需要 --ticket（前面兩次呼叫都沒帶 --ticket 也沒觸發缺少必填的 exit 2）
+  write(localDir, 'broken-ticket/summary.json', '{ 這不是合法 JSON')
+  let stderrOutput = ''
+  const origError = console.error
+  console.error = (...args) => { stderrOutput += args.join(' ') + '\n' }
+  let exitCode3
+  try {
+    exitCode3 = await cliMain([
+      '--cohort', 'tool',
+      '--config', cfgPath,
+    ], { cwd: root, repoRoot: root })
+  } finally {
+    console.error = origError
+  }
+  assert.equal(exitCode3, 0, `壞 JSON 存在時 --cohort（無 --ticket）仍應 exit 0，實際：${exitCode3}`)
+  assert.match(stderrOutput, /略過壞 summary\.json/, `stderr 應印略過壞 summary.json 的訊息，實際：${stderrOutput}`)
+})
+
+test('--cohort (n)：localDir 有一個空子目錄（沒有 summary.json）⇒ exit 0、stderr 含「沒有 summary.json」，且該目錄不出現在任何 tickets 名單', async () => {
+  const root = tmp()
+  const localDir = join(root, '.local/llm-team')
+
+  COHORT_15_VALUES.forEach((apiCalls, i) => {
+    const ticket = `nt${i + 1}`
+    const summary = makeCohortSummary({
+      ticket,
+      apiCalls,
+      run: i < 8 ? undefined : 1,
+      from: isoAt(i),
+    })
+    write(localDir, `${ticket}/summary.json`, JSON.stringify(summary, null, 2) + '\n')
+  })
+  // 空子目錄：沒有 summary.json
+  mkdirSync(join(localDir, 'empty-no-summary'), { recursive: true })
+  const cfgPath = makeFixtureConfig(root)
+
+  let stdoutOutput = ''
+  let stderrOutput = ''
+  const origLog = console.log
+  const origError = console.error
+  console.log = (...args) => { stdoutOutput += args.join(' ') + '\n' }
+  console.error = (...args) => { stderrOutput += args.join(' ') + '\n' }
+  let exitCode
+  try {
+    exitCode = await cliMain([
+      '--cohort', 'tool',
+      '--config', cfgPath,
+      '--json',
+    ], { cwd: root, repoRoot: root })
+  } finally {
+    console.log = origLog
+    console.error = origError
+  }
+
+  assert.equal(exitCode, 0, `空子目錄存在時 --cohort tool 應 exit 0，實際：${exitCode}`)
+  assert.match(stderrOutput, /略過 empty-no-summary：沒有 summary\.json/, `stderr 應含「沒有 summary.json」，實際：${stderrOutput}`)
+
+  const parsed = JSON.parse(stdoutOutput.trim())
+  const allTickets = [
+    ...parsed.baseline.tickets,
+    ...parsed.windows.flatMap((w) => w.tickets),
+  ]
+  assert.ok(
+    !allTickets.includes('empty-no-summary'),
+    `empty-no-summary 不應出現在任何 tickets 名單，實際名單：${JSON.stringify(allTickets)}`
+  )
+})
+
+test('--cohort (p)：非 --json 的 --cohort tool 對 15 張 tmp fixture ⇒ stdout 逐字等於預期的窗行＋provisional 附注兩行', async () => {
+  const root = tmp()
+  const localDir = join(root, '.local/llm-team')
+
+  COHORT_15_VALUES.forEach((apiCalls, i) => {
+    const ticket = `ct${i + 1}`
+    const summary = makeCohortSummary({
+      ticket,
+      apiCalls,
+      run: i < 8 ? undefined : 1,
+      from: isoAt(i),
+    })
+    write(localDir, `${ticket}/summary.json`, JSON.stringify(summary, null, 2) + '\n')
+  })
+  const cfgPath = makeFixtureConfig(root)
+
+  let stdoutOutput = ''
+  const origLog = console.log
+  console.log = (...args) => { stdoutOutput += args.join(' ') + '\n' }
+  let exitCode
+  try {
+    exitCode = await cliMain([
+      '--cohort', 'tool',
+      '--config', cfgPath,
+    ], { cwd: root, repoRoot: root })
+  } finally {
+    console.log = origLog
+  }
+
+  assert.equal(exitCode, 0, `--cohort tool（非 --json）應 exit 0，實際：${exitCode}`)
+  const expected =
+    '窗 1：票 ct6,ct7,ct8,ct9,ct10,ct11,ct12,ct13,ct14,ct15；中位數 19（基線 48，降 60.4%）；重工率 0/7（3 張無 run 欄位）（基線 0/0（5 張無 run 欄位））；判定 🟡 provisional\n' +
+    '重工率不可比：缺 run 欄位\n'
+  assert.equal(stdoutOutput, expected, `stdout 應逐字等於預期兩行，實際：${JSON.stringify(stdoutOutput)}`)
 })

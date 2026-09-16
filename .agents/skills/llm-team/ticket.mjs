@@ -1140,11 +1140,16 @@ export async function main(argv, deps = {}) {
   if (sub === 'accept') {
     const a = parseArgs(rest, ['disposition'])
     if (!a.name) {
-      console.error('用法：accept --name <n> --q6 "<receipt>" [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...')
+      console.error('用法：accept --name <n> --caliber <docs|tool|feature> --q6 "<receipt>" [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...')
       return 2
     }
     if (!a.q6 || !String(a.q6).trim()) {
       console.error('🔴 accept：--q6 必填且不可為空')
+      return 2
+    }
+    const validCalibers = ['docs', 'tool', 'feature']
+    if (!a.caliber || !validCalibers.includes(String(a.caliber).trim())) {
+      console.error('🔴 accept：--caliber 必填（docs｜tool｜feature）')
       return 2
     }
 
@@ -1218,6 +1223,8 @@ export async function main(argv, deps = {}) {
       dispMap.set(`${d.member}:${d.q}`, d)
     }
 
+    summary.caliber = String(a.caliber).trim()
+    summary.caliberBy = 'coordinator'
     summary.q6Receipt = String(a.q6).trim()
     summary.dispositions = Array.from(dispMap.values())
     summary.acceptedAt = now
