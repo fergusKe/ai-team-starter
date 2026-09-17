@@ -1500,3 +1500,16 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 3. **`subagentPromptCacheTtl=1h`**：codex／gemini 不走 Claude subagent、Agent 工具用得少，預估省 0 次有意義的 miss。連續一週每票 ≥2 次 Claude subagent 重用且 5 分鐘 TTL 確實造成重複 creation 才重評。
 
 **沒有的**：不含每票的 token 台帳（規則⑦：不開每票要餵的尺）；量測用 `/usage` 與這裡的 `claude -p` 差分法，不新增工具。
+
+## 2026-09-17　複製清單補上「不在版控裡的那一半」；不新增偵測，用 SETUP-GITHUB.md 佔位
+
+**決定**：README〈安裝〉加前置需求（git／Node 24／pnpm 10.27.0／python3／gh 與 admin 權限／git 署名）、`git init -b main`＋建 remote＋首推、「不要帶過去」清單（`.git`、`.local/`、`node_modules/`、`.claude/worktrees/`、本機記憶與設定）與第 4 步 `setup.mjs --check`。`SETUP-GITHUB.md` 加〈8. 不在版控裡的那一半〉：8a 這台機器（每台各做；codex 的 hooks 信任 canary 它量不到）、8b plugin 名單照本專案重判（要開的明確 `true`；安裝與服務登入不跟 repo 走）、8c 登記進真源 `targets.json` 才會被 `export --all` 配送（`--to` 可單次推；落後只有 `setup --check` 在真源可讀的機器上會紅）、8d Actions secrets（模板 CI 不需要任何一個）、8e `.envrc`。`.gitignore` 加 `/.claude/settings.local.json`。`progress.sh` 的「SETUP-GITHUB.md 還在」那條待辦加一句指向第 8 節。
+
+**為什麼**：負責人問「複製模板做新專案，會自動有這些設定嗎」。逐項對過：repo 裡的都會（AGENTS／prompts／閘門／快照／symlink／`llm-team.config.json`／`.claude/settings.json`），但機器端的執行檔、守門 hook、agy 白名單、codex hooks.json 只有 `setup.mjs --check` 對得出來（模板目錄自己現在就有一行 ✗）；plugin 名單是模板的判斷，衍生專案要重判這件事原本只寫在 DECISIONS；`targets.json` 在維護者私人 repo，新專案不登記就不會被配送；README 原本只說「不要複製 .git」，模板目錄實際上還有 `.local/llm-team/` 的測試殘留與 `node_modules/`，整個目錄複製會帶走。codex（gpt-5.6-sol）第一輪擋下 8 條：初稿寫「刪掉那一行＝開」（錯，只是不表態）、「過期無紅燈」（錯，`setup --check` 會比版本）、「不登記永遠停在複製當天」（過度絕對，有 `--to`）、mode 語意寫成會開 PR（錯，只動本機不 push）、漏了 `git init -b main`／remote／gh 登入／git 署名／codex canary／plugin 安裝與授權——全部照它改。第二輪再擋 6 條（首推後「main 就受保護」是錯的、`!==` 是不一致不是落後、hooks 信任每台一次 vs canary 每 session、首次納入用 `plugin install --scope project` 不是 `enable`、`--to` 只寫 working tree）；第三輪無脈絡情境題「猜的」清單空、判可合併。
+
+**拒絕的替代**：
+1. **讓 `progress.sh` 跑 `setup.mjs --check`**：那是每台機器、每種統整者各一組結果，而 `progress.sh --check` 也在 CI 跑，CI 沒有那些執行檔——會永遠紅。機器端的事留給機器端的工具。
+2. **讓 `--sync-check` 查真源有沒有更新**：快照不連外是〈程式真源移到維護者的 config repo〉明文的（CI 不發連外請求）；真源是私人 repo，衍生專案讀不到。`setup --check` 的「真源可讀才比」已是對的邊界。
+3. **把整個第 8 節寫進 AGENTS.md**：8b／8c／8d／8e 是一次性設定，寫進每 session 讀的 AGENTS 就是每 session 多付一段沒人用的字。8a 是每台機器都會重來的事，它的耐久入口 AGENTS.md〈多模型分工的票流程〉本來就有（`setup.mjs --check` 那一行），第 8 節開頭指回去，SETUP 刪掉後不會找不到。
+
+**沒有的**：不加任何新腳本、新旗標；「SETUP-GITHUB.md 還在」仍是唯一訊號。

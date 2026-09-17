@@ -1106,7 +1106,8 @@ def setup_todo():
         todo.append((
             "SETUP-GITHUB.md 還在",
             "建 repo 的人做一次（ruleset、code owner），**設完就可以刪掉這個檔案**。"
-            "它還在就代表這一步可能還沒做 —— 沒做的話 GitHub 那道門是開的。"))
+            "它還在就代表這一步可能還沒做 —— 沒做的話 GitHub 那道門是開的。"
+            "它的〈8. 不在版控裡的那一半〉（這台機器的 setup.mjs --check、plugin 名單重判、真源 targets.json）本腳本看不到，也靠這個檔案佔位。"))
     return todo
 
 

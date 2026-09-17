@@ -54,21 +54,43 @@ approve 的簽章永遠是真的。`AGENTS.md` 的注意力預算那一節是為
 
 ## 安裝
 
+**前置**：git、Node 24、pnpm 10.27.0（`package.json` 的 `packageManager`，`corepack enable` 就對版）、
+python3（`progress.sh` 等腳本用）、`gh`（已 `gh auth login`，對新 repo 要有 admin 權限——`SETUP-GITHUB.md` 的 API 呼叫需要）。
+先確認 `git config user.name` / `user.email` 是你要署名的身份 —— 這套流程把說明寫在 commit 裡，署錯很難改。
+
 ```bash
-# 1. 複製本目錄內容到你的專案（不要複製 .git），然後 git init
+# 1. 只複製「版控裡的檔案」到你的專案
+#    （在模板目錄跑 `git ls-files` 就是那份清單；用 git clone 再刪 .git 也行）
+#    不要帶過去：.git、.local/（票流程的產物與台帳）、node_modules/、.claude/worktrees/
+#    .claude/skills/llm-team 是指向 ../../.agents/skills/llm-team 的 symlink，複製後 ls -l 確認它還是
+#    本機的東西不會跟來、也不要搬：Claude Code 的專案記憶、~/.claude 的設定、各 CLI 的登入狀態。repo 裡的文件才是新專案的真相。
+git init -b main                     # 整套流程認的是 main 與 origin/main；預設 master 會讓閘門與 progress.sh 都對不上
+gh repo create <owner>/<repo> --private --source=. --remote=origin   # 或自己建 repo、git remote add origin
+git add -A && git commit -m "init from ai-team-starter" && git push -u origin main
+#    這時 main 還沒受保護 —— 做完 SETUP-GITHUB.md 的 ruleset 與「故意失敗的 PR」實測之後，才是只能走 PR
 
 # 2. 裝相依（openspec 已經在 package.json 裡釘死 1.11.0）
 pnpm install --frozen-lockfile
 
 # 3. 問它「我還缺什麼」
 bash .github/scripts/progress.sh
+
+# 4. 這台機器那一半（不在 repo 裡，每台機器各做一次）
+node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 你會用到的統整者各跑一次；能產片段的項目會印片段，要手動合併
 ```
 
 **第三步是重點：不用記，腳本自己會說。** 剛複製的模板跑它會印出一份
 還沒設定的清單，每一條都寫了**這是什麼、怎麼做、不做會怎樣**；
 做完一件就少一條，全部做完清單自己消失。
 
-多模型分工：先 `node .agents/skills/llm-team/setup.mjs --check --coordinator <claude|agy|codex>`（三種統整者各一組名單，住 `llm-team.config.json` `profiles`），流程見 `prompts/07-ticket.md`。
+**第四步是 `progress.sh` 看不到的那一半。** 複製過來的是 repo 裡的檔案；
+`claude`／`agy`／`codex` 有沒有裝、守門 hook、agy 的指令白名單、codex 的 `hooks.json`——
+這些是**這台機器**的狀態，換一台就要重做，只有 `setup.mjs --check` 對得出來（它不驗各 CLI 的登入與額度）。
+還有幾件事機器對不出來、寫在 `SETUP-GITHUB.md`〈8. 不在版控裡的那一半〉：
+`.claude/settings.json` 的 plugin 名單要照**這個專案**重判（模板關的 10 個是模板的判斷，不是你的；plugin 的安裝與服務登入也不會跟著 repo 來），
+以及新專案要登記進真源的 `targets.json`，`export.mjs --all` 才會配送 `llm-team` 快照的更新。
+
+多模型分工：三種統整者各一組名單，住 `llm-team.config.json` `profiles`；票流程見 `prompts/07-ticket.md`。
 
 日常操作一律 `pnpm exec openspec ...`，**不需要設定任何環境變數**。
 
@@ -248,7 +270,7 @@ bash .github/scripts/progress.sh
 | 寫 `docs/WBS.md` | 沒有它就沒有「還有哪些沒做」的視角，`--check` 也沒有東西可以驗 |
 | 在 WBS 裡建一張〈阻塞類型〉表 | 阻塞欄的類型詞彙是**從那張表讀的**，腳本裡沒有寫死任何一個詞（`待銜接`、`待裁決`⋯⋯宣告你自己的）。沒有它的話阻塞欄只能放 ID |
 | 設好 `package.json` 那四個 script | 它們是刻意會失敗的佔位，不動的話 CI 的 `quality` 一直是紅的 |
-| 做完 `SETUP-GITHUB.md` 就把它刪掉 | 那個檔案還在，就代表 GitHub 那道門可能還沒關 |
+| 做完 `SETUP-GITHUB.md` 就把它刪掉 | 那個檔案還在，就代表 GitHub 那道門可能還沒關——**也**代表〈8. 不在版控裡的那一半〉可能還沒做：這台機器的 `setup.mjs --check`、`.claude/settings.json` 的 plugin 名單重判、新專案加進真源 `targets.json` |
 
 **這份清單寫在腳本裡，不是寫在這裡。** 這份 README 你複製之後就會換掉，
 而腳本會留著 —— 資訊要放在不會被丟掉的那一邊。
