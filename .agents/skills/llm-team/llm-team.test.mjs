@@ -58,6 +58,8 @@ import {
   startsWithAllowedHead,
   preflightBriefCommands,
   writeTreeOf,
+  USAGE_MODES,
+  MEASUREMENT_SCHEMA_VERSION,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
 import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
@@ -362,6 +364,47 @@ describe('loadConfig：載入專案 config.json（fail-closed）', () => {
     const cfg = loadConfig(okDir)
     assert.equal(cfg.schemaVersion, 2)
     assert.equal(cfg.maxRounds, 3)
+  })
+
+  describe('1.8.0 ①：usage.mode（量測與 Q6 閘門解耦）', () => {
+    test('缺 usage 欄位 ⇒ loadConfig 補 { mode: "off" }（真源與 export 出去的預設都是 off）', () => {
+      const d = tmpdir('usage-default-')
+      fs.writeFileSync(path.join(d, 'llm-team.config.json'), JSON.stringify(v2Config()))
+      const cfg = loadConfig(d)
+      assert.deepEqual(cfg.usage, { mode: 'off' })
+    })
+
+    test('usage.mode 為 record／cohort ⇒ 過；未知值 ⇒ throw 指名 usage.mode', () => {
+      for (const mode of ['off', 'record', 'cohort']) {
+        assert.deepEqual(USAGE_MODES.includes(mode), true, `USAGE_MODES 應含 ${mode}`)
+        const d = tmpdir(`usage-${mode}-`)
+        fs.writeFileSync(path.join(d, 'llm-team.config.json'), JSON.stringify(v2Config({ usage: { mode } })))
+        const cfg = loadConfig(d)
+        assert.equal(cfg.usage.mode, mode)
+      }
+      const bad = tmpdir('usage-bad-')
+      fs.writeFileSync(path.join(bad, 'llm-team.config.json'), JSON.stringify(v2Config({ usage: { mode: 'always' } })))
+      assert.throws(() => loadConfig(bad), /usage\.mode 不支援/)
+    })
+
+    test('usage 不是物件（字串／陣列）⇒ throw 指名 usage', () => {
+      const d1 = tmpdir('usage-string-')
+      fs.writeFileSync(path.join(d1, 'llm-team.config.json'), JSON.stringify(v2Config({ usage: 'off' })))
+      assert.throws(() => loadConfig(d1), /config usage 不合法/)
+      const d2 = tmpdir('usage-array-')
+      fs.writeFileSync(path.join(d2, 'llm-team.config.json'), JSON.stringify(v2Config({ usage: ['off'] })))
+      assert.throws(() => loadConfig(d2), /config usage 不合法/)
+    })
+
+    test('真源模板 config.json 的 usage.mode 為 off（預設 off，不強制每票餵口徑）', () => {
+      const cfg = loadConfig(null, fileURLToPath(new URL('./config.json', import.meta.url)))
+      assert.equal(cfg.usage.mode, 'off')
+    })
+
+    test('MEASUREMENT_SCHEMA_VERSION 是正整數（accept 一律蓋這個版本；cohort 只收版本相符的票）', () => {
+      assert.equal(Number.isInteger(MEASUREMENT_SCHEMA_VERSION), true)
+      assert.ok(MEASUREMENT_SCHEMA_VERSION >= 1)
+    })
   })
 
   test('真源模板 config.json 走 loadConfig 不 throw；三個 profile 都解得出名單', () => {

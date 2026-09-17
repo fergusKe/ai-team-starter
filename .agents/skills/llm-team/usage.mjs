@@ -22,10 +22,15 @@
  * exit：0 ＝ 成功（或不可量 harness）；1 ＝ 找不到目標（lifecycle / transcript / summary 檔不存在）；2 ＝ 參數錯誤（未知旗標、缺少必填值）。
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, createReadStream, statSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, createReadStream, statSync } from 'node:fs'
+import { join, resolve, dirname } from 'node:path'
 import { homedir } from 'node:os'
-import { isDirectRun, loadConfig, git } from './lib.mjs'
+import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { isDirectRun, loadConfig, git, MEASUREMENT_SCHEMA_VERSION } from './lib.mjs'
+
+/** ③ cohort 自證 JSON 的輸出格式版本（與 lib.mjs 的 MEASUREMENT_SCHEMA_VERSION 是兩個不同的版本欄——一個是量測方法、一個是這份 JSON 的形狀）。 */
+export const COHORT_JSON_SCHEMA_VERSION = 1
 
 // ── 工具與常數 ──────────────────────────────────────────────────────────────
 
@@ -114,7 +119,7 @@ export function findMainRepo(cwd = process.cwd(), config = {}) {
  *   - to 預設為 landed 的 at（windowEnd='landed'）；若無 landed 則最後一筆 accepted 的 at（windowEnd='accepted'）；若無 accepted 則最後一筆的 at（windowEnd='last-event'）
  *   - 若外部提供 from 或 to，則覆寫且標示 windowEnd='override'
  */
-export function parseLifecycleWindow(entries, { from, to } = {}) {
+export function parseLifecycleWindow(entries, { from, to, noLastEventFallback = false } = {}) {
   const list = Array.isArray(entries) ? entries : []
   const runStart = list.find((e) => e?.event === 'run-start')
   const accepted = list.findLast((e) => e?.event === 'accepted')
@@ -131,6 +136,11 @@ export function parseLifecycleWindow(entries, { from, to } = {}) {
   } else if (accepted) {
     defaultTo = accepted.at
     defaultWindowEnd = 'accepted'
+  } else if (noLastEventFallback) {
+    // 🔴 1.8.0 ②：cohort 的 live 量測視窗終點固定——有 landed 用 landed，否則 accepted，不用 last-event；
+    //   兩者都沒有 ⇒ 視窗缺時間，回傳 to:null 讓呼叫端判定 measurable:false（不得補猜、不得計入 pass）。
+    defaultTo = null
+    defaultWindowEnd = 'incomplete'
   } else {
     defaultTo = last?.at ?? null
     defaultWindowEnd = 'last-event'
@@ -221,8 +231,17 @@ function inWindow(ts, from, to) {
  * 載入指定 localDir 底下除了本票之外，其他票的 lifecycle 視窗資訊。
  * 每個票回傳 { ticket, from, to, runStartAt }。
  * 排除本票、排除沒有 lifecycle.ndjson 的目錄；缺 from 或 to 的票跳過；壞 JSON 行容錯跳過。
+ *
+ * 🔴 事故（sol block 複審第 2 輪 Q5，2026-09-17）：cohort 的 live 量測（measureTicketLive）呼叫這支函式時，
+ *   一直沿用單票 `--ticket` 流程的預設視窗規則（landed／accepted／last-event 都收），把「一般量測的實作細節」
+ *   誤當成「cohort 的固定視窗契約」；結果是只有 run-start（沒有 accepted／landed）的其他票會被 last-event
+ *   補出一個視窗，可能誤把本票的 apiCalls 排他歸屬算錯（污染或漏算）。
+ *   改法：`noLastEventFallback: true` 時，其他票的視窗規則跟 cohort 對「本票」的規則一致——有 landed 用
+ *   landed，否則 accepted，都沒有 ⇒ 視為沒有視窗（跳過，不補、不讓它參與排他歸屬）；單票 `--ticket` 流程
+ *   （呼叫時不帶這個參數）維持 1.7.4 原行為不變。
+ *   陽性對照：usage.test.mjs「1.8.0 ③ (Q5-b) 兩張時間重疊的票，其中一張只有 run-start」。
  */
-export function loadOtherWindows(localDir, ticket) {
+export function loadOtherWindows(localDir, ticket, { noLastEventFallback = false } = {}) {
   if (!localDir || !existsSync(localDir)) {
     return []
   }
@@ -261,7 +280,7 @@ export function loadOtherWindows(localDir, ticket) {
       }
     }
 
-    const win = parseLifecycleWindow(lifecycleEntries)
+    const win = parseLifecycleWindow(lifecycleEntries, { noLastEventFallback })
     if (!win.from || !win.to) {
       continue
     }
@@ -938,6 +957,332 @@ export function cohortReport(summaries, caliber) {
   return { caliber, baseline, windows }
 }
 
+// ── ③ cohort 自證 JSON：canonical hash 與單票 live 量測 ─────────────────────
+
+/** 遞迴排序 object key 後的穩定 JSON 字串化（陣列保持原順序，只排物件 key）；同一組資料永遠得到同一個字串。 */
+export function canonicalStringify(value) {
+  const sortValue = (v) => {
+    if (Array.isArray(v)) return v.map(sortValue)
+    if (v && typeof v === 'object') {
+      // 🔴 事故（sol block 複審第 9 輪 Q2，2026-09-17）：用一般物件字面量 `{}` 重建時，JSON 自己合法帶的
+      //   `__proto__` key 會被當成原型 setter 吞掉，不會成為重建物件上的自有 key——record 裡 `__proto__`
+      //   欄位的值真的變了，重建後的物件卻看不出差異，canonicalStringify／recordsHash／inputHash 全部
+      //   漏報。改用 `Object.create(null)` 重建（沒有原型，`__proto__` 只是一個普通 key）。
+      const out = Object.create(null)
+      for (const k of Object.keys(v).sort()) out[k] = sortValue(v[k])
+      return out
+    }
+    return v
+  }
+  return JSON.stringify(sortValue(value))
+}
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(input).digest('hex')
+}
+
+/** 某票 lifecycle.ndjson 的原始位元組雜湊；不存在回 null。 */
+export function lifecycleHashOf(localDir, ticket) {
+  const f = join(localDir, ticket, 'lifecycle.ndjson')
+  if (!existsSync(f)) return null
+  return sha256Hex(readFileSync(f))
+}
+
+/**
+ * 🔴 1.8.0 ②：cohort 專用的單票 live 量測——不依賴任何預先存在的 --write 產物，
+ *   每次都從 lifecycle.ndjson 找視窗（landed／accepted，不用 last-event）、找 transcript、
+ *   只累加「歸本票排他」的 assistant usage 記錄；同時收集這些記錄做 canonical 雜湊
+ *   （③ 要的是「實際採計的 transcript records」的雜湊，不是整份會持續追加的 transcript 檔）。
+ *
+ * 回傳 { measurable:true, apiCalls, usageWindow, recordsHash, recordCount, transcript }
+ *   或 { measurable:false, reason, usageWindow }（usageWindow 視進度可能為 null）。
+ */
+export async function measureTicketLive(ticket, localDir, config, repoRoot, deps = {}) {
+  const lifecycleFile = join(localDir, ticket, 'lifecycle.ndjson')
+  if (!existsSync(lifecycleFile)) {
+    return { measurable: false, reason: 'no-lifecycle', usageWindow: null }
+  }
+  let entries = []
+  try {
+    entries = readFileSync(lifecycleFile, 'utf8')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+  } catch {
+    return { measurable: false, reason: 'lifecycle-parse-error', usageWindow: null }
+  }
+
+  const window = parseLifecycleWindow(entries, { noLastEventFallback: true })
+  if (!window.from || !window.to) {
+    return { measurable: false, reason: '視窗缺時間', usageWindow: null }
+  }
+
+  const summaryFile = join(localDir, ticket, 'summary.json')
+  let summary = {}
+  try {
+    summary = JSON.parse(readFileSync(summaryFile, 'utf8'))
+  } catch {
+    // 缺檔／壞檔交呼叫端處理母體資格；這裡只管量測，量不到就 measurable:false
+  }
+
+  const coordinator = typeof summary.coordinator === 'string' && summary.coordinator ? summary.coordinator : null
+  const profile = coordinator ? config.profiles?.[coordinator] : null
+  const harness = profile?.coordinator?.harness
+  if (!coordinator || !profile) {
+    return { measurable: false, reason: 'coordinator-profile-unknown', usageWindow: { from: window.from, to: window.to } }
+  }
+  if (harness !== 'claude') {
+    return { measurable: false, reason: `no-transcript-for-harness:${harness}`, usageWindow: { from: window.from, to: window.to } }
+  }
+
+  const runStartEntry = entries.find((e) => e && e.event === 'run-start')
+  const sessionId = runStartEntry?.sessionId || null
+  const projectsRoot = deps.projectsRoot || process.env.LLM_TEAM_PROJECTS_ROOT || join(homedir(), '.claude/projects')
+
+  let transcriptPath = null
+  if (sessionId) {
+    const hit = findTranscriptBySession(projectsRoot, sessionId)
+    if (hit) transcriptPath = hit.file
+  }
+  if (!transcriptPath) {
+    const defaultProjectsDir = join(projectsRoot, slugOf(repoRoot))
+    const preferred = [defaultProjectsDir]
+    const mainRepo = findMainRepo(repoRoot, config)
+    if (mainRepo) preferred.push(join(projectsRoot, slugOf(mainRepo)))
+    const found = await findTranscriptAcross(projectsRoot, ticket, window.from, { preferred })
+    if (found) transcriptPath = found.file
+  }
+  if (!transcriptPath) {
+    return { measurable: false, reason: 'transcript-not-found', usageWindow: { from: window.from, to: window.to } }
+  }
+
+  const others = loadOtherWindows(localDir, ticket, { noLastEventFallback: true })
+  const self = { ticket, from: window.from, to: window.to, runStartAt: runStartEntry?.at ?? window.from }
+
+  // 🔴 事故（sol block 複審第 4 輪 Q3，2026-09-17）：舊版 recordsHash 只雜湊「從 record 投影出來的 usage
+  //   欄位」（timestamp＋四個 token 數），改動被採計 record 的非 usage 欄位（例如 message.content）不會讓
+  //   recordsHash 變，等於自證 JSON 沒有真的證明「這就是那筆 record」。改法：雜湊來源改成每一筆被採計
+  //   record 的完整內容，依 timestamp 排序（同時間戳用原始檔案順序當 tie-breaker，Array.prototype.sort
+  //   穩定排序天然滿足）後串接。
+  // 🔴 事故（sol block 複審第 8 輪 Q5，2026-09-17）：上面那版把「完整內容」實作成整行原始 JSON 文字
+  //   （trimmedLine，不重新序列化）——這把「寫入者當初序列化時的 key 順序」也當成了契約的一部分：同一筆
+  //   record 的欄位值完全沒變，只要寫入者換一種 key 順序重寫（例如巢狀 usage 物件的四個欄位順序不同），
+  //   recordsHash／inputHash 就會被誤判成「輸入變了」，假紅。改法：改用檔內既有的 canonicalStringify（遞迴
+  //   排序 object key、陣列保持原順序）序列化每一筆已解析的 record 物件再串接雜湊——key 順序不再算數，但
+  //   仍是雜湊「完整 record」（第 4 輪 Q3 的要求不變：改動非 usage 欄位一樣要讓 hash 變，canonical 化不是
+  //   只挑幾個欄位投影）。record 在上面的採計迴圈裡已經 JSON.parse 過一次，這裡直接沿用解析出的物件
+  //   （counted[].record），不重複 parse；canonicalStringify 對正常 JSON 值理論上不會丟例外，但仍包一層
+  //   try/catch fail-closed——真的失敗就回 measurable:false 具名原因，不要吞掉讓 recordsHash 悄悄漏算。
+  //   陽性對照：usage.test.mjs「1.8.0 ③ (Q3-e) 改一筆已採計 record 的非 usage 欄位 ⇒ recordsHash／inputHash
+  //   都變」「改一筆視窗外（未採計）record ⇒ 不變」「(Q8-b) 同一批 record 換 key 順序 ⇒ 兩次雜湊相同」
+  //   「(Q8-c) key 順序不變、值真的變 ⇒ hash 仍會變」。
+  let apiCalls = 0
+  const counted = [] // { timestamp, line, record }：line 是原始 JSON 行文字（僅供除錯參考，不再用來雜湊）；
+                      // record 是同一行已經 JSON.parse 過的物件，canonical 雜湊直接沿用它。
+  let sawTie = false
+  let sawMissing = false
+  try {
+    let lineNo = 0
+    for await (const rawLine of readLines(transcriptPath)) {
+      lineNo++
+      const trimmedLine = rawLine.trim()
+      if (!trimmedLine) continue
+      let record
+      try {
+        record = JSON.parse(trimmedLine)
+      } catch (e) {
+        throw new Error(`transcript 毀損行：${transcriptPath}:${lineNo}（${e.message}）`)
+      }
+      if (!record || !record.timestamp) continue
+      if (!inWindow(record.timestamp, window.from, window.to)) continue
+      if (record.type !== 'assistant' || !record.message?.usage) continue
+      const attr = attributeRecord(record.timestamp, self, others)
+      if (attr === null) {
+        if (!self.from || !self.to || !self.runStartAt) sawMissing = true
+        else sawTie = true
+        continue
+      }
+      if (attr !== true) continue
+      apiCalls++
+      counted.push({ timestamp: record.timestamp, line: trimmedLine, record })
+    }
+  } catch (e) {
+    return { measurable: false, reason: `transcript-corrupt:${e.message}`, usageWindow: { from: window.from, to: window.to } }
+  }
+
+  if (sawMissing || sawTie) {
+    return {
+      measurable: false,
+      reason: sawMissing ? '視窗缺時間' : 'run-start 並列',
+      usageWindow: { from: window.from, to: window.to },
+    }
+  }
+
+  counted.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0))
+  const canonicalLines = []
+  for (const c of counted) {
+    let canon
+    try {
+      canon = canonicalStringify(c.record)
+    } catch (e) {
+      return { measurable: false, reason: `record-canonicalize-failed:${e.message}`, usageWindow: { from: window.from, to: window.to } }
+    }
+    canonicalLines.push(canon)
+  }
+  const recordsHash = sha256Hex(canonicalLines.join('\n'))
+
+  return {
+    measurable: true,
+    apiCalls,
+    usageWindow: { from: window.from, to: window.to },
+    recordsHash,
+    recordCount: counted.length,
+    transcript: transcriptPath,
+  }
+}
+
+/**
+ * 讀 usage.mjs 自身所在目錄的 SOURCE.json（快照）或 VERSION＋git rev-parse HEAD（真源），供 ③ JSON 的
+ * toolVersion／sourceCommit／sourceKind（"snapshot" | "source-repo"）。
+ *
+ * 🔴 事故（sol block 複審第 4 輪 Q2，2026-09-17）：舊版對 SOURCE.json 缺失或解析失敗一律往下走、
+ *   改拿 target repo 自己的 `git rev-parse HEAD` 冒充 source commit——在快照環境（`.agents/skills/llm-team/`
+ *   底下本來就該有 SOURCE.json 的那種）這樣做會把「target repo 的 commit」誤標成「llm-team 工具的來源
+ *   commit」，產生帶錯誤來源、卻仍可能 pass 的自證 JSON。
+ *   改法：用 MANIFEST.sha256 是否存在判斷「這裡是不是快照環境」（只有 export.mjs 匯出時才會同時寫
+ *   SOURCE.json 與 MANIFEST.sha256）；快照環境裡 SOURCE.json 缺失或解析失敗 ⇒ 回傳 `{ error }`，呼叫端
+ *   fail-closed（--cohort exit 非 0，具名說缺／壞）；沒有 MANIFEST.sha256（真源環境，本來就不該有
+ *   SOURCE.json）才落回自身 VERSION＋git HEAD，並標 `sourceKind: "source-repo"`；讀到合法 SOURCE.json
+ *   則標 `sourceKind: "snapshot"`。
+ *   陽性對照：usage.test.mjs「1.8.0 ③ (Q2) 快照環境刪 SOURCE.json／壞 JSON ⇒ --cohort exit 非 0」
+ *            「1.8.0 ③ (Q2) 真源環境（無 MANIFEST.sha256）⇒ 正常，sourceKind=source-repo」。
+ *
+ * 🔴 事故（sol block 複審第 5 輪 Q2，2026-09-17）：第 4 輪只擋「SOURCE.json 缺失／解析失敗」與「快照
+ *   缺 SOURCE.json」，但欄位本身缺、型別錯、格式錯（例如 `{}`、`sourceCommit: "abc"`）仍會 parse 成功、
+ *   一路帶著 `null`／不合法值產出自證 JSON；真源分支的 `git rev-parse HEAD` 失敗也被 `catch` 吞成
+ *   `null` 照樣放行。null／格式不對的 provenance 一樣是 fail-open——下游看不出「這是驗過的值」還是
+ *   「工具舉手說不知道」。改法：`version` 一律驗非空字串（trim 後長度 >0）、`sourceCommit` 一律驗
+ *   `/^[0-9a-f]{40}$/`（40 碼 hex），任一分支任一欄位不合 ⇒ 具名回 `{ error }`（說哪個欄位、哪個來源、
+ *   實際拿到什麼，值截到 40 字），真源 git 失敗改回具名 error 不再 catch 吞掉。
+ */
+const SOURCE_COMMIT_HEX40_RE = /^[0-9a-f]{40}$/
+
+function truncateForVersionError(v) {
+  const s = typeof v === 'string' ? v : JSON.stringify(v)
+  return s === undefined ? 'undefined' : s.length > 40 ? `${s.slice(0, 40)}…` : s
+}
+
+function readToolVersionInfo(llmTeamDir, repoRoot, gitFn) {
+  const sourceJsonPath = join(llmTeamDir, 'SOURCE.json')
+  const manifestPath = join(llmTeamDir, 'MANIFEST.sha256')
+  const looksLikeSnapshot = existsSync(manifestPath)
+
+  if (existsSync(sourceJsonPath)) {
+    let raw
+    try {
+      raw = readFileSync(sourceJsonPath, 'utf8')
+    } catch (e) {
+      return { error: `SOURCE.json 讀取失敗（${sourceJsonPath}）：${e.message}` }
+    }
+    let s
+    try {
+      s = JSON.parse(raw)
+    } catch (e) {
+      return { error: `SOURCE.json 解析失敗（${sourceJsonPath}）：${e.message}` }
+    }
+    const version = s?.version
+    if (typeof version !== 'string' || version.trim().length === 0) {
+      return { error: `SOURCE.json（快照，${sourceJsonPath}）的 version 欄位必須是非空字串，實際拿到 ${truncateForVersionError(version)}` }
+    }
+    const sourceCommit = s?.sourceCommit
+    if (typeof sourceCommit !== 'string' || !SOURCE_COMMIT_HEX40_RE.test(sourceCommit)) {
+      return { error: `SOURCE.json（快照，${sourceJsonPath}）的 sourceCommit 欄位必須是 40 碼 hex，實際拿到 ${truncateForVersionError(sourceCommit)}` }
+    }
+    return { version, sourceCommit, sourceKind: 'snapshot' }
+  }
+
+  if (looksLikeSnapshot) {
+    return { error: `快照環境缺 SOURCE.json（${sourceJsonPath} 不存在，但 ${manifestPath} 存在）` }
+  }
+
+  // 真源環境：沒有 SOURCE.json 是正常狀態，用自身 VERSION＋git HEAD。
+  const versionPath = join(llmTeamDir, 'VERSION')
+  if (!existsSync(versionPath)) {
+    return { error: `真源環境（${llmTeamDir}）缺 VERSION 檔（${versionPath}）` }
+  }
+  let version
+  try {
+    version = readFileSync(versionPath, 'utf8').trim()
+  } catch (e) {
+    return { error: `VERSION 檔讀取失敗（${versionPath}）：${e.message}` }
+  }
+  if (version.length === 0) {
+    return { error: `VERSION 檔（${versionPath}）內容為空字串` }
+  }
+  let sourceCommit
+  try {
+    sourceCommit = gitFn(repoRoot, ['rev-parse', 'HEAD'])
+  } catch (e) {
+    return { error: `真源環境 git rev-parse HEAD 失敗（${repoRoot}）：${e.message}` }
+  }
+  if (typeof sourceCommit !== 'string' || !SOURCE_COMMIT_HEX40_RE.test(sourceCommit)) {
+    return { error: `真源環境（${repoRoot}）git rev-parse HEAD 回傳值不是 40 碼 hex，實際拿到 ${truncateForVersionError(sourceCommit)}` }
+  }
+  return { version, sourceCommit, sourceKind: 'source-repo' }
+}
+
+/**
+ * ③ 組出 cohort 的自證 JSON payload（不含 inputHash）；呼叫端算完 inputHash 再塞進去。
+ * ticketDetails：每票 { ticket, caliber, apiCalls, run, usageWindow, lifecycleHash, recordsHash }。
+ */
+export function buildCohortPayload({ caliber, report, ticketDetails, toolVersion, sourceCommit, sourceKind, generatedAt }) {
+  const lastNonPartial = [...report.windows].reverse().find((w) => !w.partial)
+  const verdict = lastNonPartial ? lastNonPartial.verdict : null
+  return {
+    schemaVersion: COHORT_JSON_SCHEMA_VERSION,
+    toolVersion: toolVersion ?? null,
+    sourceCommit: sourceCommit ?? null,
+    sourceKind: sourceKind ?? null,
+    generatedAt,
+    caliber,
+    threshold: {
+      dropPctMin: 40,
+      reworkRule: '窗重工率（run>=2 張數/有 run 欄位張數）不高於基線重工率',
+      baselineSize: 5,
+      windowSize: 10,
+    },
+    baseline: {
+      tickets: report.baseline.tickets,
+      median: report.baseline.median,
+      rework: report.baseline.rework,
+      short: Boolean(report.baseline.short),
+    },
+    windows: report.windows.map((w) => ({
+      k: w.k,
+      tickets: w.tickets,
+      median: w.median,
+      dropPct: w.dropPct,
+      rework: w.rework,
+      verdict: w.verdict,
+      partial: w.partial,
+      ...(w.demotedReason ? { demotedReason: w.demotedReason } : {}),
+    })),
+    verdict,
+    tickets: ticketDetails,
+  }
+}
+
+/** 寫 cohort JSON 到 <localDir>/_cohort/<caliber>-<sanitizedTimestamp>.json；回傳寫入路徑。 */
+export function writeCohortJson(localDir, caliber, payload) {
+  const dir = join(localDir, '_cohort')
+  mkdirSync(dir, { recursive: true })
+  const safeTs = String(payload.generatedAt).replace(/[:.]/g, '-')
+  const filePath = join(dir, `${caliber}-${safeTs}.json`)
+  writeFileSync(filePath, JSON.stringify(payload, null, 2) + '\n')
+  return filePath
+}
+
 // ── CLI 主流程 ─────────────────────────────────────────────────────────────
 
 export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
@@ -1069,6 +1414,16 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
       return 2
     }
 
+    // 🔴 事故（統整者 Q6 親驗 155c941，2026-09-17）：--cohort 路徑的 measureTicketLive 只看
+    //   deps.projectsRoot／LLM_TEAM_PROJECTS_ROOT／~/.claude/projects，沒接到 CLI 的 `--projects-dir`；
+    //   帶著這個旗標跑 --cohort 時全部 transcript-not-found（要改用 env 才對，違反旗標存在的意義）。
+    //   改法：跟單票 --ticket 流程一致（見下方 `flags['--projects-dir']` 分支），--projects-dir 給了就
+    //   resolve(cwd, flag) 蓋過 deps.projectsRoot／env／預設；沒給就照舊吃 deps/env/預設。
+    //   陽性對照：usage.test.mjs「1.8.0 ③ (Q6) 只給 --projects-dir（不設 env）跑 --cohort」。
+    const cohortDeps = flags['--projects-dir']
+      ? { ...deps, projectsRoot: resolve(cwd, flags['--projects-dir']) }
+      : deps
+
     let cohortEntries = []
     try {
       cohortEntries = existsSync(localDir) ? readdirSync(localDir, { withFileTypes: true }) : []
@@ -1077,28 +1432,166 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
       return 1
     }
 
+    // 🔴 事故（sol block 複審第 1 輪 Q2，2026-09-17）：舊版對「已有 usage.measurable 欄位」的票整個跳過 live 量測、
+    //   直接信任 summary 裡的舊欄位——過期的 `usage.mjs --write` 產物（甚至手改）可以在不碰 transcript、不驗
+    //   measurementSchemaVersion 的情況下假 pass；同一個判斷還讓 schemaVersion 檢查只在「沒有舊 usage」時才跑，
+    //   有舊 usage 的過期票反而繞過版本檢查。
+    //   改法：cohort 一律重掃 lifecycle＋transcript，不管 summary 裡有沒有舊 usage 欄位；measurementSchemaVersion
+    //   檢查對「同口徑的每一票」都套用，不再看有沒有舊 usage。舊欄位只留下來印一行「與 live 值矛盾」的對照訊息，
+    //   不參與 verdict／JSON 的任何計算——量測值只能來自這次現場算出的 live 結果。
+    //   陽性對照：usage.test.mjs「1.8.0 ②③ (b) 舊 usage 與 transcript 矛盾」「(c) 版本不符但有舊 usage 仍被排除」。
+    //   停止條件：--write 這條手動診斷路徑被拔除、cohort 改成唯一權威量測入口時，這段對照訊息可以拆。
+    const liveMeasured = new Map() // ticket ⇒ live 量測結果（③ JSON 要用）
     const summaries = []
     for (const entry of cohortEntries) {
       if (!entry.isDirectory()) continue
-      const otherSummaryFile = join(localDir, entry.name, 'summary.json')
+      const ticketName = entry.name
+      if (ticketName === '_cohort') continue // ③ 自己的輸出目錄，不是票
+      const otherSummaryFile = join(localDir, ticketName, 'summary.json')
       if (!existsSync(otherSummaryFile)) {
-        console.error(`ℹ 略過 ${entry.name}：沒有 summary.json`)
+        console.error(`ℹ 略過 ${ticketName}：沒有 summary.json`)
         continue
       }
       let s
       try {
         s = JSON.parse(readFileSync(otherSummaryFile, 'utf8'))
       } catch (e) {
-        console.error(`ℹ 略過壞 summary.json：${otherSummaryFile}（${e.message}）`)
-        continue
+        // 🔴 事故（sol block 複審第 8 輪 Q2，2026-09-17）：舊版把「壞 summary.json（parse 失敗）」跟「沒有
+        //   summary.json（進行中的票，本來就不該有）」用同一種「略過」處理——壞檔靜默消失會讓同口徑的一票
+        //   直接從母體裡不見，剩下的票照樣算出 baseline／窗、照樣 exit 0、照樣產自證 JSON，等於用一份
+        //   「少算一票」的假 pass 蓋過「有票壞了要人看」的事實。改法：同第 7 輪 Q2 的做法，在 cohort 邊界
+        //   fail-closed——壞檔直接擋下整個 --cohort，不產出任何自證 JSON；「沒有 summary.json」那條分支不動
+        //   （進行中的票本來就沒有，不是壞檔，繼續略過）。
+        //   陽性對照：usage.test.mjs「1.8.0 ③ (Q8-a) 某票 summary.json 寫成非法 JSON ⇒ --cohort exit≠0」。
+        console.error(`🔴 --cohort：${otherSummaryFile} 的 summary.json 解析失敗（${e.message}）——fail-closed，不產自證 JSON`)
+        return 1
       }
       // 缺 ticket 欄位時補目錄名，僅供印名單，不寫回檔案（summaries 只在記憶體內給 cohortReport 用）。
       // 只在 ticket／name 都是 nullish 時才補——已有 ticket:'' 之類的假值不該被目錄名蓋掉。
       if (s.ticket == null && s.name == null) s.ticket = entry.name
+
+      // 🔴 事故（sol block 複審第 7 輪 Q2，2026-09-17）：下游（liveMeasured.get／lifecycleHashOf）一律用
+      //   summary.json 裡的 `s.ticket ?? s.name` 當 key 去查，但寫入 liveMeasured 與掃 lifecycle 檔用的卻是
+      //   readdirSync 出來的**目錄名**（entry.name）。兩者只要不一致（summary.ticket 打錯、目錄手動改名、
+      //   複製別票的 summary.json 沒改欄位……）就會靜默錯綁：live 量到但用錯 key 存，之後用 summary 欄位查
+      //   查不到 ⇒ recordsHash 悄悄變 null；lifecycleHash 甚至讀到別的目錄的 lifecycle，自證 JSON 帶著
+      //   看似正常、實則錯綁的資料，exit 仍是 0。改法：在 cohort 邊界擋下——ticket/name 必須是非空字串且
+      //   逐字等於目錄名，否則直接 fail-closed，不產出任何自證 JSON。
+      //   陽性對照：usage.test.mjs「1.8.0 ③ (Q7-a) summary.ticket 與目錄名不一致」「(Q7-b) ticket:''」。
+      const resolvedName = s.ticket ?? s.name
+      if (typeof resolvedName !== 'string' || resolvedName.trim().length === 0 || resolvedName !== ticketName) {
+        console.error(
+          `🔴 --cohort：${ticketName} 的 summary.json ticket/name=${JSON.stringify(resolvedName)} 與目錄名不一致（fail-closed，不產自證 JSON）`
+        )
+        return 1
+      }
+
+      if (s.caliber === caliber) {
+        // 🔴 事故（sol block 複審第 2 輪 Q2，2026-09-17）：舊版用 hasOwnProperty 當閘——完全缺
+        //   measurementSchemaVersion 欄位的舊票（連這個欄位都沒有，比「版本不符」更早期）會因為 hasOwnProperty
+        //   為 false 而跳過整個檢查，預設放行混進 cohort。改法：只接受「欄位存在且恰好等於現版」的票；
+        //   缺欄／版本不同一律排除，stderr 分開記錄是哪一種（缺欄 vs 版本 X≠Y），不含糊成同一句。
+        //   陽性對照：usage.test.mjs「1.8.0 ②③ (Q3-b)」（版本不同）「(Q3-d)」（缺欄，且若誤採計會改變基線中位數）。
+        if (s.measurementSchemaVersion !== MEASUREMENT_SCHEMA_VERSION) {
+          const hasField = Object.prototype.hasOwnProperty.call(s, 'measurementSchemaVersion')
+          const reason = hasField
+            ? `版本 ${JSON.stringify(s.measurementSchemaVersion)}≠${MEASUREMENT_SCHEMA_VERSION}`
+            : '缺欄'
+          console.error(`ℹ 略過 ${ticketName}：measurementSchemaVersion 不符（${reason}），不進同一個 cohort`)
+          continue
+        }
+        // 舊 usage 欄位（若有）先記下來，只當對照印出，不參與量測。
+        const staleApiCalls =
+          s.usage && typeof s.usage === 'object' && 'measurable' in s.usage
+            ? s.coordinatorUsageExclusive?.apiCalls ?? null
+            : undefined
+
+        const live = await measureTicketLive(ticketName, localDir, config, repoRoot, cohortDeps)
+        liveMeasured.set(ticketName, live)
+        if (live.measurable) {
+          if (typeof staleApiCalls === 'number' && staleApiCalls !== live.apiCalls) {
+            console.error(
+              `ℹ ${ticketName}：舊 usage 產物 apiCalls=${staleApiCalls} 與 live 量測 apiCalls=${live.apiCalls} 不符（僅供對照），採計 live 值`
+            )
+          }
+          s.usage = { measurable: true }
+          s.coordinatorUsageExclusive = { apiCalls: live.apiCalls }
+          s.usageWindow = { from: live.usageWindow.from, to: live.usageWindow.to }
+        } else {
+          console.error(`ℹ ${ticketName}：live 量測不可得（${live.reason}）⇒ measurable:false`)
+          s.usage = { measurable: false, reason: live.reason }
+          s.coordinatorUsageExclusive = null
+          s.usageWindow = live.usageWindow
+        }
+      }
       summaries.push(s)
     }
 
+    // 🔴 事故（sol block 複審第 1 輪 Q5，2026-09-17）：readdirSync 回傳的檔案系統列舉順序不是任何作業系統都保證
+    // 的穩定契約；直接把這個順序餵進 cohortReport／JSON payload，會讓「同一組票」在不同機器／檔案系統上排出不
+    // 同的 tie-break 順序，inputHash 因此不穩定。
+    // 改法：進 cohortReport 前先按票名（固定鍵）排序；cohortReport 內部對 usageWindow.from 相同的票再用
+    // Array.prototype.sort 的穩定排序特性，以這裡先排好的票名順序當 tie-breaker。
+    // 陽性對照：usage.test.mjs「1.8.0 ③ (Q5) 同一組票以相反順序餵入 ⇒ inputHash 相同」。
+    // 停止條件：cohortReport 本身改成明確要求呼叫端傳已排序陣列並在簽章上標註時，這段排序可以搬過去、拆掉這裡的重複排序。
+    summaries.sort((a, b) => {
+      const an = String(a.ticket ?? a.name ?? '')
+      const bn = String(b.ticket ?? b.name ?? '')
+      return an < bn ? -1 : an > bn ? 1 : 0
+    })
+
     const report = cohortReport(summaries, caliber)
+
+    // 🔴 缺 transcript（或其他 live 量測失敗）⇒ 該票 measurable:false，cohort 不得 pass：
+    //   只要這個口徑存在任一量不到的票，就把所有原本 'pass' 的窗降成 'provisional'（不做逐窗精準歸屬，
+    //   寧可保守降級也不讓漏測的票被靜默排除後仍宣稱 pass）。
+    const hasUnmeasurable = summaries.some((s) => s.caliber === caliber && s.usage && s.usage.measurable === false)
+    if (hasUnmeasurable) {
+      for (const w of report.windows) {
+        if (w.verdict === 'pass') {
+          w.verdict = 'provisional'
+          w.demotedReason = 'unmeasurable-ticket-present'
+        }
+      }
+    }
+
+    // ③ 自證 JSON：不論 --json 與否都輸出一份，路徑＋inputHash 印到 stderr（機器讀的 report 仍照舊只印到 stdout）。
+    const nowFn = deps.now || (() => new Date())
+    const generatedAt = nowFn().toISOString()
+    const llmTeamDir = deps.llmTeamDir || dirname(fileURLToPath(import.meta.url))
+    const versionInfo = readToolVersionInfo(llmTeamDir, repoRoot, gitFn)
+    if (versionInfo.error) {
+      console.error(`🔴 --cohort：${versionInfo.error}（fail-closed，不產出自證 JSON）`)
+      return 1
+    }
+
+    const eligibleTickets = summaries.filter((s) => s.caliber === caliber)
+    const ticketDetails = eligibleTickets.map((s) => {
+      const name = s.ticket ?? s.name
+      const live = liveMeasured.get(name)
+      return {
+        ticket: name,
+        caliber: s.caliber,
+        apiCalls: s.coordinatorUsageExclusive?.apiCalls ?? null,
+        run: s.run ?? null,
+        usageWindow: s.usageWindow ?? null,
+        lifecycleHash: lifecycleHashOf(localDir, name),
+        recordsHash: live?.recordsHash ?? null,
+      }
+    })
+
+    const payload = buildCohortPayload({
+      caliber,
+      report,
+      ticketDetails,
+      toolVersion: versionInfo.version,
+      sourceCommit: versionInfo.sourceCommit,
+      sourceKind: versionInfo.sourceKind,
+      generatedAt,
+    })
+    payload.inputHash = sha256Hex(canonicalStringify({ ...payload, generatedAt: null }))
+    const cohortJsonPath = writeCohortJson(localDir, caliber, payload)
+    console.error(`已輸出 cohort JSON：${cohortJsonPath}（inputHash=${payload.inputHash}）`)
 
     if (flags['--json']) {
       console.log(JSON.stringify(report))
@@ -1125,6 +1618,9 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
       )
       if (w.verdict === 'provisional') {
         console.log('重工率不可比：缺 run 欄位')
+      }
+      if (w.demotedReason === 'unmeasurable-ticket-present') {
+        console.log('判定降級：存在無法量測（缺 transcript 等）的票，不得 pass')
       }
     }
     return 0

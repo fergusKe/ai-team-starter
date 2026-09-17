@@ -38,6 +38,7 @@ import {
   rosterLabel,
   preflightBriefCommands,
   writeTreeOf,
+  MEASUREMENT_SCHEMA_VERSION,
 } from './lib.mjs'
 import { main as writeMain } from './write.mjs'
 import { main as councilMain, parseVerdicts } from './council.mjs'
@@ -978,12 +979,34 @@ export async function main(argv, deps = {}) {
     }
 
     // ⑤ git add -- <changed 逐檔>，任一失敗 ⇒ 4
+    // 🔴 事故：2026-09-17 WAS review-only 多輪票（寫手已 commit）＋整個目錄被刪（`scripts/__tests__/` 連同
+    //    `spec-lint-corpus.test.mjs` 一起消失）：對「已經 commit 在分支上、工作樹與索引都沒有這個檔」的路徑
+    //    無條件呼叫 `git add -- f` 會回 `fatal: pathspec … did not match any files`，land 永遠卡在 exit 4，
+    //    走不到 ⑥「分支已領先 main，視為已 commit 過」。
+    //    改法：add 失敗時才問 `git status --porcelain --ignored -- f`（不對每檔都先問一次，保持原本「有變更
+    //    就 add」的快樂路徑不變、也不用改動任何既有測試的 fake git）——加 `--ignored` 是為了不誤放真正被
+    //    gitignore 擋下的既存檔（那種失敗要照樣冒出來，不能被本檢查靜默吃掉）；空 ⇒ 這個檔在工作樹與索引都
+    //    沒有東西要處理（含已 commit 的刪除／搬移），原本的 add 失敗只是「pathspec 不存在」，不是真失敗，跳過；
+    //    非空 ⇒ add 是真的失敗，仍回 4，不准用 `--ignore-errors` 或 `2>/dev/null` 蓋過去。
+    //    陽性對照：ticket.test.mjs「(a) 分支上已 commit 刪除一檔且該檔在 summary.changed ⇒ land 走到 ff 成功」
+    //             「(b) 工作樹有未 commit 修改的檔 ⇒ 仍被 add 進 commit」「(c) add 真失敗 ⇒ 仍 exit 4」
+    //    停止條件：`git add` 本身把「pathspec 不存在」與「其他失敗」分成不同 exit code 時，改回直接判 exit code。
     for (const f of summaryChanged) {
       try {
         gitFn(worktree, ['add', '--', f])
       } catch (e) {
-        console.error(`🔴 git add 失敗（${f}）：${e.message}`)
-        return 4
+        let statusOut
+        try {
+          statusOut = gitFn(worktree, ['status', '--porcelain', '--ignored', '--', f])
+        } catch {
+          console.error(`🔴 git add 失敗（${f}）：${e.message}`)
+          return 4
+        }
+        if (statusOut.trim()) {
+          console.error(`🔴 git add 失敗（${f}）：${e.message}`)
+          return 4
+        }
+        // 空 ⇒ 這個檔對工作樹／索引無事可做（含已 commit 的刪除／搬移）；add 失敗只是「pathspec 不存在」，跳過。
       }
     }
 
@@ -1140,16 +1163,27 @@ export async function main(argv, deps = {}) {
   if (sub === 'accept') {
     const a = parseArgs(rest, ['disposition'])
     if (!a.name) {
-      console.error('用法：accept --name <n> --caliber <docs|tool|feature> --q6 "<receipt>" [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...')
+      console.error('用法：accept --name <n> --q6 "<receipt>" [--caliber <docs|tool|feature>]（usage.mode≠off 時必填）[--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...')
       return 2
     }
     if (!a.q6 || !String(a.q6).trim()) {
       console.error('🔴 accept：--q6 必填且不可為空')
       return 2
     }
+    // 🔴 1.8.0：量測與 Q6 閘門解耦——usage.mode 預設 off，--caliber 只在 mode≠off 時必填；
+    //   off 時給了也接受（寫進 summary）但不強制。陽性對照 ticket.test.mjs「(h) mode=off 缺 caliber ⇒ 0」「(h2) mode=cohort 缺 caliber ⇒ 2」。
     const validCalibers = ['docs', 'tool', 'feature']
-    if (!a.caliber || !validCalibers.includes(String(a.caliber).trim())) {
-      console.error('🔴 accept：--caliber 必填（docs｜tool｜feature）')
+    const usageMode = (config.usage && config.usage.mode) || 'off'
+    let caliberValue = null
+    if (a.caliber !== undefined) {
+      caliberValue = String(a.caliber).trim()
+      if (!validCalibers.includes(caliberValue)) {
+        console.error('🔴 accept：--caliber 只准 docs｜tool｜feature')
+        return 2
+      }
+    }
+    if (usageMode !== 'off' && !caliberValue) {
+      console.error(`🔴 accept：usage.mode=${usageMode} 時 --caliber 必填（docs｜tool｜feature）`)
       return 2
     }
 
@@ -1223,8 +1257,13 @@ export async function main(argv, deps = {}) {
       dispMap.set(`${d.member}:${d.q}`, d)
     }
 
-    summary.caliber = String(a.caliber).trim()
-    summary.caliberBy = 'coordinator'
+    if (caliberValue) {
+      summary.caliber = caliberValue
+      summary.caliberBy = 'coordinator'
+    }
+    // 🔴 1.8.0 ②：measurementSchemaVersion 蓋當下量測方法版本（與 --caliber 是否必填無關）；
+    //   cohort 只收版本相符的票，避免視窗規則改版後新舊算法混在同一批統計裡。
+    summary.measurementSchemaVersion = MEASUREMENT_SCHEMA_VERSION
     summary.q6Receipt = String(a.q6).trim()
     summary.dispositions = Array.from(dispMap.values())
     summary.acceptedAt = now

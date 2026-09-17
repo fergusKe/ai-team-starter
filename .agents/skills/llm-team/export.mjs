@@ -11,6 +11,20 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { CLEAN_GIT_ENV, parseArgs, isDirectRun } from './lib.mjs'
 
+/**
+ * 剝除 `//` 行註解與 `/* ... *\/` 區塊註解，供防回歸 literal check 用（例如「export.mjs 不得含
+ * tools/m4-ship.sh 字面」）——事故出處註解可以提到單一專案的舊指令當史料，不該被這類 gate 誤判成
+ * 「還在用」；但同一個字面出現在 console.log/console.error/throw 等實際會執行的字串裡，仍要照樣抓到。
+ * 🔴 不是完整的 JS 剖析器：只依「整行以 // 開頭（前面只有空白）」與「/* ... *\/ 跨行區塊」剝除；
+ *   字串常值裡剛好含 `//` 或 `/*` 的極端情況不處理——這支工具目前的原始碼沒有這種字面。
+ *   陽性對照：export.test.mjs「Q5：stripJsComments」。
+ */
+export function stripJsComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+}
+
 export const EXPORT_FILES = [
   'lib.mjs',
   'write.mjs',
@@ -535,15 +549,17 @@ export function exportAll(sourceDir, targets, { force = false, deps = {}, git, s
       return 3
     }
 
-    // (f) 印一行結果：✅ <name> <mode> <branch> <sha>；branch 模式再印 → 接著跑 tools/m4-ship.sh（M4 完整 guards）再 ff。main 模式不 push（印「本機 main 已 commit，push 由統整者決定」）
+    // (f) 印一行結果：✅ <name> <mode> <branch> <sha>；後續步驟一律讀 target.nextSteps（target 自己的操作事實，
+    //    不准在這裡硬寫死任何專案名／指令），沒有就印通則。main 模式維持既有通則文字（多數 main target 不需要 nextSteps）。
     const rSha = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: root, env: CLEAN_GIT_ENV, encoding: 'utf8' })
     const sha = (rSha.stdout || '').trim()
     const branch = mode === 'branch' ? branchName : 'main'
     console.log(`✅ ${name} ${mode} ${branch} ${sha}`)
+    const nextSteps = typeof target.nextSteps === 'string' && target.nextSteps.trim() ? target.nextSteps.trim() : null
     if (mode === 'branch') {
-      console.log('→ 接著跑 tools/m4-ship.sh（M4 完整 guards）再 ff')
+      console.log(nextSteps ? `→ ${nextSteps}` : '→ 本機分支已 commit，依專案自己的守門流程驗證後再 ff（見 targets.json 的 nextSteps／postExport）')
     } else {
-      console.log('本機 main 已 commit，push 由統整者決定')
+      console.log(nextSteps || '本機 main 已 commit，push 由統整者決定')
     }
     completed.push({ name, mode, branch, sha })
   }

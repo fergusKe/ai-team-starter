@@ -62,6 +62,18 @@ export const MEMBER_EFFORTS = ['high', 'medium']
  */
 export const WRITER_HARNESSES = ['agy']
 
+// ─────────────────── 1.8.0：量測與 Q6 閘門解耦（usage.mode） ───────────────────
+// 🔴 2026-09-17 codex gpt-5.6-sol 兩輪審查共識（ai-team-starter docs/DECISIONS.md）：`accept --caliber` 之前無條件必填，
+//   跟 SKILL.md 規則⑤「缺標的票不納入」、規則⑦「停損期不開每票要餵的台帳」打架。改法：usage.mode 預設 off，
+//   --caliber 只在 mode≠off 時必填；publish／land 永遠不依賴任何 usage 產物。
+export const USAGE_MODES = ['off', 'record', 'cohort']
+/**
+ * 量測方法版本：cohort 的 live 量測（lifecycle＋transcript）改版時遞增。
+ * accept 時把當下版本蓋在 summary.measurementSchemaVersion；cohort 只收版本相符的票，
+ * 避免新舊算法（例如視窗終點規則改變）混進同一批統計。
+ */
+export const MEASUREMENT_SCHEMA_VERSION = 1
+
 /** 成員物件基本形狀檢查；`where` 用來指名 profile 與欄位。 */
 function validateMember(m, where, targetFile) {
   if (!m || typeof m !== 'object' || Array.isArray(m)) {
@@ -206,6 +218,18 @@ export function loadConfig(repoRoot, configFile = null) {
     throw new Error(`config branchPrefixes 不支援（${targetFile}）：預期全為字串的陣列，得到包含非字串型別 [${invalidTypes.join(', ')}]`)
   } else if (config.branchPrefixes.some((p) => p.trim() === '')) {
     throw new Error(`config branchPrefixes 不支援（${targetFile}）：空前綴等於不檢查，要停用請用 []`)
+  }
+  if (config.usage === undefined) {
+    config.usage = { mode: 'off' }
+  } else {
+    if (!config.usage || typeof config.usage !== 'object' || Array.isArray(config.usage)) {
+      throw new Error(`config usage 不合法（${targetFile}）：必須是物件 {mode}`)
+    }
+    const mode = config.usage.mode === undefined ? 'off' : config.usage.mode
+    if (!USAGE_MODES.includes(mode)) {
+      throw new Error(`config usage.mode 不支援（${targetFile}）：只准 ${USAGE_MODES.join('|')}，得到 ${JSON.stringify(config.usage.mode)}`)
+    }
+    config.usage.mode = mode
   }
   return config
 }

@@ -57,12 +57,10 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 - **為什麼**：統整者每次工具呼叫＝一次帶完整 context 的 API 呼叫（實測 100–170k token／次）；省的是**次數**，不是每次的字。
 - **規則**：
   - ① **不輪詢**：長任務背景跑、用通知或 until-loop 一次等完。
-  - ② **收貨兩次呼叫**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）＋`node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（accept 由統整者先跑，land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。
+  - ② **收貨固定步驟**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）→ `node .agents/skills/llm-team/ticket.mjs accept --name <票> --caliber <口徑> --q6 "<收據>"` → `node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。**accept 不需要跑 usage.mjs**（見下方「量測（usage.mode）」）。
   - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。
-  - ④ **每票 accept 後量測**：`node .agents/skills/llm-team/usage.mjs --ticket <票> --write`，數字記進專案的 handoff／台帳。`gross`＝牆上視窗上限（含夾票與非票工作）；`exclusive`＝排除被其他票視窗夾走的部分，**仍含非票工作**（release／compact／回答 Fergus 沒有標記），比票時看 exclusive、稽核時看 gross。
-  - ⑤ **量法門檻（A 案）**：每專案各自一組，不跨專案混；`accept` 必標 `--caliber docs|tool|feature`（缺標的票不納入）；基線＝該專案該口徑最早 5 張、凍結不滾動；之後不重疊每連續 10 張一窗；判定＝`coordinatorUsageExclusive.apiCalls` 中位數比基線降 ≥40% **且** 重工率（`summary.run ≥ 2` 的比例）不高於基線；每滿一窗跑 `node .agents/skills/llm-team/usage.mjs --cohort <口徑>` 把那一行抄進專案 handoff；缺 `run` 欄位的票只能給 🟡 provisional；**停止條件**：連續兩窗口徑稽核（統整者抽 5 張重標）誤標率 >20% ⇒ 這把尺廢止、回到只記數字不判定。
-  - ⑥ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省；把大票拆成很多小票灌低單票中位數（要看專案總呼叫數有沒有反而漲）；難票錯標／漏標口徑（漏標＝不納，等於把難票藏起來）。
-  - ⑦ **修尺停損（尺預算；2026-09-16 WAS 實證後三專案共用）**：「尺」＝量 repo 自己一不一致的守門／台帳／登記表（產物 vs 台帳、env 有沒有登記、產生區塊有沒有重產、文件引用有沒有指到）。實證：WAS 一個 session 37 次 merge 點 ship 紅 8 次，**8 次全是尺的自我維護、0 次產品缺陷**；每把尺都要一本台帳、每張功能票都要餵一次，尺壞了再造一把尺是補不完的洞。規則（各專案在自己的 DISPATCH／AGENTS 寫到期日與覆寫）：
+  - ④ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省；把大票拆成很多小票灌低單票中位數（要看專案總呼叫數有沒有反而漲）；難票錯標／漏標口徑（漏標＝不納，等於把難票藏起來）。
+  - ⑤ **修尺停損（尺預算；2026-09-16 WAS 實證後三專案共用）**：「尺」＝量 repo 自己一不一致的守門／台帳／登記表（產物 vs 台帳、env 有沒有登記、產生區塊有沒有重產、文件引用有沒有指到）。實證：WAS 一個 session 37 次 merge 點 ship 紅 8 次，**8 次全是尺的自我維護、0 次產品缺陷**；每把尺都要一本台帳、每張功能票都要餵一次，尺壞了再造一把尺是補不完的洞。規則（各專案在自己的 DISPATCH／AGENTS 寫到期日與覆寫）：
     - **S1 尺凍結**：停損期內不開任何「新尺／新守門／新台帳／新規則／記憶整理」票；尺壞了**不修**，在 handoff 記一行（哪把尺、怎麼壞、用什麼直接量法代替），用直接量法（跑真的、開瀏覽器、唯讀查 production）把手上的功能票做完。
     - **S2 唯一例外**：壞尺會讓手上功能票的**核心接受條件假綠**才票內修；≤30 分鐘、不新增測試檔、不新增台帳或通用規則；超時改用最接近實物且安全的直接證據，production 只准唯讀；無法安全直接驗證就標「未驗證」交人裁決，不得宣稱通過。
     - **S3 ship 紅燈**：只要求 regen／台帳同步／登記表更新的紅，只做最小修正、不強化那把尺；同一斷言連續 5 次 ship 內 ≥2 次純自我維護紅且都沒指出產品行為／部署安全／權限隔離／資料完整性缺陷 ⇒ 降成警告並記 handoff，到期由人決定恢復／保留／刪。
@@ -70,7 +68,18 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
     - **S5 到期回報**：同一把尺（commit 路徑占比分別列、不相加；ship 總數與紅燈成分；完成的縱切數），不為回報新增工具。
     - **哪些尺留**：能在**事故前**擋部署可行性、租戶／權限隔離、資料完整性、重試冪等的產品契約尺留著；狀態盤點、台帳同步、文件一致性、一次性驗收類不再新增。
     - 票選擇：停損期內只開「改變使用者畫面、或 production 一個數字」的票；治理類只列不開，要人點頭。複審：只有五類（平台強制原語／金流／租戶隔離・認證・密鑰／Schema-DDL／改守門本身）走 block，其餘單簽一輪、不開 council。
-- config repo 現有 15 張 llm-team 工具票以 `usage.mjs --tag-caliber tool --ticket <票> --grandfathered` 追認為第一份 `tool` 結論；前 8 張無 `run` ⇒ 只能 provisional。
+
+## 量測（usage.mode）
+
+🔴 **1.8.0：量測與 Q6 閘門解耦**——之前 `accept --caliber` 無條件必填，跟規則⑤「缺標的票不納入」、規則⑤修尺停損「停損期不開每票要餵的台帳」互相打架。改法：
+
+- config schema 新增 `usage.mode: "off" | "record" | "cohort"`，**預設 `off`**（真源 `config.json` 與 export 出去的預設都是 off）。`--q6` 永遠必填；`--caliber` 只在 `mode ≠ off` 時必填，`off` 時給了也接受（寫進 summary）但不強制。`publish`／`land` 永不依賴任何 usage 產物（缺 caliber／usage 不會擋 publish／land）。
+- **不再要求每票量測**：拿掉「accept 後跑 `usage.mjs --ticket <票> --write`」這個流程步驟。`--write` 保留，但只當手動補登／診斷用；`--cohort <口徑>` 執行時才從各票 `lifecycle.ndjson` 的視窗現場掃 transcript，不依賴任何預先存在的每票 usage 寫入。
+  - 視窗終點固定：有 `landed` 用 `landed`，否則 `accepted`（不用 last-event）；缺 transcript 或視窗缺時間 ⇒ 該票 `measurable:false`，不得補猜、不得計入 pass（只要口徑內存在任一量不到的票，原本會 pass 的窗一律降為 provisional）。
+  - `accept` 一律在 summary 蓋 `measurementSchemaVersion`（與 `--caliber` 是否必填無關）；`--cohort` 只收版本相符的票，版本不符的票完全不進同一個 cohort（不算母體、不佔基線名額）。
+- **cohort 輸出自證 JSON**：`--cohort` 每次都會產一份 JSON（路徑與 inputHash 印到 stderr，預設放 `.local/llm-team/_cohort/<口徑>-<時間>.json`），含 `schemaVersion`、llm-team `toolVersion`＋`sourceCommit`、`generatedAt`、口徑、門檻、`verdict`、基線／窗邊界、每票 `{ticket, caliber, apiCalls, run, usageWindow}`、每票 lifecycle 檔雜湊、實際採計的 transcript records 的 canonical 雜湊、整體 `inputHash`（同一組固定輸入跑兩次 `inputHash` 與 `verdict` 相同）。工具不強制 commit（`_cohort/` 通常在 gitignore 的 `.local/` 底下）；**handoff 宣稱 pass 時要附這份 JSON 的路徑＋inputHash**，檔案已不在的只能標 `local-only`。
+- **量法門檻（A 案，`usage.mode: cohort` 時適用）**：每專案各自一組，不跨專案混；基線＝該專案該口徑最早 5 張、凍結不滾動；之後不重疊每連續 10 張一窗；判定＝`apiCalls` 中位數比基線降 ≥40% **且** 重工率（`summary.run ≥ 2` 的比例）不高於基線；缺 `run` 欄位的票只能給 🟡 provisional；**停止條件**：連續兩窗口徑稽核（統整者抽 5 張重標）誤標率 >20% ⇒ 這把尺廢止、回到只記數字不判定。
+- `gross`＝牆上視窗上限（含夾票與非票工作）；`exclusive`＝排除被其他票視窗夾走的部分，**仍含非票工作**（release／compact／回答 Fergus 沒有標記），比票時看 exclusive、稽核時看 gross。
 - `usage.mjs` 只在統整者 harness 是 claude 時量得到，其他 harness 記 `measurable:false`。找 transcript 的順序＝sessionId 直達（lifecycle run-start 的 `sessionId`，來自 Claude Code env `CLAUDE_CODE_SESSION_ID`；agy／codex 統整者沒有 ⇒ 走字面掃描）→ cwd slug → main repo slug → 全部子目錄（跨專案 session 開的票也找得到）；`--projects-dir` 只掃指定目錄。
 
 ## 快照與真源
@@ -83,12 +92,9 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 ```bash
 node home/skills/llm-team/export.mjs --all
 ```
-- `targets.json` 是 M1 環境事實（不進快照），定義了同步的目標 repo 與模式（`branch` 或 `main`）。
+- 🔴 **共用快照不放單一專案的操作事實**：target 清單、target 各自的同步模式、`postExport` 入口、匯出後的後續步驟，一律只住 `targets.json` 的 target metadata（`root`／`mode`／`postExport`／`nextSteps`），本檔只留通則；`targets.json` 不可手改成別的形狀，怎麼驗看下面。
+- `targets.json` 是 M1 環境事實（不進快照），定義了同步的目標 repo、模式（`branch` 或 `main`）、`postExport`（target 自己維護的守門入口，在快照 `test.sh` 綠之後、`git add` 之前執行；紅時 exit 非 0 整個 `--all` 停在該 target，留分支不 commit、印還原指令）與 `nextSteps`（匯出成功後印給統整者的下一步提示；沒填就印通則）。
 - 依序對各目標進行工作樹檢查（不乾淨 ⇒ 停），跑 `exportTo` 快照匯出、`setup.mjs --sync-check` 與快照 `test.sh`。
-- `postExport` 是 target 自己維護的入口（WAS＝`pnpm run guards:llm-team-snapshot`，母體＝會讀 `.agents/` 內容的 node:test 守門；WAS 新增一道會咬快照的守門時要把它加進那個 script），在快照 `test.sh` 綠之後、`git add` 之前執行。
-- `postExport` 紅時（exit 非 0）整個 `--all` 停在該 target，留分支不 commit、印還原指令。
-- `web-agency-system`（`branch` 模式）：自動建立 `chore/llm-team-<VERSION>` 分支並 commit 快照，不 ff、不 push；接著依提示跑 `tools/m4-ship.sh`（M4 完整 guards）再 ff。
-- `GuildHub-frontend` 與 `ai-team-starter`（`main` 模式）：在乾淨 main 直接 commit 快照，不自動 push（由統整者決定）。
 - 任一 target 不乾淨、測試紅或 commit 失敗 ⇒ 整個 `--all` 停在該 target，不繼續後續專案。
 - 統整者開場跑 `setup.mjs --check` 會主動進行「快照落後偵測」，比對快照與真源版本；若快照版本落後真源版本則擋下報紅（exit 1），並印出引導指令。
 
@@ -120,10 +126,23 @@ node home/skills/llm-team/export.mjs --all
    - 複審者並行、8 分鐘 timeout、心跳（每 60 秒印進度，超時以「不簽（timeout）」計）；名單＝一般票 `reviewers`、block 票 `blockReviewers`。
    - 複審提示第一行是哨兵 `【llm-team 複審票】`（規劃是 `【llm-team 規劃】`）：codex 複審者從 cwd 讀得到 AGENTS.md，薄索引靠它判「你是複審者，只答 Q 題，不必讀正本」（GEMINI.md 對寫手用 `【llm-team 寫手票】` 同一招）。
    - 檢視終端印出的收貨摘要。
-   - 親自開啟檔案坐實每位複審者提出的 Q6 關鍵查證事項。
-4. **發布 Draft PR：**
+   - 用 `node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次呼叫）親自坐實每位複審者提出的 Q6 關鍵查證事項。
+4. **裁決（accept）：**
+   ```bash
+   node .agents/skills/llm-team/ticket.mjs accept \
+     --name <ticket-id> \
+     --q6 "<統整者親驗 Q6 的證據，一段話>" \
+     [--caliber <docs|tool|feature>] \
+     [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...
+   ```
+   *`--q6` 永遠必填。`--caliber` 依 config 的 `usage.mode` 決定：`off`（真源預設）時選填、`record`／`cohort` 時必填（缺 ⇒ exit 2）；`--disposition` 用來處置複審者的「不簽」。accept 成功後才能 `publish`／`land`（兩者都認 `q6Receipt`，缺 ⇒ 擋）。*
+5. **發布 Draft PR 或落地：**
    ```bash
    node .agents/skills/llm-team/ticket.mjs publish --name <ticket-id> [--title "<title>"]
+   ```
+   或（統整者自己 land）：
+   ```bash
+   node .agents/skills/llm-team/ticket.mjs land --name <ticket-id> --msg-file <commit-msg-file>
    ```
    *注意：本流程永不自動 merge，最終合併留給人或統整者明確核准。*
 

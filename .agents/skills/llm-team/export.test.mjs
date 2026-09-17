@@ -5,7 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { EXPORT_FILES, exportTo, exportAll, verifySnapshot, main as exportMain } from './export.mjs'
+import { fileURLToPath } from 'node:url'
+import { EXPORT_FILES, exportTo, exportAll, verifySnapshot, main as exportMain, stripJsComments } from './export.mjs'
 import { main as setupMain } from './setup.mjs'
 import { CLEAN_GIT_ENV } from './lib.mjs'
 
@@ -843,6 +844,91 @@ describe('export.mjs 快照導出與驗證測試', () => {
     assert.equal(b2, 'main')
     const commits2 = t2.g('rev-list', '--count', 'HEAD~1..HEAD').stdout.trim()
     assert.equal(commits2, '1')
+  })
+
+  test('1.8.0 ④：exportAll 印的「後續步驟」完全來自 target.nextSteps（真的寫一份 targets.json 到磁碟、走 export.mjs main() 的 --all --targets 載入路徑，不是直接把物件塞進 exportAll）；沒有 nextSteps 的 branch target 印通則、main target 印既有通則', () => {
+    const sourceDir = makeSourceDir()
+    const t1 = makeGitRepo('target-nextsteps-custom-')
+    const t2 = makeGitRepo('target-nextsteps-none-')
+    const t3 = makeGitRepo('target-nextsteps-main-')
+    const targets = [
+      { name: 't1-custom', root: t1.dir, mode: 'branch', nextSteps: '接著跑 tools/totally-custom-guard.sh 再 ff' },
+      { name: 't2-none', root: t2.dir, mode: 'branch' },
+      { name: 't3-main', root: t3.dir, mode: 'main' },
+    ]
+
+    // 🔴 事故（sol block 複審第 4 輪 Q3，2026-09-17）：舊版測試把 targets 陣列當行內物件直接餵給
+    //   exportAll()，完全繞過 export.mjs main() 讀 targets.json 檔、JSON.parse 的那段程式碼——真正的
+    //   CLI 使用者是透過 `--all --targets <file>` 走檔案載入，這條路徑一直沒有測到。
+    //   改法：真的把 targets 寫成一份 targets.json 到暫存目錄，呼叫 exportMain(['--all', '--targets', ...])
+    //   走真正的檔案讀取＋JSON.parse 路徑。
+    const targetsFile = path.join(tmpdir('targets-fixture-'), 'targets.json')
+    fs.writeFileSync(targetsFile, JSON.stringify({ targets }, null, 2))
+
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = exportMain(['--all', '--targets', targetsFile], {
+        sourceDir,
+        git: fakeGit,
+        runSyncCheck: () => 0,
+        runSnapshotTests: () => 0,
+      })
+    } finally {
+      console.log = origLog
+    }
+
+    assert.equal(code, 0, `exportMain 應回 0，實際：${code}`)
+    const allLog = logs.join('\n')
+    assert.ok(
+      allLog.includes('→ 接著跑 tools/totally-custom-guard.sh 再 ff'),
+      `t1 的 nextSteps 應原樣印出，實際：${allLog}`
+    )
+    assert.ok(
+      allLog.includes('→ 本機分支已 commit，依專案自己的守門流程驗證後再 ff（見 targets.json 的 nextSteps／postExport）'),
+      `t2（沒有 nextSteps）應印通則，實際：${allLog}`
+    )
+    assert.ok(
+      allLog.includes('本機 main 已 commit，push 由統整者決定'),
+      `t3（main 模式沒有 nextSteps）應印既有通則，實際：${allLog}`
+    )
+    // 陽性對照：export.mjs 原始碼「剝掉註解後」不含任何具體專案的 m4-ship.sh 字面（否則 t2／t3 的通則測不出差異）；
+    // 用 stripJsComments 而不是比對整份原始碼，因為事故出處註解本來就允許提到舊字面當史料（見 Q5 那條專門測試）。
+    const exportSrc = fs.readFileSync(fileURLToPath(new URL('./export.mjs', import.meta.url)), 'utf8')
+    assert.ok(!stripJsComments(exportSrc).includes('tools/m4-ship.sh'), 'export.mjs 剝掉註解後的原始碼不應含 tools/m4-ship.sh 字面')
+  })
+
+  test('1.8.0 ④ (Q5) 陽性對照：stripJsComments 只剝註解，不誤放實際會執行的字串——註解裡寫 tools/m4-ship.sh ⇒ 剝完看不到；console.log 字串裡寫 ⇒ 剝完仍看得到', () => {
+    const withCommentOnly = [
+      "// 🔴 事故：2026-09-13 曾經印過 tools/m4-ship.sh，現在已經改讀 targets.json 的 nextSteps",
+      "console.log('→ ' + nextStepsFromConfig)",
+    ].join('\n')
+    assert.ok(
+      !stripJsComments(withCommentOnly).includes('tools/m4-ship.sh'),
+      '只在 // 註解裡出現的字面，剝掉註解後不應再看得到'
+    )
+
+    const withCodeLiteral = [
+      '// 這行只是普通說明，跟下面那行程式碼無關',
+      "console.log('→ 接著跑 tools/m4-ship.sh（M4 完整 guards）再 ff')",
+    ].join('\n')
+    assert.ok(
+      stripJsComments(withCodeLiteral).includes('tools/m4-ship.sh'),
+      'console.log 字串常值裡的字面，剝掉註解後仍要看得到（不能被誤放）'
+    )
+
+    const withBlockComment = [
+      '/*',
+      ' * 舊版曾經印 tools/m4-ship.sh，現在不這樣做了',
+      ' */',
+      "console.log('本機 main 已 commit')",
+    ].join('\n')
+    assert.ok(
+      !stripJsComments(withBlockComment).includes('tools/m4-ship.sh'),
+      '只在 /* ... */ 區塊註解裡出現的字面，剝掉註解後不應再看得到'
+    )
   })
 
   test('exportAll: 第二個 target 不乾淨 ⇒ 回 3、第一個已 commit、第二個沒有快照、輸出含「停在」', () => {

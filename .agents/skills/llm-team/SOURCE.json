@@ -1,8 +1,8 @@
 {
-  "version": "1.7.4",
-  "sourceCommit": "cc4c7e60624623652dbfa94351cf2a241d5d1afb",
+  "version": "1.8.0",
+  "sourceCommit": "7ae2001c4f33ef71aac8a5b7da8c158c0acd2c48",
   "sourceDirty": false,
-  "exportedAt": "2026-09-16T09:15:13.743Z",
+  "exportedAt": "2026-09-17T14:41:13.107Z",
   "files": [
     "lib.mjs",
     "write.mjs",

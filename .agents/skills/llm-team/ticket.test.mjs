@@ -14,7 +14,7 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { CLEAN_GIT_ENV, buildSafeCommandRegex, writeTreeOf, git } from './lib.mjs'
+import { CLEAN_GIT_ENV, buildSafeCommandRegex, writeTreeOf, git, MEASUREMENT_SCHEMA_VERSION } from './lib.mjs'
 import { main as ticketMain, runCli } from './ticket.mjs'
 import { main as setupMain } from './setup.mjs'
 import { parseVerdicts } from './council.mjs'
@@ -4418,6 +4418,156 @@ describe('ticket.mjs 票流程測試', () => {
     assert.ok(errText.includes(mergeBase), `stderr 應含 merge-base sha (${mergeBase})，實際為: ${errText}`)
   })
 
+  test('1.8.0 ⑥ (a)(b) land 真 git：分支上已 commit 刪除一檔（review-only 多輪票事故重現）＋另一檔有未 commit 修改，兩者都在 summary.changed ⇒ land 走到 ff 成功，刪除檔跳過 add、修改檔仍被 add 進 commit', async () => {
+    // 🔴 事故重現：2026-09-17 WAS review-only 多輪票，寫手已經在分支上 commit 刪除整個目錄
+    //   （scripts/__tests__/spec-lint-corpus.test.mjs 連同 scripts/__tests__/ 一起消失），summary.changed 仍列著它
+    //   （因為它是 mergeBase..HEAD diff 的一部分）；land 對它無條件 `git add -- f` ⇒ `fatal: pathspec … did not
+    //   match any files`，land 永遠卡在 exit 4，走不到「分支已領先 main，視為已 commit 過」。
+    //   陽性對照：把 ticket.mjs 這次的修法整段拿掉（恢復無條件 `git add -- f`），本測試應改回 exit 4。
+    const repo = makeRepo()
+    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
+    fs.writeFileSync(path.join(repo.dir, 'b.txt'), 'init b\n')
+    repo.g('add', 'a.txt', 'b.txt')
+    repo.g('commit', '-m', 'init a+b')
+    const mergeBase = repo.g('rev-parse', 'main').trim()
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't-del')
+    repo.g('worktree', 'add', '-b', 'feat/t-del', worktreePath, 'main')
+
+    // 模擬 review-only 多輪票：寫手已經在分支上「commit 刪除」b.txt（整個檔案消失，不是待 add 的 pending 刪除）
+    execFileSync('git', ['-C', worktreePath, 'rm', 'b.txt'], { env: CLEAN_GIT_ENV })
+    execFileSync('git', ['-C', worktreePath, 'commit', '-m', 'chore: remove b.txt'], { env: CLEAN_GIT_ENV })
+
+    // (b) a.txt 有未 commit 的修改（真正待 add 的檔，不該被本次修法連帶跳過）
+    fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'modified a\n')
+
+    const reviewedTree = writeTreeOf(worktreePath)
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-del')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
+      project: 'test-proj',
+      ticket: 't-del',
+      branch: 'feat/t-del',
+      base: 'main',
+      mergeBase,
+      targetTipSha: mergeBase,
+      writeExit: 0,
+      rounds: 1,
+      changed: ['b.txt', 'a.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
+        anyEmpty: false,
+        reviewedTree,
+      },
+      q6Receipt: 'verified',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const msgFile = path.join(repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: t-del\n')
+
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let landCode
+    try {
+      landCode = await ticketMain(['land', '--name', 't-del', '--msg-file', msgFile], { repoRoot: repo.dir })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+
+    assert.equal(landCode, 0, `land 應成功回 0（陽性對照：拿掉本次修法會回 4），實際為 ${landCode}，stderr：${errs.join('\n')}`)
+    assert.ok(outs.join('\n').includes('LANDED t-del feat/t-del'), `stdout 應含 LANDED，實際：${outs.join('\n')}`)
+
+    // main 併入後：(a) b.txt 真的不見了（刪除檔跳過 add 沒有卡住整個流程）；
+    //             (b) a.txt 是修改後內容（修改檔確實仍被 add 進最後一次 commit，不是被本次修法連帶吞掉）
+    assert.equal(fs.existsSync(path.join(repo.dir, 'b.txt')), false, 'main 上 b.txt 應已刪除')
+    assert.equal(
+      fs.readFileSync(path.join(repo.dir, 'a.txt'), 'utf8'),
+      'modified a\n',
+      'main 上 a.txt 應是修改後內容（證明它真的被 add 進最後一次 commit）'
+    )
+  })
+
+  test('1.8.0 ⑥ (c) 陽性對照：add 真失敗（檔案仍在但被 .gitignore 擋）⇒ 仍回 4，不被本次修法吞掉', async () => {
+    const repo = makeRepo()
+    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
+    // .gitignore 在 main 上先 commit 好（不能算「run 之後才出現的檔」，否則會撞另一道閘而不是本次要測的路徑）
+    fs.writeFileSync(path.join(repo.dir, '.gitignore'), 'ignored.txt\n')
+    repo.g('add', 'a.txt', '.gitignore')
+    repo.g('commit', '-m', 'init a + gitignore')
+    const mergeBase = repo.g('rev-parse', 'main').trim()
+
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't-ignored')
+    repo.g('worktree', 'add', '-b', 'feat/t-ignored', worktreePath, 'main')
+
+    // ignored.txt 真的存在於工作樹，但被（繼承自 main 的）.gitignore 擋——git status 預設不會列出被忽略的檔，
+    // 所以它不會被判成「run 之後才出現的檔」；真正卡關的是 add 本身會失敗（不是「沒東西可 add」）。
+    fs.writeFileSync(path.join(worktreePath, 'ignored.txt'), 'should not be added\n')
+
+    const reviewedTree = writeTreeOf(worktreePath)
+
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-ignored')
+    fs.mkdirSync(outDir, { recursive: true })
+    const summary = {
+      schemaVersion: 2,
+      coordinator: 'claude',
+      reviewers: ROSTER_STANDARD,
+      project: 'test-proj',
+      ticket: 't-ignored',
+      branch: 'feat/t-ignored',
+      base: 'main',
+      mergeBase,
+      targetTipSha: mergeBase,
+      writeExit: 0,
+      rounds: 1,
+      changed: ['ignored.txt'],
+      verifyExit: 0,
+      review: {
+        tier: 'standard',
+        members: reviewFixture(outDir, [
+          { name: 'agy/opus', overall: '簽' },
+          { name: 'agy/gemini', overall: '簽' },
+        ]),
+        anyEmpty: false,
+        reviewedTree,
+      },
+      q6Receipt: 'verified',
+    }
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+    const msgFile = path.join(repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: t-ignored\n')
+
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let landCode
+    try {
+      landCode = await ticketMain(['land', '--name', 't-ignored', '--msg-file', msgFile], { repoRoot: repo.dir })
+    } finally {
+      console.error = origErr
+    }
+
+    assert.equal(landCode, 4, `add 真失敗時仍應回 4，實際為 ${landCode}`)
+    assert.match(errs.join('\n'), /git add 失敗（ignored\.txt）/, `stderr 應指名是 ignored.txt 的 add 失敗，實際：${errs.join('\n')}`)
+    const mainHeadAfter = repo.g('rev-parse', 'main').trim()
+    assert.equal(mainHeadAfter, mergeBase, 'main 不應被 merge（add 失敗要在 commit 之前就擋下）')
+  })
+
   test('T69 run --review-only happy path：worktree 存在且領先 merge-base ⇒ 回 0、writeMain 0 次、councilMain 1 次且 --round-start 為 merge-base、summary 與 lifecycle 符合 review-only', async () => {
     const repo = makeRepo()
     const mergeBaseSha = repo.g('rev-parse', 'main').trim()
@@ -6294,7 +6444,7 @@ describe('ticket.mjs 票流程測試', () => {
     }
   })
 
-  test('(h) accept 沒 --caliber ⇒ 2、stderr 含「--caliber 必填」、summary 沒被寫入 caliber', async () => {
+  test('(h) 1.8.0：usage.mode=off（預設，config 沒帶 usage 欄位）accept 沒 --caliber ⇒ 0、summary 沒被寫入 caliber、但有 measurementSchemaVersion', async () => {
     const repo = makeRepo()
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't-h')
     fs.mkdirSync(outDir, { recursive: true })
@@ -6305,20 +6455,140 @@ describe('ticket.mjs 票流程測試', () => {
     }
     fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
 
+    const code = await ticketMain(['accept', '--name', 't-h', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
+
+    assert.equal(code, 0, `usage.mode=off 時缺 --caliber 應 exit 0，實際：${code}`)
+    const s = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(s.caliber, undefined, '未帶 --caliber 不應被寫入 caliber')
+    assert.equal(s.measurementSchemaVersion, MEASUREMENT_SCHEMA_VERSION, 'accept 一律蓋 measurementSchemaVersion，與 caliber 是否必填無關')
+    assert.equal(s.q6Receipt, 'receipt-ok')
+  })
+
+  test('(h2) 1.8.0 陽性對照：usage.mode=cohort 時 accept 沒 --caliber ⇒ 2、stderr 含「usage.mode=cohort 時 --caliber 必填」；帶合法 --caliber ⇒ 0', async () => {
+    const repo = makeRepo({ usage: { mode: 'cohort' } })
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-h2')
+    fs.mkdirSync(outDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(outDir, 'summary.json'),
+      JSON.stringify({ schemaVersion: 2, coordinator: 'claude', ticket: 't-h2' }, null, 2)
+    )
+
     const errs = []
     const origErr = console.error
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = await ticketMain(['accept', '--name', 't-h', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
+      code = await ticketMain(['accept', '--name', 't-h2', '--q6', 'receipt-ok'], { repoRoot: repo.dir })
     } finally {
       console.error = origErr
     }
+    assert.equal(code, 2, `usage.mode=cohort 缺 --caliber 應 exit 2，實際：${code}`)
+    assert.match(errs.join('\n'), /usage\.mode=cohort 時 --caliber 必填/)
+    const sAfterFail = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(sAfterFail.caliber, undefined)
 
-    assert.equal(code, 2)
-    assert.match(errs.join('\n'), /--caliber 必填/)
-    const s = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    assert.equal(s.caliber, undefined)
+    const code2 = await ticketMain(
+      ['accept', '--name', 't-h2', '--caliber', 'tool', '--q6', 'receipt-ok'],
+      { repoRoot: repo.dir }
+    )
+    assert.equal(code2, 0, `usage.mode=cohort 帶合法 --caliber 應 exit 0，實際：${code2}`)
+    const sAfterOk = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(sAfterOk.caliber, 'tool')
+  })
+
+  test('(h3) 1.8.0 停止條件：usage.mode=off 時 accept（不帶 --caliber）→ publish／land 都不因缺 caliber／usage 產物失敗', async () => {
+    // publish 分支（沿用 T25 的 fake gh 手法）
+    {
+      const repo = makeRepo()
+      const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'tu1')
+      fs.mkdirSync(worktreePath, { recursive: true })
+      fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+      const outDir = path.join(repo.dir, '.local', 'llm-team', 'tu1')
+      fs.mkdirSync(outDir, { recursive: true })
+      const summary = {
+        schemaVersion: 2,
+        coordinator: 'claude',
+        reviewers: ROSTER_STANDARD,
+        project: 'test-proj',
+        ticket: 'tu1',
+        branch: 'feat/tu1--slice',
+        base: 'main',
+        writeExit: 0,
+        rounds: 1,
+        changed: ['file.txt'],
+        verifyExit: 0,
+        review: {
+          tier: 'standard',
+          members: reviewFixture(outDir, [
+            { name: 'agy/opus', overall: '簽' },
+            { name: 'agy/gemini', overall: '簽' },
+          ]),
+          anyEmpty: false,
+        },
+      }
+      fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+
+      const deps = {
+        repoRoot: repo.dir,
+        changedFiles: () => ['file.txt'],
+        git: () => '',
+        spawn: (cmd, args) => {
+          if (cmd === 'gh') {
+            if (args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+            if (args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/1' }
+          }
+          return { status: 0, stdout: '' }
+        },
+      }
+
+      const acceptCode = await ticketMain(['accept', '--name', 'tu1', '--q6', '親自坐實'], deps)
+      assert.equal(acceptCode, 0, `usage.mode=off 缺 --caliber 時 accept 應回 0，實際：${acceptCode}`)
+      const s = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+      assert.equal(s.caliber, undefined)
+      assert.equal(s.measurementSchemaVersion, MEASUREMENT_SCHEMA_VERSION)
+
+      let ghCalled = false
+      const deps2 = {
+        ...deps,
+        spawn: (cmd, args) => {
+          if (cmd === 'gh') {
+            ghCalled = true
+            if (args[0] === '--version') return { status: 0, stdout: 'gh 2.50.0' }
+            if (args[0] === 'pr') return { status: 0, stdout: 'https://github.com/org/repo/pull/1' }
+          }
+          return { status: 0, stdout: '' }
+        },
+      }
+      const publishCode = await ticketMain(['publish', '--name', 'tu1'], deps2)
+      assert.equal(publishCode, 0, `publish 不應因缺 caliber／usage 產物失敗，實際：${publishCode}`)
+      assert.equal(ghCalled, true, 'gh 應被呼叫（未被 caliber／usage 檢查擋下）')
+    }
+
+    // land 分支（沿用 makeLandFixture，但拿掉 q6Receipt，改走 accept 補上）
+    {
+      const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 'tu2', branch: 'feat/tu2' })
+      const preSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+      delete preSummary.q6Receipt
+      fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(preSummary, null, 2))
+
+      const acceptCode = await ticketMain(['accept', '--name', 'tu2', '--q6', '親自坐實'], { repoRoot: repo.dir })
+      assert.equal(acceptCode, 0, `usage.mode=off 缺 --caliber 時 accept 應回 0，實際：${acceptCode}`)
+
+      const deps = {
+        repoRoot: repo.dir,
+        changedFiles: () => ['file.txt'],
+        git: (cwd, args) => {
+          if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') return 'main'
+          if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') return 'feat/tu2'
+          if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') return 'file.txt'
+          if (args[0] === 'rev-parse' && args[1] === 'HEAD') return 'new-main-sha-tu2'
+          if (args[0] === 'rev-parse' && args[1] === 'main') return 'mock-target-tip-sha'
+          return ''
+        },
+      }
+      const code = await ticketMain(['land', '--name', 'tu2', '--msg-file', msgFile], deps)
+      assert.equal(code, 0, `land 不應因缺 caliber／usage 產物失敗，實際：${code}`)
+    }
   })
 
   test('(i) accept --caliber feature ⇒ 0、summary.caliber === "feature"、caliberBy === "coordinator"', async () => {
