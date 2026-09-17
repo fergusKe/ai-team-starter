@@ -350,6 +350,74 @@ git switch -c wip/whatever
 
 測完關掉 PR、刪分支。
 
+## 8. 不在版控裡的那一半（機器、plugin、真源、secrets）
+
+前面七步是 GitHub 那一半。複製模板拿到的是 **repo 裡的檔案**；下面這些不在 repo 裡，
+`progress.sh` 也看不到，只有「`SETUP-GITHUB.md` 還在」這個訊號替它們佔位。
+**這份刪掉之後**，8a 的入口留在 `AGENTS.md`〈多模型分工的票流程〉那段（`setup.mjs --check` 那一行）——
+新機器、新接手的人從那裡開始；8b／8c 是專案一次性的事，做完就不用再找。
+
+### 8a. 這台機器：`setup.mjs --check`（每台機器各做一次）
+
+```bash
+node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 會用到的統整者各跑一次（claude／agy／codex）
+```
+
+它對帳的是**複製範圍外的狀態**：`claude`／`agy`／`codex` 執行檔（走 PATH）、守門腳本、
+`~/.claude/settings.json` 的 hooks、agy 的 `settings.json` 指令白名單 regex、codex 的 `~/.codex/hooks.json`，
+以及快照版本跟真源**一不一致**（真源在本機可讀時才比，不一致就 exit 1；不可讀就印 ℹ 略過）。
+**它會診斷，不會替你改**：能產片段的項目（agy 白名單、trustedWorkspaces）印片段讓你手動合併；執行檔缺就是缺，自己裝。
+它**不驗**各 CLI 的登入狀態與額度。
+codex 當統整者還有一件它量不到的：`~/.codex/hooks.json` 要在**互動式** session 信任過一次才會載入（每台機器一次）；
+`--check` 只直跑轉接器，證明不了互動 session 真的載入了 hook。之後每個 codex 統整 session 開工的 deny canary 是 `AGENTS.md`〈codex 當統整者〉的事，不是本節。
+`llm-team.config.json` 是 repo 裡唯一該改的：模型 ID 要對得上你有的額度。
+
+### 8b. `.claude/settings.json`：plugin 名單照這個專案重判
+
+模板出貨的 `enabledPlugins` 關了 10 個 plugin，那是**模板自己**的判斷（它不碰任何雲服務、不跑瀏覽器）。
+複製過來的專案要重判一次，依據是**這個專案已經決定的工作流程與驗收方式**：`CLAUDE.md` 要求的驗收
+（要真實瀏覽器驗收就要 playwright／chrome-devtools-mcp）、`package.json` 的依賴與部署平台（用 Neon 就要 neon、部署在 Vercel 就要 vercel）、
+CI／部署設定、`docs/WBS.md` 已排的工作。dependency 看不出來的（例如下季才接的服務）由人拍板，不要從清單猜。
+
+要開的 plugin **明確設成 `true`**，不要只刪那一行——刪掉只是「專案不表態」，結果會落回使用者層的設定與安裝狀態：
+
+```bash
+claude plugin list                                   # 這台機器裝了什麼、哪些 disabled
+claude plugin install playwright@claude-plugins-official --scope project   # 第一次納入專案用 install：寫 true 進 .claude/settings.json，clone 的人也拿到
+claude plugin enable  playwright@claude-plugins-official --scope project   # 只用在「已裝、被關掉」要重開
+claude plugin details vercel@claude-plugins-official  # 元件清單與預估 always-on 成本（它不算 hook 注入的內容；有 hook 注入的實際會更高）
+```
+
+`--scope project` 之後 plugin 的安裝狀態跟著 repo 走；**不跟著走的是每台機器的登入**——
+MCP 那一類（neon、vercel、stripe⋯⋯）每台都要各自授權一次。
+名單只能省 session 的固定前綴，關錯了會少功能。量法與數字在 `docs/DECISIONS.md`〈2026-09-17 每個 repo 只開它用得到的 plugin〉；
+改 `.claude/settings.json` 走 `governance/` 分支（白名單已含這個檔）。
+`.claude/settings.local.json` 是個人本機設定，已在 `.gitignore`。
+
+### 8c. 真源的 `targets.json`：登記了，`export --all` 才會配送
+
+`.agents/skills/llm-team/` 是唯讀快照（`SOURCE.json` 記來源版本與 commit）。它的更新方式是**維護者在真源跑
+`export.mjs --all`，逐一寫進 `targets.json` 列出的每個 repo**；不在清單裡的專案不會被自動配送
+（維護者仍可 `export.mjs --to <repo 路徑>` 單次匯出一份到那個 repo 的 working tree——不 commit、不 push，而且要有人記得）。
+不一致的偵測只有一處：8a 的 `setup.mjs --check` 在真源可讀的機器上會比版本，不一致就 🔴 exit 1；
+`--sync-check` 只驗快照有沒有被手改，**不驗新舊**。真源不可讀的機器（沒有維護者 config repo 的）不會有任何紅燈。
+
+登記只有維護者做得到：把新專案加進真源（維護者私人 config repo `home/skills/llm-team/targets.json`）。
+`mode` 兩種，都只動本機、都不 push、都不開 PR：`branch` 在該 repo 開 `chore/llm-team-<版本>` 分支並 commit（分支已存在就停），
+你再自己推、開 PR；`main` 要求該 repo 當下在 main，直接 commit 本機 main——目前的清單只有模板自己用 `main`。
+不打算跟著真源走的專案不用登記，但要知道它從此是一份分叉。
+
+### 8d. GitHub Actions 的 secrets／variables／environments
+
+不在版控裡。模板的 `ci.yml` **一個 secret 都不需要**（只跑 install、閘門、openspec validate、四個 script）；
+你的 stack 需要的（部署 token、測試用資料庫 URL⋯⋯）自己盤點一次，設在 repo settings，並在 `AGENTS.md` 或 CI 註解寫哪一步用到哪一個。沒有就明確記「無」。
+
+### 8e. `.envrc`
+
+§0 說可以把 `export PATH="$PWD/node_modules/.bin:$PATH"` 寫進 `.envrc`。它不會自動存在。
+只放那一行的話可以進版控（沒有秘密、沒有本機路徑）；每個 checkout／worktree 第一次都要 `direnv allow`。
+一旦要放秘密就改進 `.env.local`（已在 `.gitignore`），`.envrc` 維持只有 PATH。
+
 ---
 
 設定完成後可以刪掉本檔。

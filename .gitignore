@@ -26,3 +26,6 @@ docs/arch.html
 # 多模型派工與票流程的產物與台帳（`.agents/skills/llm-team/`）。**不進版控** ——
 /.local/llm-team/
 /.claude/worktrees/
+
+# Claude Code 的個人本機設定（權限、本機 plugin 開關）。每台機器不同，不進版控。
+/.claude/settings.local.json
