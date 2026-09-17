@@ -354,10 +354,12 @@ git switch -c wip/whatever
 
 前面七步是 GitHub 那一半。複製模板拿到的是 **repo 裡的檔案**；下面這些不在 repo 裡，
 `progress.sh` 也看不到，只有「`SETUP-GITHUB.md` 還在」這個訊號替它們佔位。
-**這份刪掉之後**，8a 的入口留在 `AGENTS.md`〈多模型分工的票流程〉那段（`setup.mjs --check` 那一行）——
+**這份刪掉之後**，8a 的內容留在 `SETUP-MACHINE.md`（不刪）與 `AGENTS.md`〈多模型分工的票流程〉那段（`setup.mjs --check` 那一行）——
 新機器、新接手的人從那裡開始；8b／8c 是專案一次性的事，做完就不用再找。
 
 ### 8a. 這台機器：`setup.mjs --check`（每台機器各做一次）
+
+要裝什麼、從哪裝、登入怎麼確認、守門與 hooks 從哪來——在 `SETUP-MACHINE.md`（那份**不刪**，下一台機器還要用）。這裡只講對帳：
 
 ```bash
 node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 會用到的統整者各跑一次（claude／agy／codex）

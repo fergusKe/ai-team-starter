@@ -54,8 +54,8 @@ approve 的簽章永遠是真的。`AGENTS.md` 的注意力預算那一節是為
 
 ## 安裝
 
-**前置**：git、Node 24、pnpm 10.27.0（`package.json` 的 `packageManager`，`corepack enable` 就對版）、
-python3（`progress.sh` 等腳本用）、`gh`（已 `gh auth login`，對新 repo 要有 admin 權限——`SETUP-GITHUB.md` 的 API 呼叫需要）。
+**前置（每台機器一次，見 `SETUP-MACHINE.md`）**：git、Node 24、pnpm 10.27.0（corepack）、python3、`gh`（已登入、對新 repo 有 admin）、
+`claude`／`agy`／`codex` 三個 CLI 與各自的登入、守門腳本與 hooks。那份寫了每一項**先查、沒有才裝、只裝一份**與官方安裝連結，**做完不要刪**——它是機器的，不是專案的。
 先確認 `git config user.name` / `user.email` 是你要署名的身份 —— 這套流程把說明寫在 commit 裡，署錯很難改。
 
 ```bash
@@ -75,7 +75,7 @@ pnpm install --frozen-lockfile
 # 3. 問它「我還缺什麼」
 bash .github/scripts/progress.sh
 
-# 4. 這台機器那一半（不在 repo 裡，每台機器各做一次）
+# 4. 這台機器那一半（不在 repo 裡，每台機器各做一次；清單在 SETUP-MACHINE.md）
 node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 你會用到的統整者各跑一次；能產片段的項目會印片段，要手動合併
 ```
 
@@ -85,7 +85,7 @@ node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 你會�
 
 **第四步是 `progress.sh` 看不到的那一半。** 複製過來的是 repo 裡的檔案；
 `claude`／`agy`／`codex` 有沒有裝、守門 hook、agy 的指令白名單、codex 的 `hooks.json`——
-這些是**這台機器**的狀態，換一台就要重做，只有 `setup.mjs --check` 對得出來（它不驗各 CLI 的登入與額度）。
+這些是**這台機器**的狀態，換一台就要重做，只有 `setup.mjs --check` 對得出來（它不驗各 CLI 的登入與額度）；要裝什麼、從哪裝、怎麼驗，在 `SETUP-MACHINE.md`。
 還有幾件事機器對不出來、寫在 `SETUP-GITHUB.md`〈8. 不在版控裡的那一半〉：
 `.claude/settings.json` 的 plugin 名單要照**這個專案**重判（模板關的 10 個是模板的判斷，不是你的；plugin 的安裝與服務登入也不會跟著 repo 來），
 以及新專案要登記進真源的 `targets.json`，`export.mjs --all` 才會配送 `llm-team` 快照的更新。
@@ -434,6 +434,7 @@ fallback、**工作的週次沒有嚴格晚於它依賴的裁決期限**、依�
 | `.github/scripts/wbs-page.sh` | 把工作分解表產成一頁可以點開收合的網頁。**產物不進版控** |
 | `.github/scripts/test-progress-check.sh` | 工作分解表閘門的負向測試 |
 | `.github/ruleset.json` | GitHub ruleset 的快照兼 API payload。ruleset 不在版控裡，這份讓它看得見 |
+| `SETUP-MACHINE.md` | **這台機器要有什麼**：執行檔、登入、守門與 hooks。每台各做一次，**不要刪** |
 | `.github/scripts/check-ruleset.sh` | 偵測線上設定與快照的漂移 |
 
 ## 規則只有幾條
