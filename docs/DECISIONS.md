@@ -1513,3 +1513,18 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 3. **把整個第 8 節寫進 AGENTS.md**：8b／8c／8d／8e 是一次性設定，寫進每 session 讀的 AGENTS 就是每 session 多付一段沒人用的字。8a 是每台機器都會重來的事，它的耐久入口 AGENTS.md〈多模型分工的票流程〉本來就有（`setup.mjs --check` 那一行），第 8 節開頭指回去，SETUP 刪掉後不會找不到。
 
 **沒有的**：不加任何新腳本、新旗標；「SETUP-GITHUB.md 還在」仍是唯一訊號。
+
+## 2026-09-17　機器層的東西不進 repo；`SETUP-MACHINE.md` 列「先查、沒有才裝、只裝一份」，不刪
+
+**決定**：新增 `SETUP-MACHINE.md`（根目錄、governance 白名單、**不刪**）：執行檔（git／Node 24／pnpm 10.27.0 corepack／python3／gh／claude／codex／agy）各附「誰用、版本、先查什麼、官方安裝做法與連結」；登入怎麼做怎麼驗；守門與 hooks 住哪、從哪來。守門 `block-dangerous.sh` 與三家 CLI 的 hooks **維持機器層**，模板不放副本，`.claude/settings.json` 不加 hooks。README 前置與 `SETUP-GITHUB.md` 8a 改成指向它。
+
+**為什麼**：負責人問「工具要自己裝的有沒有列、附安裝指令；還是把內容都放進 repo 讓新專案直接用」。逐項對：能進 repo 的只有 Claude 那一份守門（專案層 settings 支援 hooks、`setup.mjs` 也有 `<repo>/scripts/claude-hooks/` 候選），agy 只認全域 `~/.gemini/config/hooks.json`（09-13 實測 workspace hooks 在 headless 不載入）、codex 只認 `$CODEX_HOME/hooks.json` 且要互動信任、執行檔與登入物理上進不了 repo。Claude 那份進 repo 的代價：全域已有一份時同一條指令跑兩次守門；24KB 腳本每個 repo 一份各自漂（llm-team 快照要解的同一個問題）；`setup.mjs` 的對帳只讀 `~/.claude/settings.json`，要認專案層是真源改動。Gemini 3.1 Pro（codex 額度用完至 22:44，先問 Gemini）結論同：c) 不進 repo、只寫步驟；它另擋一條 BLOCK——不要寫死 `brew install`／`npm -g` 這類指令，理由是這台機器實際就有兩份 `claude`（npm -g＋Homebrew cask），盲目照抄會再多一份，而 nvm／fnm／brew 是個人選擇。負責人要的是「附安裝指令」，兩邊的交集是：**每一項先 `command -v`／`which -a`，沒有才裝，指令寫官方文件當下的做法並附連結，且明講只留一份**（Claude Code 官方 troubleshoot-install 頁本來就要求只留一份）。
+
+**為什麼是獨立檔、而且不刪**：`SETUP-GITHUB.md` 做完會刪（那是 `progress.sh` 的完成訊號），但機器層的事每台機器都要重來，寫在會刪的檔裡第二台就找不到；`AGENTS.md` 是每 session 讀的規範，放一次性安裝清單就是每 session 多付一段。
+
+**拒絕的替代**：
+1. **模板放 `scripts/claude-hooks/block-dangerous.sh` 副本＋專案層 hooks**：解決不了 agy／codex；Claude 側雙重執行＋每 repo 漂移；要動真源對帳。`setup.mjs` 351 行的停止條件（真源自帶守門副本、候選縮成一項）達成時再重評。
+2. **真源 export 把守門帶進快照**：漂移解了，雙重執行沒解，快照再大 24KB；一樣要改 `setup.mjs` 認專案層 settings。列在真源待改之外，不推。
+3. **一支 `bootstrap.sh` 自動裝全部**：三家 CLI 的安裝管道各自會變、跨 OS 不同、會在已裝的機器上再裝一份——正是 Gemini 擋的那件事。文件列「先查、沒有才裝」比腳本安全。
+
+**沒有的**：不加偵測（`progress.sh` 不查機器層，理由見前一節）；`.claude/settings.json` 維持只有 `enabledPlugins`。停止條件（可機器驗）：`grep -c 'brew install\|npm i -g' SETUP-MACHINE.md` 的每一筆都在「先查」欄有對應的 `--version`／`which -a`；`jq -e 'has("hooks")' .claude/settings.json` exit 1；`[ ! -e scripts/claude-hooks ]`。無脈絡情境題「全新 macOS 要做什麼」已用 Gemini 3.1 Pro 跑兩輪：第一輪擋時序矛盾（沒說先 clone）、缺 Claude hook JSON、`codex-pretooluse.sh` 路徑、Homebrew 前置——都補了；它另擋「`@openai/codex` 已於 2023 停用」是它的知識截止（那是 Codex 模型，CLI 是 2025 年起的 Rust 版、本機 0.153.4），不接受、文件加一句區分。第二輪「猜的」與「事實錯誤」都空、可合併。codex 額度回來後可再補一輪。

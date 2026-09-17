@@ -372,6 +372,7 @@ run 0 main governance/fix-ci     "改 CI"                  sh -c 'echo "#" >> .g
 run 0 main governance/fix-agents "改 AGENTS.md"           sh -c 'echo "" >> AGENTS.md'
 run 0 main governance/decisions   "改 docs/DECISIONS.md"     sh -c 'mkdir -p docs && echo "x" >> docs/DECISIONS.md'
 run 0 main governance/setup-doc   "改 SETUP-GITHUB.md"       sh -c 'echo "x" >> SETUP-GITHUB.md'
+run 0 main governance/machine-doc "改 SETUP-MACHINE.md"      sh -c 'echo "x" >> SETUP-MACHINE.md'
 # 工作分解表是 CI 在驗的產物，所以它算規則面。**新開的通道要有正向案例** ——
 # 「其他測試全過」不能證明這兩條走得通。
 run 0 main governance/wbs         "改 docs/WBS.md"           sh -c 'mkdir -p docs && echo "x" >> docs/WBS.md'
