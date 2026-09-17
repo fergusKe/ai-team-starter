@@ -1,0 +1,14 @@
+{
+  "enabledPlugins": {
+    "neon@claude-plugins-official": false,
+    "stripe@claude-plugins-official": false,
+    "vercel@claude-plugins-official": false,
+    "resend@claude-plugins-official": false,
+    "aws-serverless@claude-plugins-official": false,
+    "bigquery-data-analytics@claude-plugins-official": false,
+    "cloudflare@claude-plugins-official": false,
+    "frontend-design@claude-plugins-official": false,
+    "playwright@claude-plugins-official": false,
+    "chrome-devtools-mcp@claude-plugins-official": false
+  }
+}

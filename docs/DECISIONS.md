@@ -1478,3 +1478,25 @@ rg -n -- '--q6|--caliber' prompts/07-ticket.md                    # 旗標寫出
 node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被手改
 ```
 真源改完後的驗法（`usage.mode=off` 下 `accept --q6` 不帶 caliber ⇒ exit 0、假 `gh` 的 `publish` ⇒ exit 0；`mode=cohort` 下缺 caliber ⇒ exit 2、同輸入兩次 `--cohort` 的 inputHash 與 verdict 相同、缺 transcript ⇒ `measurable:false` 不得 pass）寫在真源的測試裡，不在這裡重複。
+
+## 2026-09-17　每個 repo 只開它用得到的 plugin；AGENTS.md 不在前綴裡，瘦身不省前綴
+
+**決定**：模板出貨 `.claude/settings.json`，用 `enabledPlugins` 把跟這個 repo 無關的 Claude Code plugin 設成 false（模板關 10 個：neon、stripe、vercel、resend、aws-serverless、bigquery-data-analytics、cloudflare、frontend-design、playwright、chrome-devtools-mcp）。衍生專案拿的是**判斷方法**（只開自己用得到的），不是這份名單——GuildHub-frontend 要跑瀏覽器驗收，保留 frontend-design／playwright／chrome-devtools-mcp、只關 7 個。這是「衍生專案逐字拿共用節」的一個窄例外：設定值依專案能力不同，共用治理文件仍逐字。governance 白名單加 `.claude/settings.json`。
+
+**為什麼**：每個 session 的固定前綴（系統提示＋工具＋plugin 注入＋專案脈絡）實測約 50k token，其中 ≥15k 來自這兩個 repo 用不到的 plugin：vercel 的 SessionStart hook 在 startup／resume／clear／compact 都把 7.5KB 的 knowledge-update 全文注入、35 個 skill 描述；aws-serverless 每次 Edit／Write 跑一支 hook；stripe 每次 Skill 呼叫跑 hook。這筆是每個 session、每個 worktree 都重付一次的 cache write（cache 範圍＝一台機器＋一個目錄，worktree 各自冷起）。
+
+**怎麼量**（`claude -p "只回覆 ok" --output-format json --model claude-sonnet-5`，讀 `usage` 的 input＋cache_creation＋cache_read；同一目錄各 3 次冷 session）：
+- 模板 worktree 做前：49,553／49,762／49,762；做後：38,500／38,500／38,500 ⇒ **−11.2k（−23%）**，過「≥10k」的停止條件。
+- 空目錄全開 50,490；空目錄關 10 個 35,375。
+- 注意 `claude -p` 走 Agent SDK 額度不扣互動式訂閱額度，所以這個量法量的是 token 結構，不是 Max 額度消耗。
+
+**一起量到、因此不做的**：`AGENTS.md`（45KB）**不在前綴裡**——`CLAUDE.md` 沒有 `@AGENTS.md` import，只有文字「先讀 AGENTS.md」，所以它是 Claude 用 Read 讀進對話（每 session 一次）。同一目錄有沒有 AGENTS.md 兩次量測數字完全相同（49,192）。「AGENTS.md 瘦身省前綴」的前提不成立；它省的是 Read 之後每個請求的對話層占用（cache_read）。要不要做改用「Read 後每次請求的 logical context」當尺、門檻中位數少 ≥8k、且無脈絡情境題零「猜的」——延後，等下一條的數據。
+
+**延後（有期限）**：統整者 context 節食規則（長輸出進 subagent 或 `batch.mjs`；codex／gemini 回覆先落檔、主對話只讀結論段；`/compact` 只在票與票之間；票中不切模型／effort／fast mode——每個都打掉整個 cache；一個 worktree 用同一個連續 session 做完）跟真源 llm-team 1.8.0 一起改 `prompts/07-ticket.md`，最晚 **2026-10-01** 開始；逾期或代表性票的工具呼叫 context 中位數持續 >120k 就拆出來獨立做。停止條件：做前後各 ≥5 張同類票，context 中位數 −30%、p95 ≤100k、票中 compact／模型／effort 切換 0、除初始冷 miss 外可避免 miss 0；五票後改善 <20% 就停止加文字規則，改追大輸出來源。
+
+**拒絕的替代**：
+1. **LiteLLM gateway／OpenTelemetry 用量監控**：一人團隊、訂閱制、沒有美元帳單可省；`/usage` 的 Prompt cache 行已能看命中率與最近 miss 原因。直接節省 0。
+2. **放棄一票一 worktree 來共用 cache**：省一次約 30k 的 cache write，換掉隔離原則，不划算。接受每個 worktree 1 次初始冷 miss、0 次可避免 miss。
+3. **`subagentPromptCacheTtl=1h`**：codex／gemini 不走 Claude subagent、Agent 工具用得少，預估省 0 次有意義的 miss。連續一週每票 ≥2 次 Claude subagent 重用且 5 分鐘 TTL 確實造成重複 creation 才重評。
+
+**沒有的**：不含每票的 token 台帳（規則⑦：不開每票要餵的尺）；量測用 `/usage` 與這裡的 `claude -p` 差分法，不新增工具。
