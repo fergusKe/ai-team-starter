@@ -57,9 +57,11 @@
 
 ---
 
-## 二、統整者指令區塊（兩回合流程）
+## 二、統整者指令區塊（票流程步驟）
 
-統整者處理一張票只需兩個回合：第一回合發動票流程，第二回合讀收貨摘要並收尾。
+一張票統整者要做五步：起跑 → 讀收貨摘要 → 親驗 Q6 → `accept` 裁決 → `publish`。
+**`publish` 只認 `accept` 寫進 summary.json 的 `q6Receipt`**，跳過 `accept` 直接 `publish` 會 exit 2「缺少 q6Receipt」——
+這不是紅燈，是「統整者還沒親自坐實」的閘門（2026-09-13 事故：複審者不簽卻被直接放行開 PR）。
 
 ```bash
 # 0. 第一次開工前：對帳 config 不變式、守門、各角色 binary、該 harness 的 hooks（全對 exit 0；有缺印修法 exit 1；不自動改設定）
@@ -80,12 +82,26 @@ node .agents/skills/llm-team/ticket.mjs run \
 #    確認 write/verify exit、每位審查者的整體簽核與逐題理由。
 
 # 3. 統整者親自坐實每位複審者的 Q6（只准一件關鍵核實事項）。
+#    要親跑的驗收指令合成一次呼叫（每次工具呼叫都帶完整 context，省的是次數）：
+node .agents/skills/llm-team/batch.mjs 'pnpm test tests/runner.test.ts' 'pnpm typecheck'
 
-# 4. 第二回合：確認無誤後發布 Draft PR（永不自動 merge，留給人或統整者核准）
+# 4. 裁決：把 Q6 的證據寫進 summary.json；複審者「不簽」但查證為誤報的，用 --disposition 記下理由
+#    --caliber 是票的口徑（docs｜tool｜feature），給選配的用量量測分類用；目前快照版本（1.7.x）的 CLI 是必填，
+#    要不要啟用 cohort 量測由專案政策決定（見第四節）
+node .agents/skills/llm-team/ticket.mjs accept \
+  --name add-runner-check \
+  --caliber feature \
+  --q6 "親跑 pnpm test tests/runner.test.ts：12/12 綠；denied 分支有斷言 runner.test.ts:88" \
+  --disposition 'agy/gemini:Q3=rejected:"既有行為，不是本票引入；見 runner.ts:41 的 2026-08 註解"'
+
+# 5. 發布 Draft PR（永不自動 merge，留給人或統整者核准）
 node .agents/skills/llm-team/ticket.mjs publish \
   --name add-runner-check \
   --title "feat: handle denied permissions in runner"
 ```
+
+不開 PR、直接落地到 main 的專案用 `land` 代替 `publish`：`ticket.mjs land --name <n> --msg-file <commit 訊息檔>`
+（一樣要先 `accept`；複審後 worktree 又改過 ⇒ exit 7）。
 
 ---
 
@@ -100,11 +116,12 @@ node .agents/skills/llm-team/ticket.mjs publish \
 
 ## 四、收尾與計量
 
-- 票流程的所有產物與 ndjson 台帳皆記錄於 `.local/llm-team/<n>/`（本機暫存，已被 gitignore）。
-- 跨專案效率比較時，只比較同類葉子票的：
-  1. `coordinatorTurns`（統整者花費的回合數；統整者自身 token 通常無法由腳本取得，回合數為最佳代理指標）。
-  2. 寫手 `output_tokens`。
-  3. 寫手修正輪數（rounds）。
+- 票流程的所有產物與 ndjson 台帳皆記錄於 `.local/llm-team/<n>/`（本機暫存，已被 gitignore；**每台機器一份，不跟著 repo 走**）。
+- `summary.json` 每票都有的欄位：`rounds`（寫手修正輪數）、`writeExit`／`verifyExit`、`review.members`（每位複審者的簽核）、`caliber`（accept 時標的口徑）。
+- **統整者用量是選配量測**，不是每票必做：`usage.mjs --ticket <n> --write` 從 Claude Code transcript 量出該票視窗內統整者的 API 呼叫數與 token
+  （只有統整者是 Claude Code 才量得到；agy／codex 統整者記 `measurable:false`），`usage.mjs --cohort <口徑>` 拿同口徑的票做基線／窗比較。
+  細節與門檻在快照 `SKILL.md`〈統整者呼叫預算〉。要不要啟用、結論怎麼留存，由專案政策決定；
+  模板預設**不啟用**——量出來的數字在 gitignore 的本機目錄，別人與 CI 都拿不到，單憑它不能當團隊層級的 pass／fail。
 
 ---
 

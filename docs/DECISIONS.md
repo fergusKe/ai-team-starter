@@ -1454,3 +1454,27 @@ Fergus 定案（起因：發現衍生專案 GuildHub-frontend 用 npm——「pn
 **拒絕的替代**：三份 config 檔各對一種統整者（規則會漂、`setup --check` 只讀一份）；讓 Claude 當 agy／codex 模式的複審者（那兩個模式的前提就是 Claude 沒額度）；gpt-oss 替補（未校準）。
 
 **沒有的**：不含額度預檢（四個桶都沒有可查剩餘額度的 API）——規則是「打到 429 ⇒ 該角色停線、記進交接檔、下個 session 開票前先讀」。
+
+## 2026-09-17　統整者手冊照「現在的 CLI」寫；用量量測是選配，模板預設不啟用
+
+**決定**：`prompts/07-ticket.md` 與 `AGENTS.md` 的票流程改成 `run` → 讀收貨摘要 → 親驗 Q6（`batch.mjs` 一次呼叫）→ `accept --q6 --caliber` → `publish`／`land`。`accept` 是統整者坐實 Q6 的節點，`publish` 只認它寫的 `q6Receipt`。「兩回合」的說法拿掉，改列步驟。第四節「收尾與計量」不再用 `coordinatorTurns` 當指標；改寫成：`usage.mjs` 的統整者用量是**選配**量測、模板預設不啟用、它的結論不能單獨當團隊層級的 pass／fail。
+
+**為什麼**：快照 1.7.x 的 `publish` 要求 `q6Receipt`（只有 `accept` 會寫），1.7.2 起 `accept --caliber` 必填；模板手冊從 1.2 起就只寫 `run → publish`，照著做在 `publish` 必定 exit 2。這是文件漂移，不是工具壞掉——文件寫的是願望中的「兩回合」，工具做的是「三個決策點」。手冊要描述**現在裝在快照裡的 CLI**，不承諾還沒落地的介面（codex gpt-5.6-sol 2026-09-17 兩輪共識）。
+
+**真源待改（模板不能自己改快照，列在這裡等真源處理，同步回來後這節要更新）**：
+1. **量測與 Q6 閘門解耦**：`--q6` 永遠必填；`--caliber` 只在專案啟用量測時必填（config 加 `usage.mode: off｜record｜cohort`，模板預設 `off`）。現在的必填跟 SKILL.md 規則⑤「缺標的票不納入」與規則⑦「停損期不開每票要餵的台帳」互相打架。
+2. **每票不寫用量**：拿掉規則④的 `usage.mjs --write`；`--cohort` 執行時才從各票 `lifecycle.ndjson` 視窗掃 transcript。視窗終點固定（有 `landed` 用 `landed`，否則 `accepted`）、缺 transcript 記 `measurable:false` 不得補猜、measurement schema 要版本化、新舊口徑不混算。
+3. **cohort 輸出自證 JSON**：含 schemaVersion、工具版本、口徑、基線／窗邊界、門檻、每票 ticket／caliber／apiCalls／run／usageWindow、lifecycle 雜湊、實際採計 transcript 記錄的 canonical 雜湊、整體輸入雜湊。判定只能由這份 JSON 推導；要不要 commit 是專案的事，工具不強制——但 handoff 宣稱 pass 時這份 JSON 得在之後仍拿得到的位置，否則只算 `local-only`。
+4. **共用快照裡不放單一專案的操作事實**：SKILL.md〈版本同步〉的三個 repo 名與同步模式、某專案的 `postExport` script、`tools/m4-ship.sh`、「config repo 15 張票追認」，以及 `export.mjs` 印出的 `m4-ship.sh` 提示——全部改由 `targets.json` 的 target metadata 提供，或搬回該專案自己的文件。**事故出處註解可以留專案名**（那是「為什麼有這條規則」的證據），不能留仍有操作效力的指令。
+5. 真源 SKILL.md〈標準程序骨架〉同樣漏了 `accept`，一起補。
+
+**拒絕的替代**：等真源改完再修模板手冊——那段時間每個從模板複製出去的專案都會在 `publish` 卡死；模板手冊先照 1.7.4 寫，真源改成 opt-in 時同一個 export 把範例改成依 mode 選填。
+
+**怎麼驗（過渡期，模板層）**：
+```bash
+rg -n 'ticket\.mjs accept' prompts/07-ticket.md AGENTS.md      # 兩個入口都有 accept
+rg -n -- '--q6|--caliber' prompts/07-ticket.md                    # 旗標寫出來
+! rg -n '兩回合|coordinatorTurns' prompts/07-ticket.md            # 舊說法清掉
+node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被手改
+```
+真源改完後的驗法（`usage.mode=off` 下 `accept --q6` 不帶 caliber ⇒ exit 0、假 `gh` 的 `publish` ⇒ exit 0；`mode=cohort` 下缺 caliber ⇒ exit 2、同輸入兩次 `--cohort` 的 inputHash 與 verdict 相同、缺 transcript ⇒ `measurable:false` 不得 pass）寫在真源的測試裡，不在這裡重複。

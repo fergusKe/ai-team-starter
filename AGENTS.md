@@ -397,7 +397,8 @@ ADR 證據路徑不存在、標「已強制」卻沒有一條證據是測試）�
 ```bash
 node .agents/skills/llm-team/setup.mjs --check --coordinator <claude|agy|codex>   # 對帳 config 不變式、守門、各角色 binary、該 harness 的 hooks
 node .agents/skills/llm-team/ticket.mjs run --coordinator <claude|agy|codex> --name <n> ...   # 寫手實作＋複審（名單由 profile 決定）
-node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR
+node .agents/skills/llm-team/ticket.mjs accept --name <n> --caliber <docs|tool|feature> --q6 "<親驗證據>"   # 統整者坐實 Q6 後裁決；publish 只認這裡寫的 q6Receipt
+node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支、開 draft PR（沒 accept ⇒ exit 2）
 ```
 
 **為什麼分工。** 統整者（Claude Code／agy／codex 三種，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`／本檔）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
