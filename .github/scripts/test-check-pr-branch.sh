@@ -381,6 +381,8 @@ run 0 main governance/roadmap     "改 docs/ROADMAP.md"       sh -c 'mkdir -p do
 # （實測：把驗證方式寫進 prompts/05 的那個 PR 被擋在「夾帶產品程式碼或規格」，
 #  而它一行程式碼都沒動。）
 run 0 main governance/prompts     "改 prompts/"              sh -c 'mkdir -p prompts && echo "x" >> prompts/05-verify.md'
+# .claude/settings.json 是專案的 plugin 名單（enabledPlugins）：改它就是改每個 session 的固定前綴，走 governance。
+run 0 main governance/plugins     "改 .claude/settings.json" sh -c 'mkdir -p .claude && echo "{}" > .claude/settings.json'
 run 1 main governance/sneak-docs  "夾帶 docs/ 底下別的檔案"    sh -c 'mkdir -p docs && echo "x" > docs/RANDOM.md'
 run 1 main governance/sneak-code "夾帶產品程式碼"           sh -c 'mkdir -p src && echo a > src/a.ts'
 run 1 main governance/sneak-spec "動 changes/"            sh -c 'echo "x" >> openspec/changes/demo-change/proposal.md'

@@ -546,12 +546,13 @@ ARCHIVE_IDENTITY
     # 剩下的關係是「索引」，而索引是可以驗的。）
     #
     # `.claude/skills/` 也在清單裡：它跟 `prompts/` 一樣是給 LLM 的操作規則（模板出貨的一部分），改了它同屬改流程。`.agents/skills/` 同理（它是 agy 的 skill 位置，`.claude/skills/llm-team` 只是 symlink）。
+    # `.claude/settings.json` 也在：它決定這個 repo 的 session 載入哪些 plugin（enabledPlugins），是專案的執行環境設定；改它就是改每個 session 的固定前綴，該單獨被看到。
     #
     # 注意：這一關擋不住「在 PR 裡把 ci.yml 改成 run: true」。
     # 那個只有 CODEOWNERS + 第二個人的 review 擋得住。
     # 能機械擋的是 ruleset 的 workflows 規則，但那需要 org ruleset + Team 方案，
     # 這個 org 是 free。**不要以為這一關封住了它。**
-    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.claude/skills/|\.agents/skills/|llm-team\.config\.json$|\.gitignore$|AGENTS\.md|CLAUDE\.md|GEMINI\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|pnpm-lock\.yaml$|package-lock\.json$)' || true)"; [ -n "$OUT" ]; then
+    if OUT="$(echo "$CHANGED" | grep -vE '^(\.github/|\.claude/skills/|\.claude/settings\.json$|\.agents/skills/|llm-team\.config\.json$|\.gitignore$|AGENTS\.md|CLAUDE\.md|GEMINI\.md|README\.md|CONTEXT\.md|openspec/config\.yaml|openspec/README\.md|docs/adr/|docs/DECISIONS\.md$|docs/WBS\.md$|docs/ROADMAP\.md$|SETUP-GITHUB\.md$|prompts/|package\.json|pnpm-lock\.yaml$|package-lock\.json$)' || true)"; [ -n "$OUT" ]; then
       echo "✗ governance PR 只能改規則本身，不能夾帶產品程式碼或規格：" >&2
       echo "$OUT" | sed 's/^/    /' >&2
       exit 1
