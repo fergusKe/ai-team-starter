@@ -1408,7 +1408,8 @@ describe('export.mjs 快照導出與驗證測試', () => {
     test('(c) 舊快照（SOURCE.json.files 沒有它、目標目錄沒有 prompts/）再 export ⇒ 視為來源新增（sourceNew），不需要 --force', () => {
       const sourceDir = makeSourceDir()
       const targetRoot = tmpdir('target-repo-prompts-oldsnap-')
-      const oldExportFiles = EXPORT_FILES.filter((f) => f !== 'prompts/08-pr-review.md')
+      // 1.9.0 以前的快照整個 prompts/ 都不存在（1.10.0 又多了 07），模擬舊快照要把 prompts/ 全濾掉
+      const oldExportFiles = EXPORT_FILES.filter((f) => !f.startsWith('prompts/'))
 
       const res1 = exportTo(sourceDir, targetRoot, { deps: { git: fakeGit }, exportFiles: oldExportFiles })
       assert.equal(res1.ok, true)
@@ -1463,6 +1464,51 @@ describe('export.mjs 快照導出與驗證測試', () => {
       assert.notEqual(code, 0)
     })
   })
+
+  describe('1.10.0：統整者操作手冊 prompts/07-ticket.md 進快照（07 與 08 同一條路）', () => {
+    test('(a) export 後快照有 prompts/07-ticket.md、內容與真源逐位元組相同、MANIFEST／SOURCE.json.files 都有它', () => {
+      const sourceDir = makeSourceDir()
+      const realContent = fs.readFileSync(
+        fileURLToPath(new URL('./prompts/07-ticket.md', import.meta.url)),
+        'utf8'
+      )
+      fs.writeFileSync(path.join(sourceDir, 'prompts', '07-ticket.md'), realContent)
+
+      const targetRoot = tmpdir('target-repo-prompts07-')
+      const res = exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+      assert.equal(res.ok, true)
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      const targetFile = path.join(snapshotDir, 'prompts', '07-ticket.md')
+      assert.ok(fs.existsSync(targetFile), 'prompts/07-ticket.md 應存在於快照目錄')
+      assert.equal(fs.readFileSync(targetFile, 'utf8'), realContent, '內容應與真源逐位元組相同')
+
+      const expectedHash = crypto.createHash('sha256').update(realContent).digest('hex')
+      const manifest = fs.readFileSync(path.join(snapshotDir, 'MANIFEST.sha256'), 'utf8')
+      assert.ok(manifest.includes(`${expectedHash}  prompts/07-ticket.md`), 'MANIFEST 應有 prompts/07-ticket.md 那一行')
+
+      const sourceJson = JSON.parse(fs.readFileSync(path.join(snapshotDir, 'SOURCE.json'), 'utf8'))
+      assert.ok(sourceJson.files.includes('prompts/07-ticket.md'), 'SOURCE.json.files 應含 prompts/07-ticket.md')
+      assert.equal(verifySnapshot(snapshotDir).ok, true)
+    })
+
+    test('(b) 陽性對照：手改快照的 prompts/07-ticket.md ⇒ changed 含它、--sync-check exit 非 0', () => {
+      const sourceDir = makeSourceDir()
+      const targetRoot = tmpdir('target-repo-prompts07-drift-')
+      exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      fs.appendFileSync(path.join(snapshotDir, 'prompts', '07-ticket.md'), '!')
+
+      const v = verifySnapshot(snapshotDir)
+      assert.equal(v.ok, false)
+      assert.ok(v.changed.includes('prompts/07-ticket.md'), `changed 應含 prompts/07-ticket.md，實際：${JSON.stringify(v.changed)}`)
+      assert.notEqual(setupMain(['--sync-check'], { repoRoot: targetRoot }), 0)
+    })
+
+    test('(c) 真源 prompts/07-ticket.md 不得以「模板」為主詞描述快照或預設（它會 export 到每個 target）', () => {
+      const real = fs.readFileSync(fileURLToPath(new URL('./prompts/07-ticket.md', import.meta.url)), 'utf8')
+      assert.ok(!/模板只放|模板預設|模板專案/.test(real), '07 不得再以「模板」為主詞')
+    })
+  })
 })
-
-

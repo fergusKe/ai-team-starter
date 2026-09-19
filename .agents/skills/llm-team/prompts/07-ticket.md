@@ -86,8 +86,8 @@ node .agents/skills/llm-team/ticket.mjs run \
 node .agents/skills/llm-team/batch.mjs 'pnpm test tests/runner.test.ts' 'pnpm typecheck'
 
 # 4. 裁決：把 Q6 的證據寫進 summary.json；複審者「不簽」但查證為誤報的，用 --disposition 記下理由
-#    --caliber 是票的口徑（docs｜tool｜feature），給選配的用量量測分類用；目前快照版本（1.7.x）的 CLI 是必填，
-#    要不要啟用 cohort 量測由專案政策決定（見第四節）
+#    --caliber 是票的口徑（docs｜tool｜feature），給選配的用量量測分類用；1.8.0 起只在 usage.mode≠off 時必填，
+#    mode=off（預設）給了也收、不強制；要不要啟用 cohort 量測由專案政策決定（見第四節）
 node .agents/skills/llm-team/ticket.mjs accept \
   --name add-runner-check \
   --caliber feature \
@@ -121,13 +121,13 @@ node .agents/skills/llm-team/ticket.mjs publish \
 - **統整者用量是選配量測**，不是每票必做：`usage.mjs --ticket <n> --write` 從 Claude Code transcript 量出該票視窗內統整者的 API 呼叫數與 token
   （只有統整者是 Claude Code 才量得到；agy／codex 統整者記 `measurable:false`），`usage.mjs --cohort <口徑>` 拿同口徑的票做基線／窗比較。
   細節與門檻在快照 `SKILL.md`〈統整者呼叫預算〉。要不要啟用、結論怎麼留存，由專案政策決定；
-  模板預設**不啟用**——量出來的數字在 gitignore 的本機目錄，別人與 CI 都拿不到，單憑它不能當團隊層級的 pass／fail。
+  預設**不啟用**（`usage.mode` 預設 off）——量出來的數字在 gitignore 的本機目錄，別人與 CI 都拿不到，單憑它不能當團隊層級的 pass／fail。
 
 ---
 
 ## 五、跟真源對帳
  
-模板只放唯讀快照，以 manifest 驗證完整性：
+各專案只放唯讀快照（本檔也是快照的一部分，正本在真源 `prompts/07-ticket.md`），以 manifest 驗證完整性：
 ```bash
 node .agents/skills/llm-team/setup.mjs --sync-check
 ```

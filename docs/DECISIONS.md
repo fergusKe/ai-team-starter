@@ -1590,3 +1590,15 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 **下游要注意**：`cp` 不會傳播刪除。GuildHub 拿這一節時要**顯式刪掉**自己根目錄的 `prompts/08-pr-review.md`（#532 加的），否則留下一份無人維護的孤兒；它 `AGENTS.md` 同樣兩處改指快照路徑。web-agency-system 已經只讀快照（它從來沒有根目錄那份）。
 
 **過程**：codex（gpt-5.6-sol）與 Gemini（3.1 pro）一輪，同一份提示，三題全部一致（刪、不留指標、走 PR）；codex 補「合併前搜三個 repo 對根目錄 08 的引用」（搜過：模板只有 AGENTS 兩處、GuildHub 也只有 AGENTS 兩處，DECISIONS 裡的是史料不改）；Gemini 補「`cp` 不傳播刪除」。
+
+## 2026-09-19　`prompts/07` 也搬進 llm-team 真源（1.10.0）；根目錄那份刪掉，理由同 08
+
+**決定**：統整者操作手冊 `07-ticket.md` 從 llm-team 1.10.0 起是快照的一部分：正本住 config repo `home/skills/llm-team/prompts/07-ticket.md`，export 到各 repo 的 `.agents/skills/llm-team/prompts/07-ticket.md`，`setup.mjs --sync-check` 抓漂移，不准手改快照。模板根目錄 `prompts/07-ticket.md` **刪除**，`README.md` 一處改指快照路徑。`prompts/` 從此是 00–06；模板專屬的流程提示（00–06）留在根目錄不搬，因為它們寫的是這個模板的階段，不是 llm-team 的事。
+
+**為什麼要搬**：07 從頭到尾寫的是 `ticket.mjs`／`setup.mjs`／`batch.mjs`／`usage.mjs` 的用法與旗標，跟 llm-team 程式一起漂——`--caliber` 那條註記就漂了：程式 1.8.0 已改成「`usage.mode≠off` 才必填」，根目錄的 07 還寫「1.7.x 必填」，模板與 GuildHub 兩份都錯、沒有任何檢查抓得到。放進真源後改一次、三個 repo 的快照一起動，漂移由 manifest 抓。搬的時候只改三處事實（`--caliber` 註記、「模板預設不啟用」→「預設不啟用（`usage.mode` 預設 off）」、「模板只放唯讀快照」→「各專案只放…」），其餘逐位元組不動；真源 export.test 加一條「07 不得以『模板』為主詞」的字面檢查，因為它現在會 export 到每個 target。
+
+**來源**：使用者 09-19 決定 A（我直接改 config 真源，下游各開 PR）；config `44cfc60`，llm-team `test.sh` 9/9 綠，新字面檢查放回「模板只放」實測會紅。真源檔自本 repo `17080a5` 的 `prompts/07-ticket.md`（sha256 `78b14164…`）。
+
+**拒絕的替代**：根目錄留指標檔或 symlink——同 1.9.0 那節的理由，不重述。另一個是「不搬、維持模板→GuildHub 逐字複製」：這是治理文件的一般規則，但 07 的內容跟著 llm-team 程式版本走，程式的真源在 config repo，文件跟程式分家就是 `--caliber` 那種漂法。
+
+**下游要注意**：`cp` 不傳播刪除，GuildHub 要**顯式刪掉**根目錄 `prompts/07-ticket.md` 並改 `README.md` 那一處。web-agency-system 從來沒有根目錄的 07，它拉 1.10.0 快照時會多一個檔，`sync-check` 在它拉之前會報 `sourceNew`，不是漂移。
