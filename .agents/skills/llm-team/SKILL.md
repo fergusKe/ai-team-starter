@@ -55,7 +55,7 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 ## 統整者呼叫預算
 
 - **為什麼**：統整者每次工具呼叫＝一次帶完整 context 的 API 呼叫（實測 100–170k token／次）；省的是**次數**，不是每次的字。
-- **規則**：
+- **規則**（票內的 context 節食五條在快照 `prompts/07-ticket.md`〈六〉，這裡不重複）：
   - ① **不輪詢**：長任務背景跑、用通知或 until-loop 一次等完。
   - ② **收貨固定步驟**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）→ `node .agents/skills/llm-team/ticket.mjs accept --name <票> --caliber <口徑> --q6 "<收據>"` → `node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。**accept 不需要跑 usage.mjs**（見下方「量測（usage.mode）」）。
   - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。

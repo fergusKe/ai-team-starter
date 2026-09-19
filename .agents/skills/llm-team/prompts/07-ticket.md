@@ -125,6 +125,18 @@ node .agents/skills/llm-team/ticket.mjs publish \
 
 ---
 
+## 六、統整者 context 節食（票內）
+
+每次工具呼叫都是一次帶完整 context 的 API 呼叫（實測 100–170k token／次），cache 只在同一個 session、同一個模型設定下連續才命中。票內要守的五條：
+
+1. **長輸出不進主對話**：測試、lint、build 這類會噴幾百行的，交給 subagent 或 `batch.mjs`（它只印摘要，前 8＋後 20 行）；主對話只讀結論段。
+2. **外部模型回覆先落檔**：codex／Gemini 的回覆寫到 `.local/llm-team/<n>/` 下的檔案，主對話只讀結論段，不把整份貼進來。
+3. **`/compact` 只在票與票之間**：票中 compact 會把正在對照的行號、旗標、收據壓成摘要，Q6 親驗就要重讀一次。
+4. **票中不切模型、effort、fast mode**：三個之中換任何一個都打掉整個 cache，下一次呼叫全額重寫。要換，先 `accept` 或明確棄票再換。
+5. **一個 worktree 用同一個連續 session 做完**：每個 worktree 一次初始冷 miss 是接受的成本；票中換 session、換目錄就是可避免的 miss。
+
+**怎麼量**（`usage.mode≠off` 時才有數字）：`usage.mjs --ticket <n> --write` 產生的 `usage.json` 有該票統整者的 `apiCalls` 與 input／cacheCreation／cacheRead 總量；每次呼叫的平均 context ＝（input＋cacheCreation＋cacheRead）／apiCalls。它算的是**平均**不是中位數，要中位數得從 transcript 逐次算，沒做之前別寫「中位數」。票中有沒有切換靠自己記在 summary 的 `--disposition` 或 handoff，工具量不到。
+
 ## 五、跟真源對帳
  
 各專案只放唯讀快照（本檔也是快照的一部分，正本在真源 `prompts/07-ticket.md`），以 manifest 驗證完整性：
