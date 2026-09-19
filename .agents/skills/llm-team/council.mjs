@@ -2,7 +2,11 @@
 // ─────────────────── 規劃／複審會議（依統整者 profile 派複審者） ───────────────────
 // 用法（`--coordinator` 必帶，或設 env LLM_TEAM_COORDINATOR）：
 //   規劃：node .agents/skills/llm-team/council.mjs plan   --coordinator <claude|agy|codex> --prompt <file> --out <dir> [--tier standard|block] [--config <file>]
-//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--writer-report <file>] [--review-only] [--config <file>]
+//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--writer-report <file>] [--review-only] [--diff-cap <字元數>] [--config <file>]
+// 🔴 1.12.0 diff 不截斷（codex＋Gemini 兩輪一致選 B）：截斷的 diff 上「簽」不是整份簽核，一行警告修不了 overall=簽 的語意。
+//   超過 --diff-cap（預設 120000 字元＝完整送審上限）⇒ 在呼叫複審者【之前】停：members.json 寫 []、input.json 記 diff_over_cap、回 6。
+//   下一步是拆票，或確認後 --diff-cap N 重跑（N 入帳：input.json capOverridden、summary、收貨摘要都印）。
+//   每次 review 都寫 review/input.json（diffLength、diffCap、capOverridden、reviewInvoked、writerReport 截斷）；舊快照沒這檔＝unknown，不是「沒截斷」。
 //
 // 🔴 2026-09-14 三方定案（schema v2）：
 //   · 成員名單來自 config.profiles.<coordinator>：一般票 reviewers、block 票 blockReviewers（沒有 --codex 旗標、沒有 codexTier）。
@@ -226,17 +230,43 @@ export async function main(argv, deps = {}) {
     for (const f of untrackedFiles) {
       diff += `\n--- /dev/null\n+++ b/${f}\n` + fs.readFileSync(path.join(cwd, f), 'utf8').split('\n').map((l) => '+' + l).join('\n')
     }
-    const cap = Number(a['diff-cap'] || 120000)
-    if (diff.length > cap) diff = diff.slice(0, cap) + `\n…（截斷，原長 ${diff.length} 字元）`
+    const DEFAULT_DIFF_CAP = 120000
+    const cap = Number(a['diff-cap'] || DEFAULT_DIFF_CAP)
+    if (!Number.isInteger(cap) || cap <= 0) {
+      console.error(`🔴 --diff-cap 要是正整數字元數，不是「${a['diff-cap']}」`)
+      return 2
+    }
     let writerReport = null
+    let writerReportTruncated = null
     if (a['writer-report']) {
       const rawReport = fs.readFileSync(a['writer-report'], 'utf8')
       const reportCap = 20000
       if (rawReport.length > reportCap) {
         writerReport = rawReport.slice(0, reportCap) + `\n…（截斷，原長 ${rawReport.length} 字元）`
+        writerReportTruncated = { originalLength: rawReport.length, cap: reportCap }
       } else {
         writerReport = rawReport
       }
+    }
+    // review/input.json：複審者到底看了什麼。長度是 JS String.length（UTF-16 code unit），不是 byte 也不是嚴格字元數。
+    const inputInfo = {
+      schemaVersion: 1,
+      diffLength: diff.length,
+      diffCap: cap,
+      defaultDiffCap: DEFAULT_DIFF_CAP,
+      capOverridden: cap !== DEFAULT_DIFF_CAP,
+      reviewInvoked: diff.length <= cap,
+      status: diff.length <= cap ? 'ok' : 'diff_over_cap',
+      writerReportTruncated,
+    }
+    fs.writeFileSync(path.join(outDir, 'input.json'), JSON.stringify(inputInfo, null, 2))
+    if (!inputInfo.reviewInvoked) {
+      fs.writeFileSync(path.join(outDir, 'members.json'), '[]')
+      console.error(
+        `🔴 diff ${diff.length} 字元超過完整送審上限 ${cap}（--diff-cap）——複審者沒有被呼叫，這張票沒有複審。` +
+          `下一步：拆票；或確認過內容後 --diff-cap ${diff.length} 重跑（會入帳、收貨摘要會印）。`
+      )
+      return 6
     }
     prompt = buildReviewPrompt({
       brief: fs.readFileSync(a.brief, 'utf8'),

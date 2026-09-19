@@ -56,6 +56,7 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 
 - **為什麼**：統整者每次工具呼叫＝一次帶完整 context 的 API 呼叫（實測 100–170k token／次）；省的是**次數**，不是每次的字。
 - **規則**（票內的 context 節食五條在快照 `prompts/07-ticket.md`〈六〉，這裡不重複）：
+  - ⓪ **複審者到底看了什麼，收貨摘要會講**（1.12.0）：diff 超過完整送審上限（預設 120000 字元）⇒ council 不呼叫複審者、回 6、摘要印「🔴 沒有複審」——拆票，或確認後 `ticket run --diff-cap N`（N 入帳、摘要印 ⚠）。diff 不再截斷：截斷的 diff 上「簽」不是整份簽核。agy 的 prompt 走 stream-json stdin，沒有命令列長度上限。
   - ① **不輪詢**：長任務背景跑、用通知或 until-loop 一次等完。
   - ② **收貨固定步驟**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）→ `node .agents/skills/llm-team/ticket.mjs accept --name <票> --caliber <口徑> --q6 "<收據>"` → `node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。**accept 不需要跑 usage.mjs**（見下方「量測（usage.mode）」）。
   - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。

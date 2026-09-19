@@ -133,6 +133,18 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
   if (summary.review?.exit !== undefined && summary.review?.exit !== null) {
     lines.push(`🔴 council exit=${summary.review.exit}`)
   }
+  // 1.12.0：複審者到底看了什麼——沒被呼叫要講、cap 被提高要講、writer-report 被截要講；舊 summary 沒有 input 就不印（unknown）。
+  const inp = summary.review?.input
+  if (inp && typeof inp === 'object') {
+    if (inp.reviewInvoked === false) {
+      lines.push(`🔴 沒有複審：diff ${inp.diffLength} 字元 > 完整送審上限 ${inp.diffCap}，複審者沒有被呼叫。拆票，或確認後 ticket run --diff-cap ${inp.diffLength} 重跑`)
+    } else if (inp.capOverridden === true) {
+      lines.push(`⚠ 本票 diff cap 由 ${inp.defaultDiffCap} 提高至 ${inp.diffCap}；完整送審 ${inp.diffLength} 字元`)
+    }
+    if (inp.writerReportTruncated) {
+      lines.push(`⚠ writer-report 截斷 ${inp.writerReportTruncated.cap}/${inp.writerReportTruncated.originalLength} 字元（複審者沒看完寫手回報）`)
+    }
+  }
 
   for (const m of reviewMembers) {
     lines.push(...formatReviewerSummary(m))
@@ -677,6 +689,7 @@ export async function main(argv, deps = {}) {
       if (reviewOnly) councilArgs.push('--review-only')
       if (writerReportPath && !reviewOnly) councilArgs.push('--writer-report', writerReportPath)
       if (configFile) councilArgs.push('--config', configFile)
+      if (a['diff-cap'] !== undefined) councilArgs.push('--diff-cap', String(a['diff-cap']))
       councilExit = await councilMainFn(councilArgs, deps)
     }
 
@@ -750,6 +763,17 @@ export async function main(argv, deps = {}) {
       }
       if (councilExit !== null && councilExit !== 0 && councilExit !== 3) {
         reviewObj.exit = councilExit
+      }
+      // 1.12.0：council 的 review/input.json（diff 長度／cap／有沒有真的呼叫複審者／writer-report 截斷）。
+      // 缺檔（舊 council）⇒ null＝unknown；有檔就原樣帶，收貨摘要照它印。
+      const inputFile = path.join(reviewOutDir, 'input.json')
+      reviewObj.input = null
+      if (fs.existsSync(inputFile)) {
+        try {
+          reviewObj.input = JSON.parse(fs.readFileSync(inputFile, 'utf8'))
+        } catch {
+          reviewObj.input = null
+        }
       }
     }
 
