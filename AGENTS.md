@@ -404,7 +404,7 @@ node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支
 **為什麼分工。** 統整者（Claude Code／agy／codex 三種，看你從哪個 CLI 進來：`CLAUDE.md`／`GEMINI.md`／本檔）回合數寶貴，把目標明確、≤ 5 檔的葉子票交給便宜模型
 動手寫，再由獨立模型複審。**寫手與複審名單只住 `llm-team.config.json` 的 `profiles.<統整者>`**（schema v2；本檔不寫死模型名；統整者與複審者不同額度桶、統整者不在自己票的名單、`claude` 只准當統整者——這些是 config 載入時機械驗的不變式，違反就拒開票）。`agy`／`codex` profile 是「Claude 額度用完」時的備用模式，名單只剩另一桶、裁決交人；`codex` 只做短票。省的是統整者回合，
 作者≠審核者避免「自己寫自己審」的盲區。
-**角色哨兵（本檔也會被 `council.mjs` 叫起的 codex 無頭複審者讀到）**：提示第一行是 `【llm-team 複審票】`／`【llm-team 規劃】` ⇒ 你是複審者／裁決者，只答提示裡的 Q 題（異議格式 `<ID> [BLOCK|PROC|NIT]`），不必讀本檔其餘段落。
+**角色哨兵（本檔也會被 `council.mjs` 叫起的 codex 無頭複審者讀到）**：提示第一行是 `【llm-team 複審票】`／`【llm-team 規劃】` ⇒ 你是複審者／裁決者，只答提示裡的 Q 題（異議格式 `<ID> [BLOCK|PROC|NIT]`），不必讀本檔其餘段落。提示第一行是 `【外部 PR 審查】` ⇒ 你是外部 PR 審查者，只依 `prompts/08-pr-review.md` 審查並輸出它的固定格式；不修改檔案、不自行發起下一輪。
 **codex 當統整者**：`codex -m <model> -c model_reasoning_effort="medium" --sandbox workspace-write -c 'sandbox_workspace_write.network_access=true'`（全域 config 維持 read-only、不用 danger-full-access）；守門走 `~/.codex/hooks.json` → 快照 `codex-pretooluse.sh`（`setup --check --coordinator codex` 對帳＋deny canary；hooks.json 要在互動 session 信任一次才載入，開工先在可拋棄目錄做一次 canary）。
 
 **寫手 wrapper 的自我約束（G1–G6 各擋什麼）。**
@@ -419,6 +419,16 @@ node .agents/skills/llm-team/ticket.mjs publish --name <n>  # 提交、推分支
 產物與台帳在 `.local/llm-team/`。
 「不簽」不是紅燈，是統整者要讀的訊息；統整者必須親自開檔坐實每位審查者的 Q6，
 無誤才觸發 `publish`，永不自動 merge，最終由人核准合併。
+
+### 外部 PR 審查（**可選；預設不送**）
+
+**預設不送外審。** 統整者自己做、自己驗，repo 的機器閘門（CI、分支閘、scenario coverage、突變測試）
+就是完成的定義；統整者對**具體問題**不確定時才詢問外部模型。若那個問題是 PR／diff 審查，
+用 `prompts/08-pr-review.md`（人要做的事在它頂端的框裡：送什麼、怎麼停、貼到 PR）；
+架構取捨、需求歧義這類問題直接問，不套 08、不貼留言。
+**模型的結論是建議，不是合併權**；不進 `archive-review` 帳本、不是流程圖上的一步。
+08 只管「送了怎麼停」：第一輪沒有 material finding 就停，有就只回審一次，還有爭議交人 ——
+**沒有第三輪**。為什麼要有這條煞車、為什麼不是每個 PR 都送：`docs/DECISIONS.md`〈2026-09-19　外部 PR 審查是例外〉。
 
 ### CI 的 workflow 檢查
 
