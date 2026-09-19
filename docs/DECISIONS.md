@@ -1574,3 +1574,19 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 - 不合規的樣本（缺驗法、沒交人、模型沒答完）只證明流程沒被執行，不能拿來推翻設計。
 
 **過程**：codex（gpt-5.6-sol）與 Gemini（3.1 pro）各兩輪，同一份提示。第一輪四題結論一致（一次回審維持、終止依據改驗法、單一 change、校準用既有 TRIAL_N=10）；codex 修正了 Gemini 對帳本 `ok` 欄位的誤讀（`ok` 是「這一輪答完整」，不是「主導者承認錯了」）並指出沒有 category 欄位就算不了「某一類」。第二輪兩邊對整合版 A～D 全部同意；codex 補了「`--judge 已修` 必須是修前重現＋修後過」。
+
+## 2026-09-19　`prompts/08` 的正本搬進 llm-team 真源（1.9.0）；模板根目錄那份刪掉，不留指標
+
+**決定**：外部 PR 審查的提示 `08-pr-review.md` 從 llm-team 1.9.0 起是快照的一部分：正本住 config repo `home/skills/llm-team/prompts/08-pr-review.md`，`export.mjs --all` 輸出到各 repo 的 `.agents/skills/llm-team/prompts/08-pr-review.md`，`setup.mjs --sync-check` 抓漂移，不准手改快照。模板根目錄 `prompts/08-pr-review.md`（#32 加的）**刪除**，`AGENTS.md` 角色哨兵與〈外部 PR 審查〉兩處改指快照路徑。`prompts/` 從此是 00–07；`07-ticket.md` 這次不動。以後改 08 的規則：改 config repo 真源 → bump llm-team `VERSION` → `export --all`，不在任何 target repo 直接改。
+
+**來源**：使用者 09-19 裁決「三個 repo 的複審規則只維護一份」（web-agency-system session 開的票，llm-team 1.9.0，config `52959bf`，sol 一輪 material=0）。export 之後模板同時有根目錄與快照兩份逐位元組相同的 08（sha256 `27733eb7…`）——兩份一樣只是今天一樣，下次真源改了快照會動、根目錄不會。
+
+**拒絕的替代**：
+
+1. **根目錄改成指標檔**（一段話指向快照）：用 08 的方式是把檔案內容原樣接在 diff 前送給模型；有人照舊 `cat prompts/08-pr-review.md` 就把指標文字送出去，模型看不到第一行 `【外部 PR 審查】`、不進審查者角色，**靜默失敗**。刪掉之後同一個操作是「檔案不存在」，響亮、會逼人去看 AGENTS。
+2. **根目錄改成 symlink**：GitHub Raw、Windows 沒開 symlink 的 checkout、`cp` 逐字拿的下游都可能只拿到連結文字，同一種靜默失敗；下游 `cp` 過去還會變成實體檔，重新製造第二份真相。
+3. **eedd158 直接 push main**：GitHub 上目前沒有 ruleset，技術上推得上去；但 #32／#33 都走 PR＋CI，`prompts/` 與 `.agents/skills/` 又在 `check-pr-branch.sh` 的 governance 清單，繞過去就是拿 ruleset 的空缺當授權。走 `governance/llm-team-1.9.0`。
+
+**下游要注意**：`cp` 不會傳播刪除。GuildHub 拿這一節時要**顯式刪掉**自己根目錄的 `prompts/08-pr-review.md`（#532 加的），否則留下一份無人維護的孤兒；它 `AGENTS.md` 同樣兩處改指快照路徑。web-agency-system 已經只讀快照（它從來沒有根目錄那份）。
+
+**過程**：codex（gpt-5.6-sol）與 Gemini（3.1 pro）一輪，同一份提示，三題全部一致（刪、不留指標、走 PR）；codex 補「合併前搜三個 repo 對根目錄 08 的引用」（搜過：模板只有 AGENTS 兩處、GuildHub 也只有 AGENTS 兩處，DECISIONS 裡的是史料不改）；Gemini 補「`cp` 不傳播刪除」。
