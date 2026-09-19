@@ -90,7 +90,7 @@ node .agents/skills/llm-team/setup.mjs --check --coordinator claude   # 你會�
 `.claude/settings.json` 的 plugin 名單要照**這個專案**重判（模板關的 10 個是模板的判斷，不是你的；plugin 的安裝與服務登入也不會跟著 repo 來），
 以及新專案要登記進真源的 `targets.json`，`export.mjs --all` 才會配送 `llm-team` 快照的更新。
 
-多模型分工：三種統整者各一組名單，住 `llm-team.config.json` `profiles`；票流程見 `prompts/07-ticket.md`。
+多模型分工：三種統整者各一組名單，住 `llm-team.config.json` `profiles`；票流程見 `.agents/skills/llm-team/prompts/07-ticket.md`（llm-team 快照，正本在 config repo 真源）。
 
 日常操作一律 `pnpm exec openspec ...`，**不需要設定任何環境變數**。
 

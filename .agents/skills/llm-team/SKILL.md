@@ -49,7 +49,7 @@ publish 對舊 summary（≠ 2）直接擋，要求名單**全員到齊**（三�
 - `codex` profile 只做短票：≤ 5 檔、可逆、非風險域（`riskDomains`）。
 - `agy`／`codex` profile 只在 Claude 額度用完時使用 ⇒ 名單只有 agy＋codex 兩桶，一般票裁決交 Fergus。
 
-brief 五段：①目標（含使用者真實踩到的情境）②只准動的檔案③事實（行號、既有測試怎麼 mock）④要做的事（編號）⑤驗收指令與回報格式；模板專案另有 `prompts/07-ticket.md` 長版。**陽性對照由統整者 Q6 親跑，brief 不要求寫手做**（2026-09-16 council：三次逾時都死在寫手做陽性對照那一步、暫改沒還原）；brief 要寫的是『拿掉哪段修法、哪條斷言該紅』讓複審者能對照 diff。
+brief 五段：①目標（含使用者真實踩到的情境）②只准動的檔案③事實（行號、既有測試怎麼 mock）④要做的事（編號）⑤驗收指令與回報格式；長版在快照 `prompts/07-ticket.md`（統整者操作手冊）。**陽性對照由統整者 Q6 親跑，brief 不要求寫手做**（2026-09-16 council：三次逾時都死在寫手做陽性對照那一步、暫改沒還原）；brief 要寫的是『拿掉哪段修法、哪條斷言該紅』讓複審者能對照 diff。
 🔴 brief 裡給寫手的指令一律放 inline code span 或 bash fence——`ticket.mjs run` 會用 allow regex 預檢這兩處（只檢以准許指令頭開頭的），不合規 ⇒ exit 2 不派工；規則同寫手執行期：引數不准含 ; & | < > ` $（引號內也算），管線只准接在准許指令頭之間。統整者自己要跑的指令（pnpm、bash…）不以准許頭開頭，不在射程；要舉不合規的反例，span 內前面加「反例：」讓它不以指令頭開頭。占位符不要寫尖括號（會被當成 < >），寫 FILE。
 
 ## 統整者呼叫預算
@@ -86,7 +86,7 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 
 真源在 fergus-claude-config `home/skills/llm-team/`，專案裡是快照，改程式回真源改、跑 `node ~/.claude/skills/llm-team/export.mjs --to <專案根>`，`setup --sync-check` 驗 manifest；真源新增檔不算漂移（export 時自動歸為 sourceNew 同步過去，只有目標目錄已存在同名檔但未入 manifest 才是手動漂移 unlisted）。
 
-共用流程規則（例如複審規則）也是快照的一部分，正本住 `prompts/`（如 `prompts/08-pr-review.md`）——與專案無關的散文只在真源改一次，各專案的規則文件只留指標與各自的專案專屬對映；改規則一律回真源改再 `export`，不准在各 repo 手改快照裡的 `prompts/`。
+共用流程規則（例如複審規則）也是快照的一部分，正本住 `prompts/`（如 `prompts/07-ticket.md`、`prompts/08-pr-review.md`）——與專案無關的散文只在真源改一次，各專案的規則文件只留指標與各自的專案專屬對映；改規則一律回真源改再 `export`，不准在各 repo 手改快照裡的 `prompts/`。
 
 ### 版本同步（改一處全專案生效）
 

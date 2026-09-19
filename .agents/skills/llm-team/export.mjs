@@ -27,6 +27,7 @@ export function stripJsComments(src) {
 
 export const EXPORT_FILES = [
   // 共用流程規則 prompts 也是快照的一部分，正本在此（真源＋快照機制，各 target repo 不准手改）
+  'prompts/07-ticket.md',
   'prompts/08-pr-review.md',
   'lib.mjs',
   'write.mjs',
