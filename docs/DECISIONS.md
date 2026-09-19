@@ -1602,3 +1602,16 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 **拒絕的替代**：根目錄留指標檔或 symlink——同 1.9.0 那節的理由，不重述。另一個是「不搬、維持模板→GuildHub 逐字複製」：這是治理文件的一般規則，但 07 的內容跟著 llm-team 程式版本走，程式的真源在 config repo，文件跟程式分家就是 `--caliber` 那種漂法。
 
 **下游要注意**：`cp` 不傳播刪除，GuildHub 要**顯式刪掉**根目錄 `prompts/07-ticket.md` 並改 `README.md` 那一處。web-agency-system 從來沒有根目錄的 07，它拉 1.10.0 快照時會多一個檔，`sync-check` 在它拉之前會報 `sourceNew`，不是漂移。
+
+## 2026-09-19　統整者 context 節食五條寫進真源 `prompts/07`（llm-team 1.11.0）；基線 0 票，停止條件改用絕對值
+
+**決定**：09-17 節「延後（有期限）」那條在 10-01 前開始做：五條規則（長輸出進 subagent／`batch.mjs`；codex／Gemini 回覆先落檔、主對話只讀結論段；`/compact` 只在票與票之間；票中不切模型／effort／fast mode；一個 worktree 一個連續 session）寫進 llm-team 真源 `prompts/07-ticket.md` 新的〈六〉，config `032cdb2`，三個 repo 靠快照一起拿。SKILL.md〈統整者呼叫預算〉只加一句指標，不重複。
+
+**停止條件要改，因為做前的基線不存在**：09-17 寫的是「做前後各 ≥5 張同類票，context 中位數 −30%」。實際盤點：模板與 GuildHub 的 `.local/llm-team/` 裡 **0 個 `usage.json`**（`usage.mode` 預設 off，沒人開過），沒有「做前」可比；而且 `usage.mjs` 目前只給每票總量，算得出每次呼叫的**平均** context，算不出中位數。所以改成只用不需要基線的絕對值：
+- 開 `usage.mode=cohort`、`accept` 帶 `--caliber`，累 ≥5 張同口徑票後看 `usage.json`：每票（input＋cacheCreation＋cacheRead）／apiCalls **≤100k**；票中 compact／模型／effort 切換 **0**（自報，工具量不到）；可避免的 cache miss **0**（`/usage` 的 Prompt cache 行）。
+- 五票後平均 context 仍 >100k ⇒ 停止加文字規則，改追大輸出來源（哪個工具呼叫在噴），這一條跟 09-17 一致。
+- 「−30%」這種相對值等有了五票基線、且 `usage.mjs` 能逐次算中位數之後再談；在那之前任何「中位數降了」的說法都是沒尺的宣稱。
+
+**沒做的**：沒加測試——「07 有〈六〉這個標題」是空殼就能過的閘門，export 機制本身 1.10.0 已有測試。
+
+**下游要注意**：純快照更新，根目錄沒有東西要刪；GuildHub 逐字拿本節。web-agency-system 沒拉 1.11.0 前 `sync-check` 報 `sourceNew`，不是漂移。
