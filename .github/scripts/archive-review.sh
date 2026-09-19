@@ -4,7 +4,7 @@
 #   bash .github/scripts/archive-review.sh <change-id>                    第一輪：bundle → 兩個模型平行 → 結果＋帳本
 #   bash .github/scripts/archive-review.sh <change-id> --rereview         第二輪（**只准一次**）：修正後的 diff 對上一輪的「需修正」
 #   bash .github/scripts/archive-review.sh <change-id> --judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]
-#                                                                         已修 ＝ 重現了、修了、而且那個模型回審過（要有 r2）
+#                                                                         已修 ＝ 修前重現得到、修後驗法達到預期、而且那個模型回審過（要有 r2）
 #   bash .github/scripts/archive-review.sh --report                       帳本結算：升阻塞的條件成不成立
 #
 # 為什麼有這支：當一個 change 的每個 slice 都由同一個作者（人或 agent）寫、同一個人合併，單一 slice 的 PR review
@@ -29,7 +29,7 @@ set -euo pipefail
 
 # ── 升阻塞的條件（唯一定義處；改這裡，report 會印出來） ──────────────────────────────────────────
 TRIAL_N=10          # 試驗樣本：最早的 N 個「兩個模型都回答了」的 change，之後的不算（樣本凍結，不能一直跑到成立為止）
-MIN_VERIFIED=2      # 樣本內，經人工判定「已修」（重現了、修了、回審過）的需修正 ≥ 這個數；「已驗證」只算真陽性，不算這個
+MIN_VERIFIED=2      # 樣本內，經人工判定「已修」（修前重現得到、修後驗法達到預期、回審過）的需修正 ≥ 這個數；「已驗證」只算真陽性，不算這個
 MAX_FP=20           # 樣本內，人工判定的誤報率 ≤ 這個百分比；**任何一條需修正還沒判定，就不能下結論**
 MAX_WAIT_P90=1200   # 樣本內，每個 change 的等待（兩個模型裡慢的那個）P90 ≤ 這個秒數（nearest-rank）
 
@@ -200,7 +200,7 @@ DIR=".local/archive-review/$ID"
 if [ "${1:-}" = "--judge" ]; then
   [ $# -ge 4 ] || { echo "用法：--judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]" >&2; exit 2; }
   case "$2" in codex|gemini) ;; *) echo "模型只能是 codex 或 gemini" >&2; exit 2;; esac
-  case "$4" in 誤報|已驗證|已修) ;; *) echo "判定只能是 誤報、已驗證（重現了但還沒修）或 已修（重現了、修了、回審過）" >&2; exit 2;; esac
+  case "$4" in 誤報|已驗證|已修) ;; *) echo "判定只能是 誤報、已驗證（重現了但還沒修）或 已修（修前重現得到、修後驗法達到預期、回審過）" >&2; exit 2;; esac
   [[ "$3" =~ ^[1-9][0-9]*$ ]] || { echo "✗ 第幾條要是正整數（1、2、3…），不是「$3」" >&2; exit 2; }   # 「01」會繞過「判過了」的檢查
   # 「已修」是升阻塞數的那個 —— 要有證據：那個模型第二輪**算數**（帳本 ok）而且**對這一條**寫了「已修」。
   # 第二輪 bundle 把上一輪的需修正逐條編號（codex 的在前、gemini 的在後），模型照編號答；這裡查對應那一號。
