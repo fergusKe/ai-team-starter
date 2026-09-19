@@ -26,6 +26,8 @@ export function stripJsComments(src) {
 }
 
 export const EXPORT_FILES = [
+  // 共用流程規則 prompts 也是快照的一部分，正本在此（真源＋快照機制，各 target repo 不准手改）
+  'prompts/08-pr-review.md',
   'lib.mjs',
   'write.mjs',
   'council.mjs',
@@ -317,10 +319,11 @@ export function exportTo(sourceDir, targetRoot, options = {}) {
 
   fs.mkdirSync(targetDir, { recursive: true })
 
-  // 1. 複製 EXPORT_FILES
+  // 1. 複製 EXPORT_FILES（子目錄路徑如 prompts/08-pr-review.md 要先建目錄，copyFileSync 不會自動建）
   for (const f of exportFiles) {
     const src = path.join(sourceDir, f)
     const dst = path.join(targetDir, f)
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
     fs.copyFileSync(src, dst)
   }
 
