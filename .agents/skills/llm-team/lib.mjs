@@ -669,7 +669,13 @@ export function buildSpawnEnv(env = process.env) {
 }
 
 /** 組裝 agy 呼叫引數。包含 --print-timeout（避免預設 5m 超時導致 partial output 零輸出）。 */
-export function buildAgyArgs({ model, mode, prompt, timeoutMs = 10 * 60 * 1000, extraArgs = [] }) {
+// 🔴 1.12.0：prompt 不再放 argv（`-p <prompt>`），改走 stream-json stdin（buildAgyStdin）。
+//   理由：argv 有平台上限（Linux 單一參數 128 KiB；macOS ARG_MAX 1 MiB 含 env），archive-review.sh 2026-09-19 事故就是拿 110 KB
+//   上限擋 change 又不入帳。實測 384 KB prompt 走 stdin 成功（plan 模式）；accept-edits 下 stdin 與 -p 行為相同。
+//   `--print=`（空值）是 agy 的要求：`--print` 沒帶值會把下一個 flag 當 prompt 吃掉；spawn 不經 shell，所以是 `--print=` 不是 `--print=''`。
+//   `--disable-slash-commands`：實測 stream-json 輸入不會展開開頭的 `/plan`，加著是防禦、行為不變。
+//   陽性對照 llm-team.test.mjs「1.12.0 agy stdin」：args 不含 prompt 也不含 -p；input 解析回原文。
+export function buildAgyArgs({ model, mode, timeoutMs = 10 * 60 * 1000, extraArgs = [] }) {
   const printTimeout = `${Math.max(1, Math.ceil(timeoutMs / 60000))}m`
   return [
     '--model',
@@ -680,10 +686,17 @@ export function buildAgyArgs({ model, mode, prompt, timeoutMs = 10 * 60 * 1000, 
     printTimeout,
     '--output-format',
     'stream-json',
+    '--input-format',
+    'stream-json',
+    '--disable-slash-commands',
     ...extraArgs,
-    '-p',
-    prompt,
+    '--print=',
   ]
+}
+
+/** stream-json stdin 的唯一一行：{"event":"user","message":{"role":"user","content":<prompt>}}＋換行。JSON.stringify 編碼換行、引號、反斜線。 */
+export function buildAgyStdin(prompt) {
+  return JSON.stringify({ event: 'user', message: { role: 'user', content: String(prompt) } }) + '\n'
 }
 
 /**
@@ -715,6 +728,13 @@ export function spawnAsync(bin, args = [], opts = {}) {
 
     let stdout = ''
     let stderr = ''
+    // opts.input：一次 end(payload) 餵 stdin（1.12.0 agy prompt 走 stdin）。子行程先退 ⇒ EPIPE 只記一行 stderr，不變成未捕捉例外。
+    if (opts.input !== undefined && child.stdin) {
+      child.stdin.on('error', (err) => {
+        stderr += `\n[spawnAsync] stdin error: ${err && err.code ? err.code : err}\n`
+      })
+      child.stdin.end(opts.input)
+    }
     let stdoutTruncated = false
     let stderrTruncated = false
     let timedOut = false
@@ -849,20 +869,21 @@ export function runAgy({
 }) {
   const bin = resolveAgyBin(env)
   if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
-  const args = buildAgyArgs({ model, mode, prompt, timeoutMs, extraArgs })
+  const args = buildAgyArgs({ model, mode, timeoutMs, extraArgs })
   const r = spawn(bin, args, {
     cwd,
     env: cleanGitEnv(env),
     encoding: 'utf8',
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    input: buildAgyStdin(prompt),
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
   return parseAgyRun(r)
 }
 
 /**
- * 跑一次 agy headless（非同步版）。
+ * 跑一次 agy headless（非同步版）。prompt 走 stdin（spawnAsync 的 opts.input：一次 end(payload)，EPIPE 記進 stderr 不炸）。
  */
 export async function runAgyAsync({
   model,
@@ -876,14 +897,15 @@ export async function runAgyAsync({
 }) {
   const bin = resolveAgyBin(env)
   if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
-  const args = buildAgyArgs({ model, mode, prompt, timeoutMs, extraArgs })
+  const args = buildAgyArgs({ model, mode, timeoutMs, extraArgs })
   const r = await spawn(bin, args, {
     cwd,
     env: cleanGitEnv(env),
     encoding: 'utf8',
     timeout: timeoutMs,
     maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    input: buildAgyStdin(prompt),
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
   return parseAgyRun(r)
 }

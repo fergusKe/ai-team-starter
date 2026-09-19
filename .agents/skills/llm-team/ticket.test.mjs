@@ -6962,4 +6962,67 @@ describe('setup.mjs 設定對帳測試', () => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.12.0：council 的 review/input.json → summary.review.input → 收貨摘要那一行（三段各自有斷言）
+// 陽性對照：ticket.mjs 拿掉「reviewObj.input = …」⇒ (a)(b) 紅；拿掉收貨摘要那段 ⇒ (a) 的「🔴 沒有複審」與 (c) 的 ⚠ 紅。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('1.12.0 ticket：複審者到底看了什麼要印在收貨摘要', () => {
+  async function runTicket(name, councilImpl, extra = []) {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md'); fs.writeFileSync(briefFile, '# 票\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+    let councilArgs = null
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => { fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello\n'); return 0 },
+      councilMain: (args) => { councilArgs = args; return councilImpl(reviewOutDir) },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const outs = []; const origLog = console.log; console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['run', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'hello.txt', '--test', 'true', ...extra], deps)
+    } finally { console.log = origLog }
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', name, 'summary.json'), 'utf8'))
+    return { code, summary, out: outs.join('\n'), councilArgs }
+  }
 
+  test('(a) council 回 6（diff 超過 cap，members.json []、input.json diff_over_cap）⇒ run 非 0、summary.review.input 原樣、收貨摘要印「🔴 沒有複審」含長度、cap 與 --diff-cap 重跑指引', async () => {
+    const r = await runTicket('cap1', (dir) => {
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'members.json'), '[]')
+      fs.writeFileSync(path.join(dir, 'input.json'), JSON.stringify({ schemaVersion: 1, diffLength: 187432, diffCap: 120000, defaultDiffCap: 120000, capOverridden: false, reviewInvoked: false, status: 'diff_over_cap', writerReportTruncated: null }))
+      return 6
+    })
+    assert.notEqual(r.code, 0, '沒有複審的票 run 不得回 0')
+    assert.equal(r.summary.review.exit, 6)
+    assert.equal(r.summary.review.input.reviewInvoked, false)
+    assert.equal(r.summary.review.input.diffLength, 187432)
+    assert.match(r.out, /🔴 沒有複審：diff 187432 字元 > 完整送審上限 120000/)
+    assert.match(r.out, /--diff-cap 187432/)
+  })
+
+  test('(b) 舊 council（沒有 input.json）⇒ summary.review.input === null（unknown）、不印任何「沒有複審／cap 提高」、不炸', async () => {
+    const r = await runTicket('cap2', (dir) => {
+      fakeCouncilOut(dir, { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：x', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：y' })
+      return 0
+    })
+    assert.equal(r.code, 0)
+    assert.equal(r.summary.review.input, null)
+    assert.ok(!r.out.includes('沒有複審') && !r.out.includes('cap 由'), '舊 council 不能被印成「沒截斷」也不能印成「沒複審」')
+  })
+
+  test('(c) --diff-cap 傳給 council；input.json capOverridden ⇒ 收貨摘要印 ⚠ cap 由 120000 提高至 N；writerReportTruncated ⇒ 印 ⚠ writer-report 截斷', async () => {
+    const r = await runTicket('cap3', (dir) => {
+      fakeCouncilOut(dir, { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：x', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：y' })
+      fs.writeFileSync(path.join(dir, 'input.json'), JSON.stringify({ schemaVersion: 1, diffLength: 150000, diffCap: 200000, defaultDiffCap: 120000, capOverridden: true, reviewInvoked: true, status: 'ok', writerReportTruncated: { originalLength: 31540, cap: 20000 } }))
+      return 0
+    }, ['--diff-cap', '200000'])
+    assert.equal(r.code, 0)
+    const i = r.councilArgs.indexOf('--diff-cap'); assert.ok(i !== -1 && r.councilArgs[i + 1] === '200000', 'ticket run 要把 --diff-cap 傳給 council')
+    assert.match(r.out, /⚠ 本票 diff cap 由 120000 提高至 200000；完整送審 150000 字元/)
+    assert.match(r.out, /⚠ writer-report 截斷 20000\/31540 字元/)
+  })
+})

@@ -1637,3 +1637,21 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 **還沒驗的**：真機上整支腳本對真 agy 跑一次——要一個真的 change。GuildHub 的 FE-J13 是第一個活樣本：跑之前先 `--report` 看帳本是乾淨的，跑完看 gemini 的 row 是 `rc: 0, ok: true`；不是就把 `.local/archive-review/<id>/r1/gemini.err` 貼回來，這條決定要改。
 
 **過程**：codex（gpt-5.6-sol）與 Gemini（3.1 pro）一輪。一致：命令列上限走 stdin 消掉、成功要看協定狀態不只看 rc、attempt row 要在模型啟動前寫、`--anyway` 入帳不重設、規則要寫成機器能驗的不變條件。分歧三處（上限數字、exit 3、rc=127 排除）採 codex，理由在上面。
+
+## 2026-09-20　複審者到底看了什麼要講出來：llm-team 1.12.0 agy 走 stdin、diff 不截斷、超過上限停在複審者之前
+
+**起因**：09-19 archive-review 事故之後回頭查共用層，`council.mjs` 有同一類的病：agy 的 prompt 走命令列 `-p`（這台 Mac 沒事，Linux 128 KiB 會 E2BIG），diff 超過 120,000 字元就**截斷**，「截斷」三個字只寫在給複審者的 prompt 裡——`members.json`、`summary.json`、收貨摘要都不記。統整者看到「兩位都簽」，不知道他們只看了前 64%。web-agency-system 沒有 archive-review，但這一條它有。
+
+**決定**（config `4e027ca`＋`20c3f63`，三個 repo 靠快照拿）：
+1. **agy prompt 走 stream-json stdin**：`buildAgyArgs` 不再放 `-p`，改 `--print=`（空值；spawn 不經 shell，所以不是 `--print=''`）＋`--input-format stream-json`＋`--disable-slash-commands`；`buildAgyStdin` 用 `JSON.stringify` 編一行 `{"event":"user","message":{"role":"user","content":…}}`；`spawnAsync` 加 `opts.input`（一次 `end(payload)`，EPIPE 記 stderr 不炸）。寫手（`write.mjs`）與複審者（`council.mjs`）同一條路。實測：384 KB 走 stdin 成功；accept-edits 下 stdin 與 `-p` 行為相同；開頭 `/plan` 不會被展開。
+2. **diff 不截斷**。超過 `--diff-cap`（預設 120,000 字元，重新定義為「完整送審上限」）⇒ council **在呼叫複審者之前停**：`members.json` 寫 `[]`、`input.json` 記 `diff_over_cap`、回 6；ticket run 因此 rosterMismatch 非 0，收貨摘要印「🔴 沒有複審：diff N 字元 > 完整送審上限 120000，複審者沒有被呼叫。拆票，或確認後 `ticket run --diff-cap N` 重跑」。
+3. **每次 review 都寫 `review/input.json`**（`diffLength`、`diffCap`、`defaultDiffCap`、`capOverridden`、`reviewInvoked`、`status`、`writerReportTruncated`）→ `summary.review.input` → 收貨摘要：cap 被提高印 ⚠（入帳，不是繞過孔：提高的是完整送審的資源上限，不是通過條件）；writer-report 仍截斷（20,000）但記原長並印 ⚠。**舊 summary 沒有 `input`＝unknown**，不印，也不能當成「沒截斷」。
+4. council 的 diff **不排除 lockfile／產生檔**（Gemini 提議、codex 反對、採 codex）：council 的輸出是簽核不是給人讀的訊噪比；排除了 allowlist 內的檔又說「整份簽」是同一種覆蓋錯誤。lockfile 進 diff 表示 brief 准了它。
+
+**拒絕的替代**：**A（Gemini 第一輪）——維持截斷、只記旗標印一行 🔴、「簽」照記**。第二輪兩位一致選 B：截斷的 diff 上「簽」不是整份簽核，publish 出去的 PR 說明會寫「兩位複審者簽」，那句話是錯的；一行警告修不了 `overall=簽` 的語意。
+
+**怎麼驗**：真源 `llm-team.test.mjs` +9（argv 不含 prompt／不含 `-p`；stdin 一行解析回原文含多行引號反斜線 emoji 開頭 `/plan`；同步與非同步假 spawn 收到 `input`；真 `spawnAsync` 400,000 字元完整進子行程、子行程先退不炸；diff ≤ cap 呼叫、= cap 呼叫、> cap 回 6 且複審者 0 次呼叫；`--diff-cap` 提高入帳、非正整數回 2；writer-report 截斷入帳）、`ticket.test.mjs` +3（council 回 6 ⇒ run 非 0、summary 帶 input、摘要印 🔴；舊 council 沒 input.json ⇒ null、不印、不炸；`--diff-cap` 傳到 council、⚠ 兩行）。突變五刀各自紅：放回 `-p`（3）、拿掉 `return 6`（2）、不寫 input.json（5）、summary 不帶 input（2）、摘要不印 🔴（1）。
+
+**還沒驗的**：真的寫手＋複審者跑一張票（stdin 路徑對真 agy 只在 plan／accept-edits 各試過一個提示）。下一張 llm-team 票就是活樣本：收貨摘要要看到複審者正常簽，`review/input.json` 的 `status` 是 `ok`。
+
+**過程**：codex（gpt-5.6-sol）＋Gemini（3.1 pro）兩輪。第一輪一致：stdin、`JSON.stringify`、`--print=`、`stdin.end` 接 EPIPE、缺欄位＝unknown、三段各自測；分歧在截斷（A vs B）。第二輪用「哪個輸出會錯」論證，兩位都選 B。lockfile 一項分歧採 codex。順帶記錄：config repo 的 Stop hook 會被**別的 session** 觸發，真源改到一半就被 `4e027ca` 自動同步吃掉——之後改真源要在 config repo 的 worktree 做，不在主 checkout。

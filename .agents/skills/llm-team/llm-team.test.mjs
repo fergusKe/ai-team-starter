@@ -44,6 +44,7 @@ import {
   runAgy,
   runAgyAsync,
   buildAgyArgs,
+  buildAgyStdin,
   buildSpawnEnv,
   WRITER_PROMPT_SENTINEL,
   parseArgs,
@@ -4021,6 +4022,141 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.12.0：agy prompt 走 stream-json stdin；council diff 不截斷、超過 cap 停在複審者之前（codex＋Gemini 兩輪一致選 B）
+// 陽性對照：把 buildAgyArgs 的 '--print=' 換回 ['-p', prompt] ⇒ (a)(c) 紅；把 council 的 `return 6` 拿掉 ⇒ (f) 紅；
+// 把 input.json 的 writeFileSync 拿掉 ⇒ (e)(f)(g) 紅。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('1.12.0 agy stdin：prompt 不在 argv、走 stream-json stdin', () => {
+  const NASTY = '/plan 第一行以斜線開頭\n第二行有 "雙引號" 與 \\ 反斜線\n第三行有 emoji 🚀 與中文\n\t縮排'
 
+  test('(a) buildAgyArgs 不含 prompt、不含 -p；含 --print=、--input-format stream-json、--disable-slash-commands、--output-format stream-json', () => {
+    const args = buildAgyArgs({ model: 'gemini-3.1-pro-high', mode: 'plan', timeoutMs: 60000 })
+    assert.ok(!args.includes('-p'), 'argv 不得再有 -p')
+    assert.ok(!args.some((x) => x.includes('第一行')), 'argv 不得含 prompt 內容')
+    assert.ok(args.includes('--print='), "要有 '--print='（不是 --print=''）")
+    assert.ok(!args.includes("--print=''"), "spawn 不經 shell，'--print=\\'\\'' 會把兩個單引號當內容")
+    const i = args.indexOf('--input-format'); assert.ok(i !== -1 && args[i + 1] === 'stream-json')
+    const o = args.indexOf('--output-format'); assert.ok(o !== -1 && args[o + 1] === 'stream-json')
+    assert.ok(args.includes('--disable-slash-commands'))
+    assert.equal(args[args.length - 1], '--print=', '--print= 放最後，才不會把後面的 flag 吃成 prompt')
+  })
 
+  test('(b) buildAgyStdin：一行 JSON＋換行，解析回來 event=user、role=user、content 與原文逐字相同（多行／引號／反斜線／emoji／開頭 /plan）', () => {
+    const line = buildAgyStdin(NASTY)
+    assert.ok(line.endsWith('\n') && line.slice(0, -1).indexOf('\n') === -1, '恰好一行、以換行結尾')
+    const o = JSON.parse(line)
+    assert.equal(o.event, 'user')
+    assert.equal(o.message.role, 'user')
+    assert.equal(o.message.content, NASTY)
+  })
 
+  test('(c) runAgy（同步）：假 spawn 收到 opts.input＝buildAgyStdin(prompt)、stdio 三個 pipe、args 不含 prompt', async () => {
+    let captured = null
+    const fakeSpawn = (bin, args, opts) => {
+      captured = { bin, args, opts }
+      return { status: 0, stdout: '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}', stderr: '' }
+    }
+    const r = await runAgy({ model: 'gemini-3.1-pro-high', mode: 'plan', prompt: NASTY, cwd: process.cwd(), env: { PATH: '/x', AGY_BIN: '/fake/agy' }, spawn: fakeSpawn })
+    assert.equal(r.result.response, 'ok')
+    assert.deepEqual(captured.opts.stdio, ['pipe', 'pipe', 'pipe'])
+    assert.equal(JSON.parse(captured.opts.input).message.content, NASTY)
+    assert.ok(!captured.args.includes('-p') && !captured.args.some((x) => x.includes('第一行')))
+    assert.equal(captured.opts.maxBuffer, 64 * 1024 * 1024, 'maxBuffer 仍是 stdout/stderr 的上限，跟 input 無關')
+  })
+
+  test('(d) runAgyAsync：假 spawn 同樣收到 opts.input；真 spawnAsync 帶 input 會把 payload 送進子行程 stdin，子行程先退（EPIPE）不炸', async () => {
+    let captured = null
+    const fakeSpawn = async (bin, args, opts) => {
+      captured = { args, opts }
+      return { status: 0, signal: null, timedOut: false, stdout: '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}', stderr: '' }
+    }
+    await runAgyAsync({ model: 'gemini-3.1-pro-high', mode: 'plan', prompt: NASTY, cwd: process.cwd(), env: { PATH: '/x', AGY_BIN: '/fake/agy' }, spawn: fakeSpawn })
+    assert.equal(JSON.parse(captured.opts.input).message.content, NASTY)
+    assert.ok(!captured.args.includes('-p'))
+
+    const big = 'x'.repeat(400000)
+    const echo = await spawnAsync(process.execPath, ['-e', 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{process.stdout.write(String(d.length))})'], { input: big, stdio: ['pipe', 'pipe', 'pipe'], timeout: 20000 })
+    assert.equal(echo.status, 0)
+    assert.equal(echo.stdout, String(big.length), '400000 字元的 input 要完整進到子行程 stdin（argv 塞不下的量）')
+    const early = await spawnAsync(process.execPath, ['-e', 'process.exit(0)'], { input: big, stdio: ['pipe', 'pipe', 'pipe'], timeout: 20000 })
+    assert.equal(early.status, 0, '子行程沒讀 stdin 就退 ⇒ promise 正常 resolve，不是未捕捉的 EPIPE')
+  })
+})
+
+describe('1.12.0 council：diff 不截斷；超過 --diff-cap 停在複審者之前並入帳', () => {
+  function reviewRepo(bigBytes) {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt'); repo.g('commit', '-m', 'A')
+    repo.g('checkout', '-b', 'feat/cap-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'y'.repeat(bigBytes) + '\n')
+    const brief = path.join(tmpdir('brief-'), 'brief.md'); fs.writeFileSync(brief, '# brief\n')
+    return { repo, brief }
+  }
+  async function run(argsExtra, repo, brief) {
+    const outDir = tmpdir('review-cap-')
+    let calls = 0
+    const deps = { runOne: (name, model) => { calls++; return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' } } }
+    const origLog = console.log; const origErr = console.error; const errs = []
+    console.log = () => {}; console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await councilMain(['review', '--coordinator', 'claude', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--out', outDir, '--tier', 'standard', ...argsExtra], deps)
+    } finally { console.log = origLog; console.error = origErr }
+    const input = fs.existsSync(path.join(outDir, 'input.json')) ? JSON.parse(fs.readFileSync(path.join(outDir, 'input.json'), 'utf8')) : null
+    const members = fs.existsSync(path.join(outDir, 'members.json')) ? JSON.parse(fs.readFileSync(path.join(outDir, 'members.json'), 'utf8')) : null
+    const prompt = fs.existsSync(path.join(outDir, 'prompt.md')) ? fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8') : ''
+    return { code, calls, input, members, prompt, errs: errs.join('\n') }
+  }
+
+  test('(e) diff 未超過 cap ⇒ 複審者被呼叫、input.json 永遠寫（status ok、reviewInvoked true、capOverridden false、writerReportTruncated null）', async () => {
+    const { repo, brief } = reviewRepo(1000)
+    const r = await run([], repo, brief)
+    assert.equal(r.code, 0); assert.equal(r.calls, 2)
+    assert.equal(r.input.status, 'ok'); assert.equal(r.input.reviewInvoked, true); assert.equal(r.input.capOverridden, false)
+    assert.equal(r.input.diffCap, 120000); assert.equal(r.input.defaultDiffCap, 120000)
+    assert.ok(r.input.diffLength > 1000 && r.input.diffLength < 120000)
+    assert.equal(r.input.writerReportTruncated, null, '新版永遠寫欄位：null＝確認沒截斷，不是缺欄位')
+    assert.ok(!r.prompt.includes('截斷，原長'), 'diff 不再被截斷')
+  })
+
+  test('(f) diff 超過 cap ⇒ 回 6、複審者【沒有】被呼叫、members.json 是 []、input.json status=diff_over_cap、stderr 講下一步（拆票或 --diff-cap N）', async () => {
+    const { repo, brief } = reviewRepo(130000)
+    const r = await run([], repo, brief)
+    assert.equal(r.code, 6, `應回 6，實際 ${r.code}`)
+    assert.equal(r.calls, 0, '超過 cap 不得呼叫任何複審者')
+    assert.deepEqual(r.members, [])
+    assert.equal(r.input.status, 'diff_over_cap'); assert.equal(r.input.reviewInvoked, false)
+    assert.ok(r.input.diffLength > 120000)
+    assert.match(r.errs, /超過完整送審上限 120000/); assert.match(r.errs, /拆票/); assert.match(r.errs, new RegExp(`--diff-cap ${r.input.diffLength}`))
+  })
+
+  test('(g) --diff-cap 提高到夠大 ⇒ 複審者被呼叫、capOverridden true 入帳、diff 完整進 prompt（不截斷）；--diff-cap 非正整數 ⇒ 2', async () => {
+    const { repo, brief } = reviewRepo(130000)
+    const r = await run(['--diff-cap', '200000'], repo, brief)
+    assert.equal(r.code, 0); assert.equal(r.calls, 2)
+    assert.equal(r.input.capOverridden, true); assert.equal(r.input.diffCap, 200000); assert.equal(r.input.reviewInvoked, true)
+    assert.ok(r.prompt.includes('y'.repeat(130000)), '完整 diff 要在 prompt 裡')
+    const bad = await run(['--diff-cap', 'abc'], repo, brief)
+    assert.equal(bad.code, 2); assert.equal(bad.calls, 0)
+  })
+
+  test('(h) diff 長度剛好等於 cap ⇒ 不算超過（reviewInvoked true）', async () => {
+    const { repo, brief } = reviewRepo(500)
+    const probe = await run([], repo, brief)
+    const exact = await run(['--diff-cap', String(probe.input.diffLength)], repo, brief)
+    assert.equal(exact.code, 0); assert.equal(exact.input.reviewInvoked, true); assert.equal(exact.input.diffLength, exact.input.diffCap)
+    const under = await run(['--diff-cap', String(probe.input.diffLength - 1)], repo, brief)
+    assert.equal(under.code, 6)
+  })
+
+  test('(i) --writer-report 超過 20000 字元 ⇒ input.json.writerReportTruncated 記原長與 cap（複審者仍被呼叫）', async () => {
+    const { repo, brief } = reviewRepo(100)
+    const report = path.join(tmpdir('report-'), 'r.md'); fs.writeFileSync(report, 'r'.repeat(25000))
+    const r = await run(['--writer-report', report], repo, brief)
+    assert.equal(r.code, 0); assert.equal(r.calls, 2)
+    assert.deepEqual(r.input.writerReportTruncated, { originalLength: 25000, cap: 20000 })
+  })
+})
