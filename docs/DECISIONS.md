@@ -1615,3 +1615,25 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 **沒做的**：沒加測試——「07 有〈六〉這個標題」是空殼就能過的閘門，export 機制本身 1.10.0 已有測試。
 
 **下游要注意**：純快照更新，根目錄沒有東西要刪；GuildHub 逐字拿本節。web-agency-system 沒拉 1.11.0 前 `sync-check` 報 `sourceNew`，不是漂移。
+
+## 2026-09-19　影子審查七天沒跑過一次沒人知道：沒起作用要自己講，機制自己擋第三次靜默失效
+
+**事故**：GuildHub 三個 change（FE-X16、FE-J03、FE-J13）送 `archive-review.sh` 全被 L339 的 110 KB 上限擋在送出前（`exit 2`、不寫帳本），`--report` 永遠印「樣本還沒滿（0/10）」，跑的 session 看到 ✗ 三次都往下走，機制存在七天一次都沒起作用，人問了才發現（使用者：「還好我有問，不然根本白做了」）。110 KB 的唯一理由是 agy 不吃 stdin、Linux 單一命令列參數上限 128 KiB。
+
+**決定**（模板 `archive-review.sh`，GuildHub 逐字拿）：
+1. **Gemini 的 prompt 走 stream-json stdin**（`agy --print='' --input-format stream-json --output-format stream-json`，一行 `{"event":"user","message":{"role":"user","content":…}}` 用 `json.dumps` 編）；回答從最後一個 `result` event 取，`status≠SUCCESS`／沒有 result／response 空 ⇒ rc=8、不算答（CLI exit 0 也不算）。實測 384 KB 的 prompt 成功、input 54,847 tokens。**110 KB 拒絕線與 120 KB 跳過都刪掉**，不設新的拒絕線：超過 400 KB（已實測範圍）只印警告，模型塞不下會自己失敗、失敗有 row。
+2. **每次送審先寫 attempt row**（模型還沒啟動、任何早退之前），結束時 outcome row 記 rc 與 bundle bytes；review row 加 `rc`、`size`。`--report` 從 attempt 算「送過 N 個、答齊 M、沒答齊 K（原因：rc 分布）」；0 個答齊而 ≥2 個沒答齊，結論印「**機制沒起作用**」，不再印「樣本還沒滿」。
+3. **機制自己擋第三次靜默失效**：最近 2 個不同的 change 都沒有「兩模型皆 ok」的第一輪 ⇒ 下一個 change 送之前寫 blocked row、印原因、`exit 3`。硬送要 `--anyway "<理由>"`：理由入帳、report 印、**不重設連續數**。「起作用」只有一種定義（兩模型皆 ok），缺 CLI、逾時、協定失敗、回答不合格、早退全算沒起作用，不分原因——原因是印給人看的，不是拿來豁免的。
+4. `AGENTS.md`〈archive 前的雙模型影子審查〉加一段：跑這支的 session 看到 rc 非 0 當輪回報人（命令、rc、原因），回報前不得說 change 已完成、不得繼續封存。
+
+**拒絕的替代**：
+- **把上限放寬到 900 KB**（GuildHub session 的提議）：還是一個綁平台的魔術數字（macOS `ARG_MAX` 1 MB 含環境變數，900 KB 加上 env 可能剛好爆），而且沒解決「擋了不入帳」——換個數字，下次超過的 change 一樣消失。
+- **只印紅字、寫 `.shadow-alert` 標記檔，不 exit 3**（Gemini）：這次事故就是「印了紅字沒人看」；標記檔是另一個沒人讀的檔。exit 3 擋的是第三次靜默失效，不是把影子審查升成阻塞閘門——主線流程（PR、CI、archive）完全不經過這支。
+- **連續數排除 rc=127（CLI 沒裝）**（Gemini）：宣稱雙模型的環境裡 CLI 沒裝就是機制不能用，正是要通知的情況（codex 同意）。
+- **把警告寫進 STATE 檔**（Gemini）：模板沒有每個 session 必讀的跨 session 狀態檔，AGENTS.md 才是；一條規則放在每個 session 都讀的地方，比新開一個檔小。
+
+**怎麼驗**：`test-archive-review.sh` 93→115 條，新增：早退也入帳（attempt 4、outcome rc=2 4、review 0）；gemini `status=ERROR`／純文字輸出 ⇒ rc=8、ok=false；prompt 是 json.dumps 過的 stream-json；500 KB 的 change 照送、兩模型 ok、row 記 size；連續 2 個沒起作用 ⇒ 第 3 個 exit 3＋blocked row＋沒開跑；`--anyway` 空理由／多餘參數被擋、有理由入帳照送；override 不重設連續數；最近 2 個有 1 個答齊就不擋；report 印送過／答齊／沒答齊／原因／被擋／硬送、結論「機制沒起作用」。突變四刀各自紅：放回 110 KB（3 紅）、連續數永遠空（6 紅）、gemini 不驗協定狀態（1 紅）、不寫 attempt（10 紅）。
+
+**還沒驗的**：真機上整支腳本對真 agy 跑一次——要一個真的 change。GuildHub 的 FE-J13 是第一個活樣本：跑之前先 `--report` 看帳本是乾淨的，跑完看 gemini 的 row 是 `rc: 0, ok: true`；不是就把 `.local/archive-review/<id>/r1/gemini.err` 貼回來，這條決定要改。
+
+**過程**：codex（gpt-5.6-sol）與 Gemini（3.1 pro）一輪。一致：命令列上限走 stdin 消掉、成功要看協定狀態不只看 rc、attempt row 要在模型啟動前寫、`--anyway` 入帳不重設、規則要寫成機器能驗的不變條件。分歧三處（上限數字、exit 3、rc=127 排除）採 codex，理由在上面。

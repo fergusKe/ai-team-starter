@@ -325,7 +325,7 @@ delta 一起掃的話會鎖死流程：`spec/` 分支依設計不能加測試，
 ```bash
 bash .github/scripts/archive-review.sh <change-id>            # tasks.md 全勾之後、/opsx:archive 之前；放背景跑
 bash .github/scripts/archive-review.sh <change-id> --rereview # 修完回審，只准一次
-bash .github/scripts/archive-review.sh --report               # 帳本結算：升阻塞的條件成不成立
+bash .github/scripts/archive-review.sh --report               # 帳本結算：升阻塞的條件成不成立；也印送過幾個、答齊幾個、沒答齊為什麼
 ```
 
 把一個 change 的**全部**（origin/main 上凍結的規格、WBS 那一項、DECISIONS 裡提到它的整節、
@@ -358,6 +358,12 @@ slice 的認定是 **PR 的分支名**（`feat/<id>--…`、`fix/<id>--…`）�
 **不留一個大家都會跳過的空殼閘門。**
 
 **回審只准一次。** 第三輪代表這套流程在製造等待；腳本直接拒絕，人工處理。
+
+**沒起作用要自己講，不准靜默。** 影子審查的每次送審先寫 attempt row（早退也入帳），
+「起作用」只有一種定義：兩個模型都有 ok 的 row。**最近 2 個 change 都沒起作用，腳本擋下第三個（exit 3）**，
+硬送要 `--anyway "<理由>"`（理由入帳、report 印、不重設連續數）。跑這支的 session 看到 rc 非 0
+（包含 exit 3 與任何 ✗）**當輪就回報人**：命令、rc、原因；回報前不得說這個 change 已完成、不得繼續封存。
+2026-09-19 事故：三個 change 全被舊的大小上限擋在送出前、不寫帳本，機制存在七天沒跑過一次，人問了才知道。
 
 ### 架構視圖（**推導出來的，不是維護出來的**）
 

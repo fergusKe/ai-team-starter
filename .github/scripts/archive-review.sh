@@ -5,7 +5,9 @@
 #   bash .github/scripts/archive-review.sh <change-id> --rereview         第二輪（**只准一次**）：修正後的 diff 對上一輪的「需修正」
 #   bash .github/scripts/archive-review.sh <change-id> --judge <codex|gemini> <第N條需修正> <誤報|已驗證|已修> [備註]
 #                                                                         已修 ＝ 修前重現得到、修後驗法達到預期、而且那個模型回審過（要有 r2）
-#   bash .github/scripts/archive-review.sh --report                       帳本結算：升阻塞的條件成不成立
+#   bash .github/scripts/archive-review.sh --report                       帳本結算：升阻塞的條件成不成立；也印「送過幾個、答齊幾個、沒答齊為什麼」
+#   bash .github/scripts/archive-review.sh <change-id> [--rereview] --anyway "<理由>"
+#                                                                         連續 2 個 change 沒起作用被擋（exit 3）之後硬送：理由入帳，不重設連續數
 #
 # 為什麼有這支：當一個 change 的每個 slice 都由同一個作者（人或 agent）寫、同一個人合併，單一 slice 的 PR review
 # 看不到跨 slice 的不一致、規格說了但沒有任何 slice 做的缺口。審查單位所以是 change（archive 前一次），不是 PR。
@@ -20,6 +22,16 @@
 # 模型與執行檔走環境變數：ARCHIVE_REVIEW_CODEX（模型）、ARCHIVE_REVIEW_CODEX_BIN（預設 codex）、
 # ARCHIVE_REVIEW_GEMINI（模型）、ARCHIVE_REVIEW_GEMINI_BIN（預設 agy）、ARCHIVE_REVIEW_TIMEOUT（秒）。
 # 哪個 CLI 不在就**明說跳過**並記進帳本；少一個模型的 change 不算雙模型樣本。
+#
+# **沒起作用要自己講，不准靜默（2026-09-19 事故）**：GuildHub 三個 change 全被舊的 110 KB 上限擋在送出前（exit 2、不寫帳本），
+# 機制存在七天一次都沒跑，`--report` 只會說「樣本還沒滿」，跑的 session 看到 ✗ 三次都往下走，人問了才發現。所以：
+# - 每次送審**先寫 attempt row**（模型還沒啟動、任何早退之前），結束時寫 outcome row（rc、bundle bytes）；--report 從 attempt 算「送過幾個」。
+# - 「起作用」的定義只有一種：同一 change 同一輪 codex 與 gemini 都有 ok 的 review row（rc 0、協定成功、回答通過 answered()）。
+#   缺 CLI、逾時、CLI exit 0 但協定狀態不是成功、回答不合格、早退，全算沒起作用 —— 不分原因，原因印給人看。
+# - **最近 2 個不同的 change 都沒起作用 ⇒ 第三次送之前擋下（寫 blocked row、exit 3）**，要硬送加 `--anyway "<理由>"`：理由入帳、
+#   report 印出來、**不重設連續數**（override 不能讓報表看起來健康）。這條擋的是第三次靜默失效，不是把影子審查升成阻塞閘門。
+# - Gemini 的 prompt 走 stream-json stdin（agy `--input-format stream-json`），沒有命令列參數長度上限；bundle 不設拒絕線，
+#   只在超過已實測範圍（400 KB；實測 384 KB 成功、input 54,847 tokens）時印警告。模型塞不下會自己失敗，失敗有 row。
 #
 # 信任邊界：帳本與回答檔都在本機、gitignore、負責人自己可以改。這套守的是**誤操作與模型的半成品**
 # （移走重跑、沒答完、結論跟明細對不上、判定套到別的發現上），**不防惡意竄改** —— 一個人合併的專案，
@@ -129,7 +141,17 @@ for i in cohort:
         else: broken.append(f"{i}/{m}")
 print(f"條件：最早 {N} 個雙模型樣本內 已修 ≥{MINV}、誤報率 ≤{MAXFP}%、等待 P90 ≤{MAXP90} 秒")
 print(f"雙模型樣本：{len(both)} 個（樣本取前 {N}：{', '.join(cohort) or '—'}）；兩個模型還沒都答完、不算樣本的：{len(half)} 個（{', '.join(half) or '—'}）")
-if not cohort: print("還沒有任何雙模型樣本"); sys.exit(0)
+# 有沒有起作用：從 attempt 算（模型啟動前就寫，早退也在），不從 review row 算（早退沒有 review row）。
+att = list(dict.fromkeys(r["id"] for r in rows if r.get("kind") == "attempt" and r.get("round") == 1))
+dead = [i for i in att if i not in done]
+def why(i):
+    rs = [r for r in rows if r["id"] == i and r.get("round") == 1 and (r.get("kind") == "review" or (r.get("kind") == "outcome" and r.get("rc")))]
+    return ", ".join(sorted({f"{r['model']} rc={r.get('rc','?')}" if r["kind"] == "review" else f"早退 rc={r.get('rc')}" for r in rs})) or "沒有任何結果 row"
+ovr = [r for r in rows if r.get("kind") == "override"]; blk = [r for r in rows if r.get("kind") == "blocked"]
+if att: print(f"送過 {len(att)} 個 change（有 attempt row）：答齊 {len(att) - len(dead)}、沒答齊 {len(dead)}" + (f"（{'; '.join(f'{i}：{why(i)}' for i in dead)}）" if dead else "") + (f"；被擋 {len(blk)} 次、--anyway 硬送 {len(ovr)} 次（{'; '.join(r['reason'] for r in ovr)}）" if (blk or ovr) else ""))
+if not cohort:
+    if len(dead) >= 2: print(f"結論：**機制沒起作用**：送過 {len(att)} 個 change、0 個答齊 —— 先修機制，不要再送"); sys.exit(0)
+    print("還沒有任何雙模型樣本"); sys.exit(0)
 if broken:
     print(f"樣本裡帳本說答過、檔案卻不在或不完整：{', '.join(broken)}")
     print(f"結論：不能下結論：{len(broken)} 份樣本的第一輪回答檔不成立（樣本不遞補）"); sys.exit(0)
@@ -181,12 +203,18 @@ ZZPY
 fi
 
 ID="${1:?用法見檔頭}"; shift
-# 模式是封閉列舉：<id>、<id> --rereview、<id> --judge …。打錯字（--rereveiw）不能悄悄變成第一輪。
+# 模式是封閉列舉：<id>、<id> --rereview、<id> --judge …，送審的兩種可加 --anyway "<理由>"。打錯字（--rereveiw）不能悄悄變成第一輪。
+ANYWAY=""
+if [ "${1:-}" = "--anyway" ]; then
+  [ $# -eq 2 ] && [ -n "${2:-}" ] || { echo "✗ --anyway 只收一個非空理由（會入帳、印在 --report）" >&2; exit 2; }; ANYWAY="$2"; set --
+elif [ "${1:-}" = "--rereview" ] && [ "${2:-}" = "--anyway" ]; then
+  [ $# -eq 3 ] && [ -n "${3:-}" ] || { echo "✗ --anyway 只收一個非空理由（會入帳、印在 --report）" >&2; exit 2; }; ANYWAY="$3"; set -- --rereview
+fi
 case "${1:-}" in
   "") ;;
   --rereview) [ $# -eq 1 ] || { echo "✗ --rereview 不收其他參數" >&2; exit 2; } ;;
   --judge) ;;
-  *) echo "✗ 不認得「$1」。用法見檔頭：<id>、<id> --rereview、<id> --judge <codex|gemini> <N> <誤報|已驗證|已修> [備註]、--report" >&2; exit 2 ;;
+  *) echo "✗ 不認得「$1」。用法見檔頭：<id>、<id> --rereview、<id> --judge <codex|gemini> <N> <誤報|已驗證|已修> [備註]、--report；送審可加 --anyway \"<理由>\"" >&2; exit 2 ;;
 esac
 # 「答過」＝那一輪帳本有 ok 的 row **而且** 檔案有照格式回答。只看檔案不行：CLI 非零／逾時可能留下格式完整的半成品；
 # 只看帳本不行：帳本說答過、檔案卻被移走，那是有人想重跑。兩者不一致 → 拒絕，不猜。
@@ -235,6 +263,32 @@ if [ "${1:-}" = "--rereview" ]; then
 else
   ROUND=1
 fi
+# ── 沒起作用的自我監控（先於任何早退）──────────────────────────────────────────────────────────────
+# 最近 2 個不同的 change（照 attempt 順序，不含本 change：補跑自己不該被自己擋）都沒有「兩模型皆 ok」的第一輪 ⇒ 擋下，除非 --anyway。
+STREAK="$(python3 - "$LEDGER" "$ID" <<'ZZPY'
+import json, sys, os
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()] if os.path.isfile(sys.argv[1]) else []
+ids = list(dict.fromkeys(r["id"] for r in rows if r.get("kind") == "attempt" and r.get("round") == 1))
+last = [i for i in ids if i != sys.argv[2]][-2:]
+def both_ok(i): return all(any(r.get("kind") == "review" and r["id"] == i and r["round"] == 1 and r["model"] == m and r.get("ok") for r in rows) for m in ("codex", "gemini"))
+def why(i):
+    rs = [r for r in rows if r["id"] == i and r.get("round") == 1 and (r.get("kind") == "review" or (r.get("kind") == "outcome" and r.get("rc")))]
+    return ", ".join(sorted({f"{r['model']} rc={r.get('rc','?')}" if r["kind"] == "review" else f"早退 rc={r.get('rc')}" for r in rs})) or "沒有任何結果 row"
+if len(last) == 2 and not any(both_ok(i) for i in last): print("; ".join(f"{i}（{why(i)}）" for i in last))
+ZZPY
+)"
+if [ -n "$STREAK" ]; then
+  if [ -z "$ANYWAY" ]; then
+    ledger "$(python3 -c 'import json,sys;print(json.dumps({"kind":"blocked","id":sys.argv[1],"round":int(sys.argv[2]),"streak":sys.argv[3]},ensure_ascii=False))' "$ID" "$ROUND" "$STREAK")"
+    echo "🔴 影子審查連續 2 個 change 沒起作用：${STREAK}。先回報人（這是機制壞了，不是這個 change 的事）；查清楚要硬送就加 --anyway \"<理由>\"（入帳、不重設連續數）。" >&2
+    exit 3
+  fi
+  ledger "$(python3 -c 'import json,sys;print(json.dumps({"kind":"override","id":sys.argv[1],"round":int(sys.argv[2]),"reason":sys.argv[3],"streak":sys.argv[4]},ensure_ascii=False))' "$ID" "$ROUND" "$ANYWAY" "$STREAK")"
+  echo "（--anyway：${ANYWAY} —— 連續沒起作用的是 ${STREAK}，這次照送，report 會印）"
+fi
+ledger "$(python3 -c 'import json,sys;print(json.dumps({"kind":"attempt","id":sys.argv[1],"round":int(sys.argv[2]),"expected":["codex","gemini"]},ensure_ascii=False))' "$ID" "$ROUND")"
+SIZE=0; LOCKED=""
+trap 'rc=$?; ledger "{\"kind\":\"outcome\",\"id\":\"$ID\",\"round\":$ROUND,\"rc\":$rc,\"size\":${SIZE:-0}}"; [ -z "$LOCKED" ] || rmdir "$OUT/.lock" 2>/dev/null; exit $rc' EXIT
 for m in codex gemini; do ! in_ledger "$m" "$ROUND" || file_ok "$m" "$ROUND" || { echo "✗ 帳本說 $m 第 $ROUND 輪答過了，$DIR/r$ROUND/$m.md 卻不在或不完整 —— 不要移走它重跑；答過的那份就是樣本。" >&2; exit 2; }; done
 if has_answer codex "$ROUND" && has_answer gemini "$ROUND"; then
   [ "$ROUND" = 1 ] && echo "✗ 兩個模型第一輪都答過了（$DIR/r1）。要回審用 --rereview。" >&2 \
@@ -244,7 +298,7 @@ fi
 OUT="$DIR/r$ROUND"; mkdir -p "$OUT"
 # 同一個 change 同一輪只能有一個在跑：兩個一起跑會互相蓋回答檔、各寫一次帳本。mkdir 是原子的。
 mkdir "$OUT/.lock" 2>/dev/null || { echo "✗ $OUT/.lock 存在 —— 同一輪已經在跑（或上次沒正常結束：確認沒有在跑的 codex／agy 之後 rmdir 它）" >&2; exit 2; }
-trap 'rmdir "$OUT/.lock" 2>/dev/null' EXIT
+LOCKED=1
 # 補跑沒回答的那個模型時，**沿用這一輪已經組好的 bundle 與 main.sha**：兩個模型要看同一份東西，不然不是同一個樣本。
 if [ -s "$OUT/bundle.md" ] && [ -s "$OUT/main.sha" ]; then
   MAIN="$(cat "$OUT/main.sha")"; echo "沿用第 $ROUND 輪已組好的 bundle（main $(git rev-parse --short "$MAIN")）：$OUT/bundle.md"
@@ -334,14 +388,13 @@ if not hit: print("（沒有）")' "$ID" "$WBS"
 } > "$OUT/bundle.md.tmp" && mv "$OUT/bundle.md.tmp" "$OUT/bundle.md"
 fi
 SIZE=$(wc -c < "$OUT/bundle.md" | tr -d " ")
-# 上限 110 KB：gemini 的 prompt（bundle＋第二輪時再加上一輪回答）要走命令列參數（agy 不吃 stdin），
-# Linux 單一參數上限 128 KiB；codex 走 stdin 沒這問題。超過就是 change 太大，人工拆開審 —— 送出前擋，不要送到一半炸。
-[ "$SIZE" -lt 110000 ] || { echo "✗ bundle ${SIZE} bytes，超過 110 KB —— 這個 change 太大，人工拆開審。" >&2; exit 2; }
+# 不設拒絕線（舊的 110 KB 只是在迴避 agy 的命令列參數上限，現在走 stdin）。超過已實測範圍只警告；模型塞不下會自己失敗、失敗有 row。
+[ "$SIZE" -lt 400000 ] || echo "⚠ bundle ${SIZE} bytes 超過已實測範圍（400 KB）—— 照送；哪個模型失敗看它的 row 與 .err" >&2
 echo "bundle：$OUT/bundle.md（$SIZE bytes）；等待上限 ${ARCHIVE_REVIEW_TIMEOUT:-1500} 秒／模型，放背景跑"
 
 # ── 平行送出 ──────────────────────────────────────────────────────────────────────────────────────
 row() { # row <model> <t0> <rc> [session]
-  ledger "{\"kind\":\"review\",\"id\":\"$ID\",\"round\":$ROUND,\"model\":\"$1\",\"seconds\":$(( $(date +%s) - $2 )),\"need_fix\":$(count "$OUT/$1.md" 需修正),\"risk\":$(count "$OUT/$1.md" 可接受風險),\"fp\":$(count "$OUT/$1.md" 誤報候選),\"ok\":$(answered "$3" "$OUT/$1.md" "$ROUND"),\"session\":\"${4:-}\"}"
+  ledger "{\"kind\":\"review\",\"id\":\"$ID\",\"round\":$ROUND,\"model\":\"$1\",\"seconds\":$(( $(date +%s) - $2 )),\"need_fix\":$(count "$OUT/$1.md" 需修正),\"risk\":$(count "$OUT/$1.md" 可接受風險),\"fp\":$(count "$OUT/$1.md" 誤報候選),\"ok\":$(answered "$3" "$OUT/$1.md" "$ROUND"),\"rc\":$3,\"size\":$SIZE,\"session\":\"${4:-}\"}"
   [ "$(answered "$3" "$OUT/$1.md" "$ROUND")" = true ] || echo "✗ $1 沒有回答（rc=${3}；看 $OUT/$1.err）—— 這次不算數" >&2
 }
 run_codex() {
@@ -362,11 +415,29 @@ run_gemini() {
   ! has_answer gemini "$ROUND" || { echo "（gemini 第 $ROUND 輪已經答過，不重送）"; return; }
   command -v "$GEMINI_BIN" >/dev/null || { echo "（跳過 gemini：找不到 ${GEMINI_BIN}）" | tee "$OUT/gemini.md"; row gemini "$t0" 127; return; }
   { [ "$ROUND" = 2 ] && { echo "## 你上一輪的回答"; cat "$DIR/r1/gemini.md"; echo; }; cat "$OUT/bundle.md"; } > "$OUT/gemini.prompt.md"
-  # agy 不吃 stdin，prompt 只能走命令列參數：Linux 單一參數上限 128 KiB，取 120 000 bytes；超過就明說跳過、記帳本（這個 change 進不了雙模型樣本）。
-  [ "$(wc -c < "$OUT/gemini.prompt.md" | tr -d ' ')" -lt 120000 ] || { echo "（跳過 gemini：prompt 超過 120 KB，命令列參數塞不下 —— change 太大，人工拆開審）" | tee "$OUT/gemini.md"; row gemini "$t0" 7; return; }
+  # prompt 走 stream-json stdin（一行 {"event":"user","message":{"role":"user","content":…}}，用 json.dumps 編碼，不手拼），
+  # 沒有命令列參數長度上限。回答從最後一個 result event 取：status 必須是 SUCCESS、response 非空，否則 rc=8（CLI exit 0 也不算答）。
+  python3 -c 'import json,sys;print(json.dumps({"event":"user","message":{"role":"user","content":open(sys.argv[1],encoding="utf-8").read()}},ensure_ascii=False))' "$OUT/gemini.prompt.md" > "$OUT/gemini.ndjson"
   local tmp; tmp="$(mktemp "$OUT/gemini.XXXXXX")"
-  "$GEMINI_BIN" --print "$(cat "$OUT/gemini.prompt.md")" --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m > "$tmp" 2> "$OUT/gemini.err" &
-  local rc=0; watch $! || rc=$?; finish gemini "$rc" "$tmp"
+  "$GEMINI_BIN" --print='' --input-format stream-json --output-format stream-json --model "$GEMINI_MODEL" --effort high --mode plan --print-timeout 25m < "$OUT/gemini.ndjson" > "$tmp.raw" 2> "$OUT/gemini.err" &
+  local rc=0; watch $! || rc=$?
+  if [ "$rc" = 0 ]; then
+    python3 - "$tmp.raw" "$tmp" "$OUT/gemini.err" <<'ZZPY' || rc=8
+import json, sys
+last = None
+for line in open(sys.argv[1], encoding="utf-8"):
+    try: o = json.loads(line)
+    except ValueError: continue
+    if isinstance(o, dict) and o.get("event") == "result": last = o.get("result") or {}
+err = open(sys.argv[3], "a", encoding="utf-8")
+if last is None: print("✗ 輸出裡沒有合法的 result event（不是 stream-json？舊版 agy？）", file=err); sys.exit(1)
+if last.get("status") != "SUCCESS" or not (last.get("response") or "").strip():
+    print(f"✗ result.status={last.get('status')!r} error={last.get('error')!r}", file=err); sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(last["response"])
+ZZPY
+  else mv -f "$tmp.raw" "$tmp" 2>/dev/null || true; fi
+  python3 -c 'import os,sys; os.path.exists(sys.argv[1]) and os.remove(sys.argv[1])' "$tmp.raw"
+  finish gemini "$rc" "$tmp"
   row gemini "$t0" "$rc"
 }
 run_codex & run_gemini & wait
