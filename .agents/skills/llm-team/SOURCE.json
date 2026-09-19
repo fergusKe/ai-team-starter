@@ -1,9 +1,10 @@
 {
-  "version": "1.8.0",
-  "sourceCommit": "7ae2001c4f33ef71aac8a5b7da8c158c0acd2c48",
+  "version": "1.9.0",
+  "sourceCommit": "52959bf7ed601afdea24619a09ba9684a38bdb09",
   "sourceDirty": false,
-  "exportedAt": "2026-09-17T14:41:13.107Z",
+  "exportedAt": "2026-09-19T08:30:58.862Z",
   "files": [
+    "prompts/08-pr-review.md",
     "lib.mjs",
     "write.mjs",
     "council.mjs",

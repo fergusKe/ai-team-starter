@@ -1346,6 +1346,123 @@ describe('export.mjs 快照導出與驗證測試', () => {
     assert.equal(logLines.length, 1, `commit 數應為 1（僅初始 commit），實際：${logLines.length} 行：${JSON.stringify(logLines)}`)
     assert.ok(logLines[0].includes('initial commit'), `僅有的 commit 應為 initial commit，實際：${logLines[0]}`)
   })
+
+  describe('1.9.0 ①：共用流程規則 prompts/08-pr-review.md 進快照（子目錄路徑）', () => {
+    test('(a) export 後目標目錄存在 prompts/08-pr-review.md、內容與真源相同、MANIFEST 有一行、SOURCE.json.files 含它、verifySnapshot ok', () => {
+      const sourceDir = makeSourceDir()
+      // makeSourceDir() 對每個 EXPORT_FILES 只填 placeholder 內容；這裡用真正的真源檔內容覆蓋，
+      // 驗「內容與真源相同」而不是只驗 placeholder 有沒有走完整條複製路徑。
+      const realContent = fs.readFileSync(
+        fileURLToPath(new URL('./prompts/08-pr-review.md', import.meta.url)),
+        'utf8'
+      )
+      fs.writeFileSync(path.join(sourceDir, 'prompts', '08-pr-review.md'), realContent)
+
+      const targetRoot = tmpdir('target-repo-prompts-')
+      const res = exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+      assert.equal(res.ok, true)
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      const targetFile = path.join(snapshotDir, 'prompts', '08-pr-review.md')
+      assert.ok(fs.existsSync(targetFile), 'prompts/08-pr-review.md 應存在於快照目錄')
+      assert.equal(fs.readFileSync(targetFile, 'utf8'), realContent, '內容應與真源逐位元組相同')
+
+      const manifestLines = fs
+        .readFileSync(path.join(snapshotDir, 'MANIFEST.sha256'), 'utf8')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+      const expectedHash = crypto.createHash('sha256').update(realContent).digest('hex')
+      assert.ok(
+        manifestLines.includes(`${expectedHash}  prompts/08-pr-review.md`),
+        `MANIFEST 應有一行 <sha>  prompts/08-pr-review.md，實際：${JSON.stringify(manifestLines)}`
+      )
+
+      const sourceJson = JSON.parse(fs.readFileSync(path.join(snapshotDir, 'SOURCE.json'), 'utf8'))
+      assert.ok(sourceJson.files.includes('prompts/08-pr-review.md'), 'SOURCE.json.files 應含 prompts/08-pr-review.md')
+
+      const v = verifySnapshot(snapshotDir)
+      assert.equal(v.ok, true, 'verifySnapshot 應為 ok')
+    })
+
+    test('(b) 陽性對照：改快照裡 prompts/08-pr-review.md 一個字元 ⇒ verifySnapshot 的 changed 含它，--sync-check exit 非 0', () => {
+      const sourceDir = makeSourceDir()
+      const targetRoot = tmpdir('target-repo-prompts-drift-')
+      exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      const targetFile = path.join(snapshotDir, 'prompts', '08-pr-review.md')
+      fs.appendFileSync(targetFile, '!')
+
+      const v = verifySnapshot(snapshotDir)
+      assert.equal(v.ok, false)
+      assert.ok(
+        v.changed.includes('prompts/08-pr-review.md'),
+        `changed 應包含 prompts/08-pr-review.md，實際：${JSON.stringify(v.changed)}`
+      )
+
+      const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+      assert.notEqual(code, 0, '--sync-check 應 exit 非 0')
+    })
+
+    test('(c) 舊快照（SOURCE.json.files 沒有它、目標目錄沒有 prompts/）再 export ⇒ 視為來源新增（sourceNew），不需要 --force', () => {
+      const sourceDir = makeSourceDir()
+      const targetRoot = tmpdir('target-repo-prompts-oldsnap-')
+      const oldExportFiles = EXPORT_FILES.filter((f) => f !== 'prompts/08-pr-review.md')
+
+      const res1 = exportTo(sourceDir, targetRoot, { deps: { git: fakeGit }, exportFiles: oldExportFiles })
+      assert.equal(res1.ok, true)
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      assert.ok(!fs.existsSync(path.join(snapshotDir, 'prompts')), '舊快照目標目錄不應有 prompts/')
+      const sourceJson1 = JSON.parse(fs.readFileSync(path.join(snapshotDir, 'SOURCE.json'), 'utf8'))
+      assert.ok(
+        !sourceJson1.files.includes('prompts/08-pr-review.md'),
+        '舊 SOURCE.json.files 不應含 prompts/08-pr-review.md'
+      )
+
+      const outs = []
+      const origLog = console.log
+      console.log = (m) => outs.push(String(m))
+      let res2
+      try {
+        res2 = exportTo(sourceDir, targetRoot, {
+          deps: { git: fakeGit },
+          exportFiles: [...EXPORT_FILES],
+          force: false,
+        })
+      } finally {
+        console.log = origLog
+      }
+
+      assert.equal(res2.ok, true, '真源新增 prompts/08-pr-review.md 不帶 --force 也應成功（sourceNew，不是漂移）')
+      assert.match(outs.join('\n'), /\+ prompts\/08-pr-review\.md/, '應印出 + prompts/08-pr-review.md')
+
+      const targetFile = path.join(snapshotDir, 'prompts', '08-pr-review.md')
+      assert.ok(fs.existsSync(targetFile), '目標目錄應多出 prompts/08-pr-review.md')
+      const sourceJson2 = JSON.parse(fs.readFileSync(path.join(snapshotDir, 'SOURCE.json'), 'utf8'))
+      assert.ok(sourceJson2.files.includes('prompts/08-pr-review.md'))
+    })
+
+    test('(d) 快照裡多出未列的 prompts/stray.md ⇒ extra 含 prompts/stray.md（證明子目錄的 extra 掃描真的有效）', () => {
+      const sourceDir = makeSourceDir()
+      const targetRoot = tmpdir('target-repo-prompts-stray-')
+      exportTo(sourceDir, targetRoot, { deps: { git: fakeGit } })
+
+      const snapshotDir = path.join(targetRoot, '.agents', 'skills', 'llm-team')
+      fs.writeFileSync(path.join(snapshotDir, 'prompts', 'stray.md'), '# stray\n')
+
+      const v = verifySnapshot(snapshotDir)
+      assert.equal(v.ok, false)
+      assert.ok(
+        v.extra.includes('prompts/stray.md'),
+        `extra 應包含 prompts/stray.md，實際：${JSON.stringify(v.extra)}`
+      )
+
+      const code = setupMain(['--sync-check'], { repoRoot: targetRoot })
+      assert.notEqual(code, 0)
+    })
+  })
 })
 
 

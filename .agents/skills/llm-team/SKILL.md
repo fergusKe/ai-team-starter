@@ -86,6 +86,8 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 
 真源在 fergus-claude-config `home/skills/llm-team/`，專案裡是快照，改程式回真源改、跑 `node ~/.claude/skills/llm-team/export.mjs --to <專案根>`，`setup --sync-check` 驗 manifest；真源新增檔不算漂移（export 時自動歸為 sourceNew 同步過去，只有目標目錄已存在同名檔但未入 manifest 才是手動漂移 unlisted）。
 
+共用流程規則（例如複審規則）也是快照的一部分，正本住 `prompts/`（如 `prompts/08-pr-review.md`）——與專案無關的散文只在真源改一次，各專案的規則文件只留指標與各自的專案專屬對映；改規則一律回真源改再 `export`，不准在各 repo 手改快照裡的 `prompts/`。
+
 ### 版本同步（改一處全專案生效）
 
 真源改完程式並 bump `VERSION` 後，在真源 repo 跑：

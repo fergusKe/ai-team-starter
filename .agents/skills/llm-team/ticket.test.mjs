@@ -6872,6 +6872,7 @@ describe('setup.mjs 設定對帳測試', () => {
     const manifestLines = []
     for (const f of testFiles) {
       const p = path.join(snapshotDir, f)
+      fs.mkdirSync(path.dirname(p), { recursive: true })
       const content = f === 'VERSION' ? '1\n' : `export const f = "${f}"\n`
       fs.writeFileSync(p, content)
       const hash = crypto.createHash('sha256').update(content).digest('hex')
@@ -6909,6 +6910,7 @@ describe('setup.mjs 設定對帳測試', () => {
     const manifestLines = []
     for (const f of testFiles) {
       const p = path.join(snapshotDir, f)
+      fs.mkdirSync(path.dirname(p), { recursive: true })
       const content = f === 'VERSION' ? '1\n' : `export const f = "${f}"\n`
       fs.writeFileSync(p, content)
       const hash = crypto.createHash('sha256').update(content).digest('hex')
