@@ -251,7 +251,14 @@ expect_grep "拿不到 PR #7 的 diff" "PR diff 拿不到 → 整輪不算數" $
 mkdir -p .local/archive-review/app-c3-x/r1/.lock
 expect_grep "同一輪已經在跑" "lock 在 → 拒絕同時跑第二個" $AR app-c3-x
 rmdir .local/archive-review/app-c3-x/r1/.lock
-[ ! -s "$L" ] && ok "diff 拿不到 → 沒寫帳本" || bad "diff 拿不到 → 沒寫帳本"
+# 早退（清單截斷／不在 main／diff 拿不到／lock）**也要入帳**：attempt row 在模型啟動前寫、outcome row 記 rc；沒有 review row。
+# 2026-09-19 事故：早退不入帳 ⇒ report 永遠「樣本還沒滿」、三個 change 全被擋七天沒人知道。
+python3 - "$L" <<'ZZPY' && ok "早退也入帳：attempt 4 筆、outcome rc=2 4 筆、review 0 筆" || bad "早退也入帳：attempt 4 筆、outcome rc=2 4 筆、review 0 筆" "$(python3 -c 'import json,sys;print([ (r["kind"],r.get("rc")) for r in map(json.loads, open(sys.argv[1])) ])' "$L")"
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+k = lambda t: [r for r in rows if r["kind"] == t and r["id"] == "app-c3-x"]
+assert len(k("attempt")) == 4 and len(k("outcome")) == 4 and all(r["rc"] == 2 for r in k("outcome")) and not k("review"), rows
+ZZPY
 echo ok > "$GH_MODE"
 expect_grep "跳過 codex" "diff 拿得到 → 走到送出（模型不在就明說跳過）" $AR app-c3-x
 grep -q "^+1$" .local/archive-review/app-c3-x/r1/bundle.md && ok "bundle 含 PR 的 diff" || bad "bundle 含 PR 的 diff"
@@ -292,15 +299,33 @@ cat > "$W/bin/codex-good" <<'ZZ'
 #!/bin/bash
 cat > /dev/null; echo "結論：需修正 0 條／可接受風險 0 條／誤報候選 0 條"
 ZZ
-chmod +x "$W/bin/codex-orphan" "$W/bin/codex-good"
+# gemini（agy）替身：stdin 是 stream-json（一行 event=user），stdout 是 stream-json（最後一個 result event 帶回答）
+cat > "$W/bin/gemini-good" <<'ZZ'
+#!/bin/bash
+python3 -c 'import json,sys
+o=json.loads(sys.stdin.readline()); assert o["event"]=="user" and o["message"]["role"]=="user"
+print(json.dumps({"event":"init","conversation_id":"x"}))
+print(json.dumps({"event":"result","result":{"status":"SUCCESS","response":"結論：需修正 0 條／可接受風險 0 條／誤報候選 0 條"}},ensure_ascii=False))'
+ZZ
+cat > "$W/bin/gemini-error" <<'ZZ'
+#!/bin/bash
+cat > /dev/null; echo '{"event":"result","result":{"status":"ERROR","response":"","error":"context too long"}}'; exit 0
+ZZ
+chmod +x "$W/bin/codex-orphan" "$W/bin/codex-good" "$W/bin/gemini-good" "$W/bin/gemini-error"
 mkdir -p openspec/changes/app-c6-x; echo "# p" > openspec/changes/app-c6-x/proposal.md; git add -A && git commit -qm spec6
 export GH_BRANCH="feat/app-c6-x--a" ORPHAN_GO="$W/orphan-go"
 out="$(ARCHIVE_REVIEW_TIMEOUT=1 ARCHIVE_REVIEW_CODEX_BIN="$W/bin/codex-orphan" $AR app-c6-x 2>&1)"
 echo "$out" | grep -q "codex 沒有回答（rc=124" && ok "逾時 → rc=124、這次不算數" || bad "逾時 → rc=124、這次不算數" "$(echo "$out" | tail -2 | tr '\n' ' ')"
 grep -q "逾時" .local/archive-review/app-c6-x/r1/codex.md && ok "逾時後回答檔只寫了「逾時」" || bad "逾時後回答檔只寫了「逾時」"
-expect_grep "需修正 0 條" "重送（好的 CLI）→ 發布的是這一次的回答" bash -c "ARCHIVE_REVIEW_CODEX_BIN=$W/bin/codex-good ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/codex-good $AR app-c6-x >/dev/null 2>&1; cat .local/archive-review/app-c6-x/r1/codex.md"
+# gemini 走 stream-json stdin：CLI exit 0 但 status≠SUCCESS、或根本不是 stream-json（舊式純文字）→ rc=8、ok=false、不發布成回答
+ARCHIVE_REVIEW_CODEX_BIN=$W/bin/codex-good ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/gemini-error $AR app-c6-x >/dev/null 2>&1 || true
+grep -q 'result.status=' .local/archive-review/app-c6-x/r1/gemini.err && grep '"model": "gemini"' "$L" | tail -1 | grep -q '"ok": false, "rc": 8' && ok "gemini CLI exit 0 但 status=ERROR → rc=8、ok=false" || bad "gemini CLI exit 0 但 status=ERROR → rc=8、ok=false" "$(tail -1 "$L")"
+ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/codex-good $AR app-c6-x >/dev/null 2>&1 || true
+grep '"model": "gemini"' "$L" | tail -1 | grep -q '"ok": false, "rc": 8' && grep -q "沒有合法的 result event" .local/archive-review/app-c6-x/r1/gemini.err && ok "gemini 吐純文字（不是 stream-json）→ rc=8、不算答" || bad "gemini 吐純文字（不是 stream-json）→ rc=8、不算答" "$(tail -1 "$L")"
+expect_grep "需修正 0 條" "重送（好的 CLI）→ 發布的是這一次的回答" bash -c "ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/gemini-good $AR app-c6-x >/dev/null 2>&1; cat .local/archive-review/app-c6-x/r1/gemini.md"
 grep -q "需修正 0 條" .local/archive-review/app-c6-x/r1/gemini.md && ok "gemini 那條路徑也經過暫存檔發布" || bad "gemini 那條路徑也經過暫存檔發布"
-grep -q '"model": "gemini".*"ok": true' "$L" && ok "gemini 帳本 ok" || bad "gemini 帳本 ok"
+grep '"model": "gemini"' "$L" | tail -1 | grep -q '"ok": true, "rc": 0, "size": [1-9]' && ok "gemini 帳本 ok、row 有 rc 與 size" || bad "gemini 帳本 ok、row 有 rc 與 size" "$(tail -1 "$L")"
+grep -q '"event": "user"' .local/archive-review/app-c6-x/r1/gemini.ndjson && python3 -c 'import json,sys;o=json.loads(open(sys.argv[1]).readline());assert "# Bundle" in o["message"]["content"]' .local/archive-review/app-c6-x/r1/gemini.ndjson && ok "gemini prompt 是 json.dumps 過的一行 stream-json、內容是 bundle" || bad "gemini prompt 是 json.dumps 過的一行 stream-json、內容是 bundle"
 touch "$ORPHAN_GO"; sleep 3
 grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.md && bad "逾時的孤兒寫進了發布的回答檔" || ok "逾時的孤兒寫不進發布的回答檔"
 grep -q "需修正 9 條" .local/archive-review/app-c6-x/r1/codex.timeout.md && ok "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）" || bad "孤兒的輸出落在逾時那份暫存檔（證明孤兒真的活著寫了）"
@@ -318,6 +343,43 @@ expect_grep "需修正 0 條" "rc=0 但留孤兒 → 發布的是退出當下的
 touch "$ORPHAN_GO2"; sleep 3
 grep -q "需修正 8 條" .local/archive-review/app-c7-x/r1/codex.md && bad "rc=0 留下的孤兒寫進了發布檔（mv 沒換 inode）" || ok "rc=0 留下的孤兒寫不進發布檔（cp 換了 inode）"
 ls .local/archive-review/app-c7-x/r1/ | grep -Eq "^codex\.[A-Za-z0-9]{6}$" && bad "成功發布後暫存檔要刪掉" || ok "成功發布後暫存檔刪掉了"
+
+echo "── archive-review：沒起作用要自己講（2026-09-19 事故） ──"
+# 大 bundle 不再被擋：規格 500 KB 照送（兩個替身都答）；只印警告
+python3 -c 'open("openspec/changes/app-d0-x/proposal.md","w").write("# big\n" + ("x" * 99 + "\n") * 5200)' 2>/dev/null || { mkdir -p openspec/changes/app-d0-x; python3 -c 'open("openspec/changes/app-d0-x/proposal.md","w").write("# big\n" + ("x" * 99 + "\n") * 5200)'; }
+git add -A && git commit -qm spec8; export GH_BRANCH="feat/app-d0-x--a"
+out="$(ARCHIVE_REVIEW_CODEX_BIN=$W/bin/codex-good ARCHIVE_REVIEW_GEMINI_BIN=$W/bin/gemini-good $AR app-d0-x 2>&1)"; rc=$?
+echo "$out" | grep -q "超過已實測範圍" && [ "$rc" = 0 ] && ok "bundle 500 KB → 只警告、照送、rc 0" || bad "bundle 500 KB → 只警告、照送、rc 0" "rc=$rc $(echo "$out" | tail -2 | tr '\n' ' ')"
+echo "$out" | grep -q "超過 110 KB" && bad "110 KB 的拒絕線已經不存在" || ok "110 KB 的拒絕線已經不存在"
+python3 -c 'import json,sys;rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()];assert sum(1 for r in rows if r["kind"]=="review" and r["id"]=="app-d0-x" and r["ok"] and r["size"]>400000)==2' "$L" && ok "500 KB 的 change 兩個模型都 ok、row 記了 size" || bad "500 KB 的 change 兩個模型都 ok、row 記了 size"
+# 連續 2 個不同的 change 沒起作用（模型都不在 → rc 127）→ 第三個 change 送之前擋、exit 3、blocked row；補跑自己不被自己擋
+python3 -c 'open(".local/archive-review.jsonl","w").close()'
+for k in 1 2 3; do mkdir -p "openspec/changes/app-d$k-x"; echo "# p" > "openspec/changes/app-d$k-x/proposal.md"; done; git add -A && git commit -qm specd
+export GH_BRANCH="feat/app-d1-x--a";  $AR app-d1-x  >/dev/null 2>&1 || true
+export GH_BRANCH="feat/app-d2-x--a"; $AR app-d2-x >/dev/null 2>&1 || true
+expect_grep "跳過 codex" "第 2 個沒起作用的 change 本身還能送（連續數要到 2 才擋）" $AR app-d2-x
+export GH_BRANCH="feat/app-d3-x--a"
+out="$($AR app-d3-x 2>&1)"; rc=$?
+echo "$out" | grep -q "連續 2 個 change 沒起作用" && [ "$rc" = 3 ] && ok "連續 2 個 change 沒起作用 → 第 3 個被擋、exit 3" || bad "連續 2 個 change 沒起作用 → 第 3 個被擋、exit 3" "rc=$rc $(echo "$out" | tail -1)"
+echo "$out" | grep -q "rc=127" && ok "擋的訊息印出原因（rc 分布）" || bad "擋的訊息印出原因（rc 分布）" "$out"
+tail -1 "$L" | grep -q '"kind": "blocked", "id": "app-d3-x"' && ok "被擋有 blocked row" || bad "被擋有 blocked row" "$(tail -1 "$L")"
+[ ! -d .local/archive-review/app-d3-x/r1 ] && ok "被擋就沒有開跑（沒有 r1/）" || bad "被擋就沒有開跑（沒有 r1/）"
+expect_rc 2 "--anyway 沒給理由被擋"                    $AR app-d3-x --anyway ""
+expect_rc 2 "--anyway 多餘參數被擋"                    $AR app-d3-x --anyway 理由 foo
+expect_grep "跳過 codex" "--anyway \"理由\" → 照送" $AR app-d3-x --anyway "CLI 剛裝好，確認過"
+grep -q '"kind": "override", "id": "app-d3-x", "round": 1, "reason": "CLI 剛裝好，確認過"' "$L" && ok "--anyway 的理由入帳" || bad "--anyway 的理由入帳"
+export GH_BRANCH="feat/app-d1-x--a"
+expect_rc 3 "override 不重設連續數：下一個 change 沒 --anyway 照樣被擋" $AR app-d1-x
+# report：從 attempt 算送過幾個；0 個答齊、≥2 沒答齊 → 結論是「機制沒起作用」，不是「樣本還沒滿」
+out="$(report)"
+echo "$out" | grep -q "送過 3 個 change（有 attempt row）：答齊 0、沒答齊 3" && ok "report 印送過／答齊／沒答齊" || bad "report 印送過／答齊／沒答齊" "$out"
+echo "$out" | grep -q "codex rc=127" && ok "report 印沒答齊的原因" || bad "report 印沒答齊的原因" "$out"
+echo "$out" | grep -q "被擋 2 次、--anyway 硬送 1 次（CLI 剛裝好，確認過）" && ok "report 印被擋與硬送次數＋理由" || bad "report 印被擋與硬送次數＋理由" "$out"
+echo "$out" | grep -q "結論：\*\*機制沒起作用\*\*" && ok "0 答齊、≥2 沒答齊 → 結論「機制沒起作用」" || bad "0 答齊、≥2 沒答齊 → 結論「機制沒起作用」" "$out"
+echo "$out" | grep -q "樣本還沒滿" && bad "不能再說「樣本還沒滿」" || ok "不能再說「樣本還沒滿」"
+# 陽性對照：兩個 change 一個答齊了 → 不擋（連續數看的是「最近 2 個都沒答齊」）
+row app-d2-x codex 1 10 0 true "$(ts 7 0)"; row app-d2-x gemini 1 10 0 true "$(ts 7 0)"
+expect_grep "跳過 codex" "最近 2 個裡有 1 個答齊 → 不擋" $AR app-d1-x
 
 echo
 echo "通過 $PASS / 失敗 $FAIL / 共 $((PASS+FAIL))"
