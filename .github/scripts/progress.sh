@@ -1170,6 +1170,7 @@ if wbs_path.exists():
     # 提到的 `FE-A01` 是那條驗收的出處），照字面抽會誤報。它沒被驗這件事每次跑都會講。
     _XD_CANON = ["這一項", "依賴", "關係", "說明"]
     _xd_head, _in_xd, _xd_done, _xd_bad = None, False, False, False
+    _xd_hdr_line = None     # 標題底下那張表的表頭行（下面「放錯地方」要排除它）
     for lineno, raw in _wbs_vis:
         bare = raw.strip()
         s = plain(bare)
@@ -1189,6 +1190,7 @@ if wbs_path.exists():
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cc if c):
             continue
         if _xd_head is None:
+            _xd_hdr_line = lineno
             if cc == _XD_CANON:
                 _xd_head = "canonical"
             else:
@@ -1276,8 +1278,24 @@ if wbs_path.exists():
     elif _legacy:
         _xdep_meta.update(schema="legacy_free_text", rows=_legacy,
                           reason="legacy_cross_dep_table_is_free_text")
+    # 正本表頭放錯地方：不在 `## 跨項依賴` 底下（沒有標題、或標題層級不對）。正本只認
+    # 標題底下的表、相容層只認兩欄表頭，這種表兩邊都不認 —— rc=0、連「沒有被驗」都不講。
+    # GuildHub #671 實測：把舊表**原地**改成四欄是最自然的遷法，第一版就是這樣綠著過的。
+    _xd_misplaced = False
+    for lineno, raw in _wbs_vis:
+        bare = raw.strip()
+        if not bare.startswith("|") or lineno == _xd_hdr_line:
+            continue
+        cc = [plain(x.strip()) for x in bare.strip("|").split("|")]
+        if cc[:2] == ["這一項", "依賴"] and len(cc) > 2:
+            _xd_misplaced = True
+            violations.append(
+                f"docs/WBS.md 第 {lineno} 行是〈跨項依賴〉的正本表頭，但它不在「## 跨項依賴」這個標題底下"
+                f" —— 這張表現在完全沒有被讀到（排程、環都沒驗）。把它搬到 `## 跨項依賴` 底下")
     if _xd_head == "canonical":
         _xdep_meta.update(schema="canonical", ordering_status="available", reason=None)
+    elif _xd_misplaced and _xdep_meta["schema"] is None:
+        _xdep_meta["reason"] = "cross_dep_table_not_parsed"
     elif _xdep_meta["found_heading"] and _xdep_meta["schema"] is None:
         # 有這一節、卻解析不出來：跟「沒有這張表」是兩件事（網頁要講的話也不同）。
         _xdep_meta["reason"] = "cross_dep_table_not_parsed"
