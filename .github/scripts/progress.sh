@@ -8,6 +8,7 @@
 #     bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束
 #     bash .github/scripts/progress.sh --render   # 更新 docs/WBS.md 的進度區塊
 #     bash .github/scripts/progress.sh --trace    # 哪些工作沒有被任何里程碑指到（報告，不擋）
+#     bash .github/scripts/progress.sh --as-of 2026-10-12  # 把「今天」當成這一天（週次錨點用）
 #
 # **這份是算出來的，不是寫出來的。** 沒有任何人維護它。
 #
@@ -115,6 +116,7 @@ CHECK=0
 JSON=0
 RENDER=0
 TRACE=0
+AS_OF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)     SHOW_ALL=1 ;;
@@ -123,8 +125,9 @@ while [ $# -gt 0 ]; do
     --json)    JSON=1 ;;
     --render)  RENDER=1 ;;
     --trace)   TRACE=1 ;;
+    --as-of)   shift; AS_OF="${1:-}" ;;
     --week)    shift; ONLY_WEEK="${1:-}" ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
   esac
   shift
@@ -150,7 +153,7 @@ elif ! git fetch -q origin 2>/dev/null; then
 fi
 
 SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" \
-RENDER="$RENDER" TRACE="$TRACE" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
+RENDER="$RENDER" TRACE="$TRACE" AS_OF="$AS_OF" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
 import os, re, sys, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
@@ -159,6 +162,18 @@ CHECK = os.environ.get("CHECK") == "1"
 JSON = os.environ.get("JSON") == "1"
 RENDER = os.environ.get("RENDER") == "1"
 TRACE = os.environ.get("TRACE") == "1"
+AS_OF = os.environ.get("AS_OF") or ""
+if AS_OF:
+    # `--as-of` 是測試與回放用的「今天」。**格式錯就停**，不要默默改用真實時鐘 ——
+    # 那樣測試會在某一天突然開始依賴日期，而且看起來還是綠的。
+    import datetime as _dt0
+    try:
+        _dt0.date.fromisoformat(AS_OF)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", AS_OF):
+            raise ValueError
+    except ValueError:
+        print(f"--as-of 要是 YYYY-MM-DD 而且是真的日期，現在是「{AS_OF}」", file=sys.stderr)
+        raise SystemExit(2)
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
 # 遠端 refs 是不是這一次抓下來的。**不新鮮的時候要說**，見上面 shell 那段。
 REMOTE_FRESH = os.environ.get("REMOTE_FRESH") == "1"
@@ -1732,6 +1747,100 @@ else:
               "pool": None, "covered": None, "uncovered_scheduled": None,
               "uncovered_unscheduled": None, "excluded": None}
 
+# ── 週次錨點（2026-09-25）──────────────────────────────────────────
+# **純報告，exit 0。** 時間不能進 `--check` 的退出碼：同一份程式碼今天測跟明天測
+# 結果要一樣（CI 冪等性）；放一個週末，無關的 PR 會突然變紅；人會學會把錨點往後推。
+#
+# 週次（W1、決策≤W5）本來沒有錨：W1 是哪一天沒人知道，所以 `決策≤W5` 在期限**過了之後**
+# 永遠不會出聲。一張放了三個月的地圖，每條規則都綠，期限全是過去式。
+#
+#   <!-- wbs:week1 2026-10-05 Asia/Taipei -->
+#
+# 人設一次、只能有一個、**時區寫明**（台北與 UTC 的 CI 在換日那幾小時會差一天）。
+# 不從 git 第一個 commit 推：匯入歷史、rebase、shallow clone 都會讓它無聲失真；
+# 人改日期至少 diff 看得見。W1 是錨點起的七天；`決策≤W1` 在 W2 第一天才算過期。
+# `--as-of YYYY-MM-DD` 把「今天」換掉 —— 測試不准依賴真實時鐘。
+#
+# 缺口三態。**「已裁決」看缺口算出來的狀態**：終態是 `已完成`（`Done`，理由欄寫答案）
+# 或 `已取消`（`Cancelled`）。其他（等外部、待裁決、未開始）都追：截止前 `waiting`，
+# 截止後 `fallback_effective`。fallback（`【沒答案就】…`）是強制寫的，期限到了語意上
+# 就生效了 —— 報告講的是「fallback 已自 Wn 起生效」，不是永遠叫「未決」。
+# （曾經定成「看 `待裁決` 類型的阻塞邊消失」：GuildHub 26 個有期限的缺口，指向它們的
+# 邊沒有一條是 `待裁決` 類型 —— 全部會被判成已裁決，這個機制永遠不出聲。）
+import datetime as _dt
+try:
+    import zoneinfo as _zi
+except ImportError:                                   # Python < 3.9
+    _zi = None
+_cal = {"status": "disabled", "reason": "no_anchor", "anchor": None, "tz": None,
+        "as_of": None, "current_week": None, "gaps": [],
+        "counts": {"waiting": 0, "decided": 0, "fallback_effective": 0}}
+_deadline_gaps = [w for w in order if wbs[w].get("deadline") is not None]
+_cal["deadline_gaps"] = len(_deadline_gaps)
+_ANCHOR = re.compile(r"^<!--\s*wbs:week1\s+(\d{4}-\d{2}-\d{2})\s+(\S+)\s*-->$")
+_alines = []
+if wbs_path.is_file():
+    # HTML 註解：`visible_lines()` 會把它拿掉，所以這裡讀原文。圍籬裡的不算。
+    _fence = None
+    for _ln, _raw in enumerate(wbs_path.read_text(encoding="utf-8").splitlines(), 1):
+        _m = _FENCE.match(_raw.strip())
+        if _m and _fence is None:
+            _fence = _m.group(1)
+            continue
+        if _fence is not None:
+            if _FENCE_CLOSE.match(_raw.strip()) and _raw.strip().startswith(_fence[0] * len(_fence)):
+                _fence = None
+            continue
+        if "wbs:week1" in _raw:
+            _alines.append((_ln, _raw.strip()))
+if len(_alines) > 1:
+    violations.append("docs/WBS.md 有 " + str(len(_alines)) + " 行週次錨點（第 "
+                      + "、".join(str(l) for l, _ in _alines) + " 行）——只能有一個")
+    _cal["reason"] = "multiple_anchors"
+elif _alines:
+    _ln, _raw = _alines[0]
+    _m = _ANCHOR.match(_raw)
+    _anchor_date = _tz = None
+    if not _m:
+        violations.append(f"docs/WBS.md 第 {_ln} 行的週次錨點格式不對："
+                          "要是 `<!-- wbs:week1 YYYY-MM-DD 時區 -->`（時區寫 IANA 名稱，例如 Asia/Taipei）")
+        _cal["reason"] = "anchor_malformed"
+    else:
+        try:
+            _anchor_date = _dt.date.fromisoformat(_m.group(1))
+        except ValueError:
+            violations.append(f"docs/WBS.md 第 {_ln} 行的週次錨點日期不存在：{_m.group(1)}")
+            _cal["reason"] = "anchor_malformed"
+        try:
+            _tz = _zi.ZoneInfo(_m.group(2)) if _zi else None
+        except Exception:
+            _tz = None
+        if _tz is None:
+            violations.append(f"docs/WBS.md 第 {_ln} 行的週次錨點時區認不出來：{_m.group(2)}"
+                              "（要 IANA 名稱，例如 Asia/Taipei、UTC）")
+            _cal["reason"] = "anchor_malformed"
+    if _anchor_date and _tz:
+        if AS_OF:
+            _today = _dt.date.fromisoformat(AS_OF)   # 開頭已經驗過格式
+        else:
+            _today = _dt.datetime.now(_tz).date()
+        _days = (_today - _anchor_date).days
+        _cw = _days // 7 + 1 if _days >= 0 else 0    # 錨點之前是 W0（還沒開始）
+        _cal.update(status="enabled", reason=None, anchor=_anchor_date.isoformat(),
+                    tz=_m.group(2), as_of=_today.isoformat(), current_week=_cw)
+        for _g in _deadline_gaps:
+            _n = wbs[_g]["deadline"]
+            _st = _state_of.get(_g)
+            if _st in ("已完成", "已取消"):
+                _cs, _since = "decided", None
+            elif _cw <= _n:
+                _cs, _since = "waiting", None
+            else:
+                _cs, _since = "fallback_effective", _n + 1
+            _cal["counts"][_cs] += 1
+            _cal["gaps"].append({"id": _g, "deadline": _n, "state": _st,
+                                 "calendar_state": _cs, "effective_since_week": _since})
+
 # ── 對不上任何 WBS ID 的 change（2026-09-12 起是 violation，不只是紅字）────
 #
 # **為什麼從提示升成違規**：有地圖的專案裡，一個 change 開了、id 對不上任何
@@ -1806,6 +1915,32 @@ if wbs and not JSON:
         if _tr["excluded"]:
             print(f"{D}  不算（Cancelled／Regular）：{'、'.join(_tr['excluded'])}{X}")
 
+# 週次錨點：設了就每次講今天是第幾週、幾個缺口的 fallback 已經生效；
+# 沒設、但有 `決策≤Wn` 的缺口，要講「沒設所以判斷不了」；什麼期限都沒有的專案不講。
+if wbs and not JSON:
+    _c = _cal
+    if _c["status"] == "enabled":
+        _f = _c["counts"]["fallback_effective"]
+        print()
+        if _f:
+            print(f"{Y}週次：今天 W{_c['current_week']}（錨點 {_c['anchor']} {_c['tz']}）；"
+                  f"{_f} 個缺口已過決策期限、還沒有答案 —— fallback 已生效{X}{D}（--trace 看是哪些）{X}")
+        else:
+            print(f"{D}週次：今天 W{_c['current_week']}（錨點 {_c['anchor']} {_c['tz']}）；"
+                  f"沒有缺口過了決策期限還沒答案。{X}")
+        if TRACE:
+            for _g in _c["gaps"]:
+                if _g["calendar_state"] == "decided":
+                    continue
+                _tag = (f"fallback 自 W{_g['effective_since_week']} 起生效"
+                        if _g["calendar_state"] == "fallback_effective" else "還在期限內")
+                print(f"    ↳ {_g['id']:<9} 決策≤W{_g['deadline']:<3} {_g['state']:<6} {_tag}")
+    elif _c["deadline_gaps"] and _c["reason"] == "no_anchor":
+        print()
+        print(f"{D}週次錨點：未設定 —— {_c['deadline_gaps']} 個缺口的決策期限（決策≤Wn）"
+              f"判斷不了有沒有過期。在 docs/WBS.md 加一行 "
+              f"`<!-- wbs:week1 YYYY-MM-DD Asia/Taipei -->`（W1 第一天、時區）。{X}")
+
 _todo = setup_todo()
 if _todo and not JSON and not CHECK:
     print()
@@ -1828,7 +1963,7 @@ if JSON:
     out = {"items": [], "groups": _groups, "affects": {},
            "milestones": _milestones, "milestones_meta": _ms_meta, "deps": _deps,
            "deps_meta": _xdep_meta, "dep_graph": _dep_graph,
-           "milestone_trace": _trace,
+           "milestone_trace": _trace, "calendar": _cal,
            "remote_fresh": REMOTE_FRESH, "remote_why": REMOTE_WHY}
     _aff = collections.defaultdict(list)
     for wid in order:
