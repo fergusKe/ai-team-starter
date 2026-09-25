@@ -166,7 +166,9 @@ run() {
   local want="$1" desc="$2" needle="$3"
   local out rc
   # `ASOF=YYYY-MM-DD run …`：把「今天」換掉（週次錨點的測試用；不准依賴真實時鐘）
-  out="$(cd "$W" && bash "$SCRIPT" --check ${ASOF:+--as-of "$ASOF"} 2>&1)"; rc=$?
+  # `WEEK=W2 run …`：加 `--week`；`RUN_ARGS=… run …`：原樣接在最後（測「參數沒帶值」用）
+  # shellcheck disable=SC2086
+  out="$(cd "$W" && bash "$SCRIPT" --check ${ASOF:+--as-of "$ASOF"} ${WEEK:+--week "$WEEK"} ${RUN_ARGS:-} 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
     bump_fail; return
@@ -261,7 +263,7 @@ print("yes" if str(d.get(sys.argv[1])) == sys.argv[2] else "no:" + str(d.get(sys
 # 而這個 repo 的判準是「共用 oracle 越少越好、每個都要走過失敗路徑」。
 run_expr() {
   local desc="$1" expr="$2" out
-  out="$(cd "$W" && bash "$SCRIPT" --json ${ASOF:+--as-of "$ASOF"} 2>/dev/null | python3 -c '
+  out="$(cd "$W" && bash "$SCRIPT" --json ${ASOF:+--as-of "$ASOF"} ${WEEK:+--week "$WEEK"} 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 m, meta = d.get("milestones"), d.get("milestones_meta")
@@ -2013,7 +2015,8 @@ run 1 "同一列改成「全部」就要紅" "APP-C02（最晚 W3）"
 # 把某種跳過漏算，加總會對不上。
 baseline
 xdep "| APP-P03 | APP-C01、APP-O10 | 全部 | 一條可比、一條常態 |
-| APP-C01 | DEP-G01 | 全部 | 依賴一個沒有週次的缺口 |"
+| APP-C01 | APP-O10 | 全部 | 依賴一個沒有週次的常態項目（缺口不准寫在這張表） |"
+run 0 "分母守恆那份 fixture 本身是合法的" ""
 run_expr "分母守恆：evaluated＋各類 skipped＝edges，而且至少評估一條" \
   "(lambda c: c['edges']==3 and c['evaluated']>=1 and c['evaluated']+c['skipped_dep_missing'] \
    +c['skipped_src_no_week']+c['skipped_dep_cancelled']+c['skipped_dep_no_week']==c['edges'])(g['cross_deps'])"
@@ -2257,6 +2260,97 @@ ASOF=20261012 run 2 "--as-of 格式不對：參數錯誤（2）" "要是 YYYY-MM
 baseline
 anchor
 ASOF=2026-10-12 run_json_parses "--json 的 stdout 還是合法 JSON（週次摘要不准混進去）"
+
+
+# ── 第三位審查者（Fable）找到、重現過的（2026-09-25）────────────────────
+
+# `--week` 是顯示篩選，**不准改變 `--check` 的結論**。原本它在算出狀態之前就跳過，
+# 不在那一週的項目在狀態表裡不存在：`--week W2 --check` 紅、不加綠，`--week W1 --json` KeyError。
+baseline
+edit "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | |" "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | Done｜PR #1 |"
+edit "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | |" "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | Done｜PR #2 |"
+xdep "| APP-P03 | APP-C01 | 全部 | 清單要先有骨架 |"
+run 0 "兩項都完成：綠" ""
+WEEK=W2 run 0 "--week W2 不改變 --check 的結論（依賴圖要看得到 W1 的項目）" ""
+WEEK=W1 run_expr "--week W1 --json 不炸，依賴圖用的是全部項目的狀態" \
+  "g['cross_deps']['done_before_deps']==0 and len(d['items'])==4"
+
+# 舊「已知的跨項依賴」表認表頭，不認散文：提到這個詞的一句話＋後面一張無關的兩欄表，不是舊表。
+baseline
+edit "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |" "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |
+
+## 跨項依賴
+
+原本的「已知的跨項依賴」表已經遷成正本。
+
+| 這一項 | 依賴 | 關係 | 說明 |
+|---|---|---|---|
+| APP-P03 | APP-C01 | 全部 | 正本 |
+
+## 對照
+
+| 舊 | 新 |
+|---|---|
+| \`APP-O10\` | APP-C01 |"
+run 0 "散文提到「已知的跨項依賴」＋後面一張無關的兩欄表：不是舊表，不誤報並存" ""
+
+baseline
+edit "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |" "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |
+
+## 對照
+
+我們不再用已知的跨項依賴那張表了。
+
+| 舊 | 新 |
+|---|---|
+| \`APP-O10\` | APP-C01 |"
+run_expr "那句話後面第一張表的表頭不是「這一項｜依賴」：不當舊表、也不送給網頁" \
+  "x['schema'] is None and d['deps']==[]"
+
+# 要接值的參數沒帶值就停（原本被吞成空字串、照常跑）。
+baseline
+RUN_ARGS=--as-of run 2 "--as-of 沒帶值：參數錯誤（2）" "要接日期"
+RUN_ARGS=--week run 2 "--week 沒帶值：參數錯誤（2）" "要接週次"
+
+# 已完成而前置「已取消」：說「已取消、改寫這一列」，不說「還沒完成」。
+baseline
+edit "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | |" "| APP-C01 | 應用骨架 | 專案骨架 | W1 | 3 | | Cancelled｜改用別的做法 |"
+edit "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | |" "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | Done｜PR #2 |"
+xdep "| APP-P03 | APP-C01 | 全部 | 清單要先有骨架 |"
+run 1 "已完成而前置已取消：講清楚是「已取消、改寫這一列」" "它依賴的 APP-C01 已取消（改用別的做法完成的話"
+run_absent 1 "…而且不說它「還沒完成」" "APP-C01 還沒完成"
+
+
+# 「靠哪些」寫群組：群組不是涵蓋，原本被靜靜吞掉、可追溯性報它的成員未涵蓋。
+baseline
+edit "| APP-C01、APP-P03 |" "| APP-C、APP-P03 |"
+run 1 "「靠哪些」寫群組要紅（逐項列出）" "寫了群組 APP-C"
+
+# 目標週的形狀：網頁按週分組靠它配對，錯了那個里程碑在週視圖上靜靜消失。
+baseline
+edit "| M1 一個人跑完主流程 | W2 |" "| M1 一個人跑完主流程 | 第2週 |"
+run 1 "目標週不是 Wn 要紅" "的「目標週」要是"
+baseline
+edit "| M1 一個人跑完主流程 | W2 |" "| M1 一個人跑完主流程 | W2–W3 |"
+run 0 "目標週可以是範圍（en dash）" ""
+baseline
+edit "| M1 一個人跑完主流程 | W2 |" "| M1 一個人跑完主流程 | W2-W3 |"
+run 1 "目標週範圍打成 ASCII 連字號要紅（跟週欄同一個文法）" "的「目標週」要是"
+baseline
+edit "| M1 一個人跑完主流程 | W2 |" "| M1 一個人跑完主流程 | — |"
+run 0 "目標週可以是 —（還沒排）" ""
+
+# 〈跨項依賴〉的依賴寫成缺口：繞過不變量 5。缺口寫在阻塞欄。
+baseline
+xdep "| APP-C01 | DEP-G01 | 全部 | 應該寫在阻塞欄 |"
+run 1 "〈跨項依賴〉的依賴是缺口要紅" "DEP-G01 是缺口"
+
+# 用 change 做掉的缺口（全部封存）也是已裁決 —— 有 change 的項目不准標 Done。
+baseline
+anchor
+mkarchived dep-g01-search
+ASOF=2026-10-12 run_expr "已封存的缺口是 decided" \
+  "d['calendar']['gaps'][0]['state']=='已封存' and d['calendar']['gaps'][0]['calendar_state']=='decided'"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
