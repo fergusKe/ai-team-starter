@@ -97,6 +97,20 @@ APP-Z99 已經改名。**這一節提到不存在的 ID 是它的工作**，不�
 | APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | |
 | | | 搜尋與篩選 | W2 | 3 | DEP-G01 `外部-缺` | Pending｜對方還沒提供 |
 | APP-O10 | 文件維護 | 常態 | 常態 | — | | Regular｜沒有完成點 |
+
+## 里程碑
+
+| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |
+|---|---|---|---|
+| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |
+
+> 這一節底下**故意**再放一張兩欄表。實測踩過：GuildHub 的〈里程碑〉後面
+> 接著一張「這一項 | 依賴」的跨項依賴表，也是兩欄，於是那 10 列被當成
+> 10 個里程碑（13 列變 23 列，網頁上看起來還很正常）。
+
+| 這一項 | 依賴 |
+|---|---|
+| `APP-P03` 清單 | `APP-C01` 骨架 |
 WBS
   # 產品意圖那一份。它沒有工作分解表，只靠 ID 指過來 ——
   # 檢查要掃它、而且**不能**因為它沒有表就報「找不到工作分解表」。
@@ -219,6 +233,36 @@ print("yes" if str(d.get(sys.argv[1])) == sys.argv[2] else "no:" + str(d.get(sys
     echo "✓ $desc"; PASS=$((PASS + 1))
   else
     echo "✗ ${desc} —— --json 的 ${key} 期望「${want}」，實際 ${out#no:}"
+    bump_fail
+  fi
+}
+
+# run_ms <說明> <python 表達式>：里程碑那一節的斷言。
+# 表達式裡 `m` 是 `milestones`、`meta` 是 `milestones_meta`。
+#
+# 為什麼要看 json 而不是只看 `--check` 的退出碼：這個 bug 的形狀就是
+# **退出碼是 0、資料是空的**。只斷言「乾淨的表不紅」永遠抓不到它。
+#
+# 用 `eval` 是刻意的，而且只在這裡安全：表達式是**這個檔案裡的字面常數**，
+# 不來自 WBS、不來自環境、不來自任何被測資料；被測資料只經過 `json.load`
+# 綁到 `m` 與 `meta` 上。要換成 key-path 比對就得為每種斷言各加一個 helper，
+# 而這個 repo 的判準是「共用 oracle 越少越好、每個都要走過失敗路徑」。
+run_ms() {
+  local desc="$1" expr="$2" out
+  out="$(cd "$W" && bash "$SCRIPT" --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+m, meta = d.get("milestones"), d.get("milestones_meta")
+try:
+    ok = bool(eval(sys.argv[1]))
+except Exception as e:
+    print("no:表達式炸了 " + repr(e)); raise SystemExit
+print("yes" if ok else "no:" + json.dumps(
+    {"milestones": m, "milestones_meta": meta}, ensure_ascii=False)[:400])' "$expr")"
+  if [ "$out" = yes ]; then
+    echo "✓ $desc"; PASS=$((PASS + 1))
+  else
+    echo "✗ ${desc} —— ${out#no:}"
     bump_fail
   fi
 }
@@ -1710,6 +1754,125 @@ baseline
 edit "DEP-G01 \`外部-缺\`" "DEP-G01–DEP-G03 \`外部-缺\`"
 run 1 "阻塞欄的範圍中間也要驗（--check）" "DEP-G02"
 run_blockers_has "阻塞欄的範圍中間真的進了 blockers" "APP-P03" "DEP-G02"
+
+# ── 里程碑：認表頭，不猜資料列長相 ─────────────────────────────────
+#
+# 2026-09-25 的事故：`prompts/00-map.md` 教的格式（第一欄是 `M1 …`）解析器
+# 完全讀不到，於是 `milestones` 是空陣列、`wbs-page.sh` 的里程碑區塊整塊空白，
+# 而 `--check` 是 **rc=0**。同一段程式還有三種同類吃法（掃到檔尾把別的表吃進來、
+# 標題在檔首整段跳過、讀原始檔所以圍籬裡的範例也算資料）。
+#
+# **這個 bug 活到今天的原因很單純：baseline fixture 從來沒有里程碑表。**
+# 一條沒有 fixture 的路徑，等於沒有測試。
+
+baseline
+run 0 "里程碑正本四欄：乾淨的表是綠的" ""
+run_ms "正本四欄真的進了 json（含 covers 與目標週）" \
+  "meta['schema']=='canonical' and meta['coverage_status']=='available' \
+   and len(m)==1 and m[0]['id']=='M1' and m[0]['covers']==['APP-C01','APP-P03'] \
+   and m[0]['target_week']=='W2'"
+run_ms "同一節的第二張兩欄表不准被吃成里程碑" "len(m)==1 and meta['rows']==1"
+
+# 顯示欄位留原文：網頁是 `md(m.text)` 渲染的，被 plain() 洗過就掉粗體、
+# en dash 也會變成 ASCII。**結構看正規化後的字串，顯示留原文。**
+baseline
+edit "進來、看到、做完一件事" "**進來**、看到、做完一件事"
+run_ms "里程碑敘述保留原文（粗體不准被正規化洗掉）" "m[0]['text'].startswith('**進來**')"
+
+# 舊的兩欄「每週一句話」（GuildHub 現狀）：讀得懂，但要講出它沒有涵蓋資料。
+# **`covers` 是 `None`，不是 `[]`** —— 「不知道涵蓋了什麼」跟「涵蓋了零項」
+# 混在一起，往後的可追溯性報告會對舊格式喊出「全部未涵蓋」。
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |
+|---|---|---|---|
+| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" "| 週 | 這一週結束時，使用者能做什麼 |
+|---|---|
+| **W1** | 骨架立起來、清單列得出來 |"
+run 0 "舊的兩欄格式仍然是綠的（相容層）" ""
+run_ms "舊格式要報 unavailable、covers 是 None（不是空陣列）" \
+  "meta['schema']=='legacy_week_goal' and meta['coverage_status']=='unavailable' \
+   and meta['reason']=='legacy_milestone_schema_has_no_covers_column' \
+   and m[0]['covers'] is None"
+
+# 有標題、一列都讀不出來：畫面上是一節正常的里程碑，機器手上是空陣列。
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |
+|---|---|---|---|
+| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" "還沒想好，先留個位置。"
+edit "| 這一項 | 依賴 |
+|---|---|
+| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |" "（跨項依賴表也先拿掉，讓這一節只剩標題與一句話。）"
+run 1 "有〈里程碑〉標題卻一列都解析不出來要紅" "一列里程碑都解析不出來"
+
+# 兩欄不等於舊格式。**舊格式的表頭第一欄一定是「週」** —— 只認欄數的話，
+# 一節裡任何一張兩欄表（例如跨項依賴表）都會變成里程碑，而且是安靜地變。
+# 這裡把正本那張表拿掉，只留跨項依賴表：它不可以被收成里程碑。
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |
+|---|---|---|---|
+| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" "（正本那張表先拿掉，只留下面那張兩欄的跨項依賴表。）"
+run 1 "一節裡只有一張別的兩欄表時，不准把它當成舊格式的里程碑" "欄位認不出來"
+run_ms "那張兩欄表不准進 milestones" "len(m)==0 and meta['schema'] is None"
+
+# 表頭認不出來（例如舊文件教的三欄）要紅，不可以安靜地當成沒有里程碑。
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |" "| 里程碑 | 意思 | 靠哪些 |"
+run 1 "里程碑表頭認不出來要紅" "欄位認不出來"
+
+# 欄數對不上：那一列會被讀歪（少一欄不是少一個里程碑）。
+baseline
+edit "| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" \
+     "| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 |"
+run 1 "里程碑表裡欄數對不上要紅" "表頭是 4 欄"
+
+# 「靠哪些」指向不存在的項目 —— 重排群組之後最容易斷的就是這種。
+baseline
+edit "APP-C01、APP-P03 |" "APP-C01、APP-Z11 |"
+run 1 "里程碑的「靠哪些」指向不存在的 ID 要紅" "APP-Z11"
+
+baseline
+edit "APP-C01、APP-P03 |" "APP-C01、APP-C01 |"
+run 1 "「靠哪些」裡重複引用同一個 ID 要紅" "重複的 ID"
+
+baseline
+edit "| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" \
+     "| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01 |
+| M1 又一個 M1 | W3 | 不該過 | APP-P03 |"
+run 1 "里程碑 ID 重複要紅" "重複的里程碑 ID"
+
+# 後面章節的 `| **W9** | 41 |`（例如一張每週負荷參考表）不准被吃成里程碑。
+# 舊的解析器掃到檔尾，所以它會變成一個叫「41」的里程碑。
+baseline
+edit "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |" "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |
+
+## 每週負荷（參考表，不是里程碑）
+
+| 週 | 點數 |
+|---|---|
+| **W9** | 41 |"
+run_ms "後面章節的 | **W9** | 不准被吃成里程碑" \
+  "len(m)==1 and all(x['id']!='W9' for x in m) and all(x['text']!='41' for x in m)"
+
+# 圍籬裡的格式範例不是資料。這一段原本讀的是原始檔，不是 visible_lines()。
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |" "\`\`\`markdown
+| M9 假的 | W9 | 不該出現 | APP-C01 |
+\`\`\`
+
+| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |"
+run 0 "圍籬裡的里程碑範例不准被當成表頭" ""
+run_ms "圍籬裡的里程碑範例不准進 json" "len(m)==1 and m[0]['id']=='M1'"
+
+# 〈里程碑〉剛好在檔首：原本 `_mi > 0` 為假，整段跳過。
+baseline
+python3 - "$W/docs/WBS.md" <<'PY'
+import io, sys
+p = sys.argv[1]
+t = io.open(p, encoding="utf-8").read()
+i, j = t.index("## 里程碑"), t.index("> 這一節底下")
+io.open(p, "w", encoding="utf-8").write(t[i:j] + "\n" + t[:i] + t[j:])
+PY
+run_ms "〈里程碑〉在檔首也要解析得到" "len(m)==1 and m[0]['id']=='M1'"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
