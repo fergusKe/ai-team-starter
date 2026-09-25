@@ -1246,21 +1246,24 @@ if wbs_path.exists():
             if "已知的跨項依賴" in s and not bare.startswith("|"):
                 _lg = "seek"
             continue
-        if _lg == "done":
-            break
+        # 那句話底下沒有舊表（遇到標題、或第一張表的表頭不對）：它只是一段提到這個詞的
+        # 散文，**往後繼續找**，不要整份放棄。原本遇到就 break —— 前面一段說明先提了
+        # 「底下那張已知的跨項依賴表」，真正的表就靜靜消失、連「沒有被驗」都不講（實測）。
         if s.startswith("#"):
-            _lg = "done"
+            if _lg == "in":
+                break
+            _lg = None
             continue
         if not bare.startswith("|"):
             if _lg == "in":
-                _lg = "done"
+                break
             continue
         cc_raw = [x.strip() for x in bare.strip("|").split("|")]
         cc = [plain(x) for x in cc_raw]
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cc if c):
             continue
         if _lg == "seek":
-            _lg = "in" if cc == ["這一項", "依賴"] else "done"
+            _lg = "in" if cc == ["這一項", "依賴"] else None
             continue
         if len(cc_raw) == 2:
             _legacy += 1
@@ -1275,6 +1278,9 @@ if wbs_path.exists():
                           reason="legacy_cross_dep_table_is_free_text")
     if _xd_head == "canonical":
         _xdep_meta.update(schema="canonical", ordering_status="available", reason=None)
+    elif _xdep_meta["found_heading"] and _xdep_meta["schema"] is None:
+        # 有這一節、卻解析不出來：跟「沒有這張表」是兩件事（網頁要講的話也不同）。
+        _xdep_meta["reason"] = "cross_dep_table_not_parsed"
 
 # ── OpenSpec 的實際狀態 ────────────────────────────────────────────
 def tasks_progress(d: pathlib.Path):
@@ -1415,6 +1421,7 @@ _state_of = {}
 # repo 沒有新 commit，那個狀態當下就過期。把它寫進版控等於把一個當下的
 # 東西凍成一份紀錄，所以 WBS 的機器區塊只放這一份。
 _durable_of = {}
+_week_ids = set()        # `--week` 之下落在那一週的項目（只給顯示用；狀態照樣每一項都算）
 for wid in order:
     info = wbs[wid]
     wk = sorted(info["weeks"])
@@ -1535,6 +1542,7 @@ for wid in order:
     _durable_of[wid] = durable if durable is not None else state
     if not _in_week:
         continue
+    _week_ids.add(wid)
     tally[state] += 1
     by_group[re.sub(r"[0-9]+$", "", wid)][state] += 1
     if ONLY_BLOCKED and state not in ("等外部", "待裁決"):
@@ -1725,6 +1733,14 @@ for r in _xdep_rows:
                 violations.append(
                     f"〈跨項依賴〉第 {r['line']} 行：{dep} 是缺口（決策≤W{wbs[dep]['deadline']}、"
                     f"沒有工作週次）—— 缺口寫在 {src} 的阻塞欄，這一張只放工作項目彼此的先後")
+            else:
+                # 沒有週次、也不是缺口（沒排週次的項目、或常態 Regular）：排不出先後，
+                # 原本靜靜落進這個桶，同一列另一條邊被評估到時連分母那行都不印（實測）。
+                # 常態的東西沒有完成點 —— 真的要依賴，拆出一個有週次的一次性項目
+                # （例如「管線可用」）再依賴它（第十四輪兩位一致）。
+                violations.append(
+                    f"〈跨項依賴〉第 {r['line']} 行：{dep} 沒有工作週次，排不出先後 —— "
+                    f"先替它排週次；常態的東西拆出一個有週次的一次性項目再依賴它")
             continue
         _xd["evaluated"] += 1
         evaluated_here += 1
@@ -2230,11 +2246,16 @@ if total:
             c = by_group[g]
             n = sum(c.values())
             print(f"{D}  {g:<6} {n:>3} 項：" + "、".join(f"{k} {v}" for k, v in c.most_common()) + X)
-    if blocks:
+    # `--week` 之下只算落在那一週的依賴者 —— 上面的統計是篩過的，這一段不篩的話，
+    # 同一個畫面兩種範圍（實測：「WBS 共 14 項」底下列出影響五十幾項）。
+    _shown_blocks = {g: (ids & _week_ids if ONLY_WEEK else ids) for g, ids in blocks.items()}
+    _shown_blocks = {g: ids for g, ids in _shown_blocks.items() if ids}
+    if _shown_blocks:
         # 「這個缺口解掉，會解鎖幾件事」—— 這是決定先問哪一個的依據。
         print()
-        print(f"{B}哪些項目依賴外部{X}（依影響範圍排序）：")
-        for gap, ids in sorted(blocks.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        print(f"{B}哪些項目依賴外部{X}（依影響範圍排序"
+              + (f"，只算 {ONLY_WEEK} 的項目" if ONLY_WEEK else "") + "）：")
+        for gap, ids in sorted(_shown_blocks.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             names = "、".join(sorted(ids))
             print(f"{R}  {gap:<8}{X} 影響 {len(ids)} 項：{D}{names}{X}")
         print()

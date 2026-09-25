@@ -121,6 +121,8 @@ const xdNote =
   : XD.schema === "legacy_free_text"
     ? `〈跨項依賴〉還是舊的自由文字表（${D.deps.length} 條）：<strong>排程與環沒有被驗</strong>，` +
       `改成正本 <code>## 跨項依賴</code>（<code>| 這一項 | 依賴 | 關係 | 說明 |</code>）才會驗。`
+  : XD.reason === "cross_dep_table_not_parsed"
+    ? `有〈跨項依賴〉這一節，但解析不出來 —— 跑 <code>bash .github/scripts/progress.sh --check</code> 看原因。`
     : `沒有〈跨項依賴〉表。`;
 $("foot").innerHTML =
   `完整內容在 <code>專案-frontend/docs/WBS.md</code>，狀態用 <code>bash .github/scripts/progress.sh --all</code> 查。<br>
