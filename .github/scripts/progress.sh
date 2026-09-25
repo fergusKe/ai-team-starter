@@ -1702,10 +1702,24 @@ for w in order:
 # (3) 〈跨項依賴〉（只有正本表）：排程逆序、環、已完成而前置沒完成。
 #     判準：被依賴者最晚週 <= 依賴者最早週。**同週合法** —— 一週是排程桶，
 #     不是順序。`W13–W16` 被 `W16` 依賴合法，被 `W15` 依賴不合法。
-#     每一條邊恰好落進一個桶：評估、或四種跳過之一。加總要等於邊數（測試釘住）。
+#     每一條邊恰好落進一個桶：評估、或下面其中一種。加總要等於邊數（測試釘住）。
+#
+#     「這一項」自己沒有工作週次（第十五～十八輪，codex＋Gemini 一致）。判準：
+#     **一條還重要的邊，不准沒被驗過就以綠燈結束。**
+#       這一項已取消         → 跳過、--check 列出（**先於週次判斷**：取消跟有沒有週次無關）
+#       依賴已取消           → 跳過（第十四輪；也先於「這一項沒週次」）
+#       這一項是缺口         → 錯誤：決策期限是「最晚」，不是開工週 —— 實際 W2 就裁決、
+#                              依賴 W3 才做完、期限 W4，拿期限比會綠，順序其實是反的
+#       這一項是常態         → 錯誤：永遠沒有起點，這一列永遠是空殼
+#       這一項已完成、沒週次 → 錯誤：不然「還沒排 → 沒排就直接做完」這條路從頭到尾沒被驗過
+#       這一項還沒排週次     → 跳過、--check 列出：一排上週次同一列就被驗；
+#                              離開這個狀態的每一條路（排週次／取消／完成）都會被驗或被擋
 _xd = {"edges": 0, "evaluated": 0, "skipped_dep_missing": 0,
-       "skipped_src_no_week": 0, "skipped_dep_cancelled": 0,
+       "skipped_src_cancelled": 0, "skipped_dep_cancelled": 0,
+       "pending_src_unscheduled": 0, "src_no_week_error": 0,
        "skipped_dep_no_week": 0, "reversed": [], "cycles": [], "done_before_deps": 0}
+_xd_listed = []      # (列號, 這一項, 為什麼沒比)：--check 要點名，不能只給數字
+_xd_src_err = set()  # 每一列只報一次
 _xg = collections.defaultdict(set)
 for r in _xdep_rows:
     src, deps, rel = r["src"], r["deps"], r["rel"]
@@ -1717,11 +1731,35 @@ for r in _xdep_rows:
         if dep not in wbs or src not in wbs:
             _xd["skipped_dep_missing"] += 1        # 不存在的 ID 由引用掃描報，這裡不重複
             continue
-        if smin is None:
-            _xd["skipped_src_no_week"] += 1
+        if "Cancelled" in parse_mark(wbs[src].get("mark", ""))[0]:
+            _xd["skipped_src_cancelled"] += 1
+            if (r["line"], src, "已取消") not in _xd_listed:
+                _xd_listed.append((r["line"], src, "已取消"))
             continue
         if "Cancelled" in parse_mark(wbs[dep].get("mark", ""))[0]:
             _xd["skipped_dep_cancelled"] += 1
+            continue
+        if smin is None:
+            _sm = parse_mark(wbs[src].get("mark", ""))[0]
+            if wbs[src].get("deadline") is not None:
+                _why = (f"這一項 {src} 是缺口（決策≤W{wbs[src]['deadline']}、沒有工作週次）—— "
+                        f"決策期限是「最晚」，不是開工週，比不出先後；「裁決要等某個工作做完」"
+                        f"寫在 {src} 的理由裡，這一張只放工作項目彼此的先後")
+            elif "Regular" in _sm:
+                _why = (f"這一項 {src} 是常態，沒有起點，排不出先後 —— "
+                        f"拆出一個有週次的一次性項目，讓它依賴 {'、'.join(deps)}")
+            elif _state_of.get(src) in DONE_STATES:
+                _why = (f"{src} {_state_of[src]}，卻沒有工作週次，這條先後從沒被驗過 —— "
+                        f"補上它實際做的週次，或刪掉這一列")
+            else:
+                _xd["pending_src_unscheduled"] += 1
+                if (r["line"], src, "還沒排週次") not in _xd_listed:
+                    _xd_listed.append((r["line"], src, "還沒排週次"))
+                continue
+            _xd["src_no_week_error"] += 1
+            if r["line"] not in _xd_src_err:
+                _xd_src_err.add(r["line"])
+                violations.append(f"〈跨項依賴〉第 {r['line']} 行：{_why}")
             continue
         dmax = week_max(wbs[dep]["weeks"])
         if dmax is None:
@@ -1954,8 +1992,16 @@ if _xdep_meta["schema"] == "legacy_free_text" and not JSON:
 elif _xdep_meta["schema"] == "canonical" and not JSON and _xd["edges"] and not _xd["evaluated"]:
     print()
     print(f"{D}〈跨項依賴〉{_xd['edges']} 條邊，這次沒有一條比得了排程"
-          f"（沒有週次 {_xd['skipped_src_no_week'] + _xd['skipped_dep_no_week']}、"
+          f"（這一項還沒排週次 {_xd['pending_src_unscheduled']}、這一項已取消 {_xd['skipped_src_cancelled']}、"
           f"依賴已取消 {_xd['skipped_dep_cancelled']}）。{X}")
+# 沒比排程、又不算錯的列：**點名**，含 --check（CI 紀錄看得到）。只給數字的話，
+# 同一張表別的邊有被評估時，這幾列就跟「驗過沒問題」長得一樣。
+if _xdep_meta["schema"] == "canonical" and not JSON and _xd_listed:
+    print()
+    print(f"{D}〈跨項依賴〉沒有比排程的列："
+          + "；".join(f"{s_}（第 {ln} 行）{why}" for ln, s_, why in sorted(_xd_listed)) + f"{X}")
+    if any(why == "還沒排週次" for _, _, why in _xd_listed):
+        print(f"{D}  還沒排週次的：排上週次就會驗；沒排週次就標完成會被擋。{X}")
 
 # 里程碑可追溯性：**預設就印一行**（含 --check）。一份沒有人跑的報告，就是
 # 「機制沒起作用、沒人知道」的形狀；零項、舊格式、沒有〈里程碑〉也各自明說 ——
