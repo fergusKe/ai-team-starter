@@ -2021,8 +2021,8 @@ xdep "| APP-P03 | APP-C01、APP-C03 | 全部 | 一條可比、一條依賴已取
 run 0 "分母守恆那份 fixture 本身是合法的" ""
 run_expr "分母守恆：evaluated＋各類 skipped＝edges，而且至少評估一條" \
   "(lambda c: c['edges']==2 and c['evaluated']==1 and c['skipped_dep_cancelled']==1 \
-   and c['evaluated']+c['skipped_dep_missing']+c['skipped_src_no_week']+c['skipped_dep_cancelled'] \
-   +c['skipped_dep_no_week']==c['edges'])(g['cross_deps'])"
+   and c['evaluated']+c['skipped_dep_missing']+c['pending_src_unscheduled']+c['skipped_src_cancelled'] \
+   +c['skipped_dep_cancelled']+c['skipped_dep_no_week']+c['src_no_week_error']==c['edges'])(g['cross_deps'])"
 
 # 說明欄的 ID 是出處，不是依賴（GuildHub 的舊表就是這樣誤判的）。
 baseline
@@ -2402,6 +2402,80 @@ run 1 "依賴一個沒排週次的項目要紅（先排週次）" "APP-O11 沒�
 baseline
 xdep "| APP-P03 | APP-O10 | 全部 | 依賴常態維運 |"
 run 1 "依賴一個常態（Regular）項目要紅（拆出有週次的一次性項目再依賴）" "APP-O10 沒有工作週次，排不出先後"
+
+# ── 〈跨項依賴〉「這一項」自己沒有工作週次（第十五～十八輪）────────────
+# 原本一律靜靜落進 skipped_src_no_week，只在整張表 0 條被評估時才印一行。
+# 判準：**一條還重要的邊，不准沒被驗過就以綠燈結束。**
+#   缺口／常態 → 永遠不會有週次，錯誤；還沒排週次 → 跳過、--check 列出
+#   （一排上週次就被驗）；已完成而沒有週次 → 錯誤（堵住「沒排就直接做完」）；
+#   這一項已取消 → 跳過、列出（**先於週次判斷**，有週次的已取消項目也跳過）。
+
+# S1：這一項是缺口。決策期限不是起始週，拿來比證明不了先後。
+baseline
+xdep "| DEP-G01 | APP-C01 | 全部 | 裁決要等骨架 |"
+run 1 "這一項是缺口要紅（決策期限不能當起始週）" "這一項 DEP-G01 是缺口"
+run_expr "…計進 src_no_week_error（不是待排），加總仍等於邊數" \
+  "(lambda c: c['edges']==1 and c['src_no_week_error']==1 and c['pending_src_unscheduled']==0)(g['cross_deps'])"
+
+# S2：這一項是常態：永遠沒有起點。
+baseline
+xdep "| APP-O10 | APP-C01 | 全部 | 維運要先有骨架 |"
+run 1 "這一項是常態要紅（拆出有週次的一次性項目）" "這一項 APP-O10 是常態"
+
+# S3：這一項還沒排週次：不紅，但 --check 列出來——就算同一張表別的邊有被評估。
+baseline
+edit "| APP-O10 | 文件維護 |" "| APP-O11 | 佈署 | 等平台 | — | — | | Pending｜平台還沒開 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-P03 | APP-C01 | 全部 | 正常的一條 |
+| APP-O11 | APP-P03 | 全部 | 佈署要等清單 |"
+run 0 "這一項還沒排週次：不紅，但 --check 點名（別的邊有評估也要講）" "APP-O11（第 [0-9]* 行）還沒排週次"
+run_expr "…計進 pending_src_unscheduled，評估的是另外那一條" \
+  "g['cross_deps']['pending_src_unscheduled']==1 and g['cross_deps']['evaluated']==1"
+# 一排上週次，同一列就被驗：排在它依賴的東西之前要紅。
+edit "| APP-O11 | 佈署 | 等平台 | — |" "| APP-O11 | 佈署 | 等平台 | W1 |"
+run 1 "…排上週次之後同一列自動被驗（W1 依賴 W2 要紅）" "APP-O11（最早 W1）依賴 APP-P03（最晚 W2）"
+
+# S5：已完成卻沒有工作週次：堵住「沒排週次就直接做完」這條沒被驗過的綠燈路徑。
+# 依賴那一邊也做完了，D7 不會叫 —— 紅的只能是這一條。
+baseline
+mkarchived app-c01-skeleton
+edit "| APP-O10 | 文件維護 |" "| APP-O12 | 治理文件 | 寫好了 | — | — | | Done｜PR #1 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-O12 | APP-C01 | 全部 | 文件要等骨架 |"
+run 1 "這一項已完成卻沒有週次要紅（補實際週次，或刪掉這一列）" "APP-O12 已完成，卻沒有工作週次"
+run_absent 1 "…而且不是 D7 叫的" "兩邊的紀錄有一邊是錯的"
+
+# S4：這一項已取消 —— 有週次也跳過（取消與週次無關），列出來。
+baseline
+edit "| APP-O10 | 文件維護 |" "| APP-C03 | 舊做法 | 改用別的了 | W1 | 1 | | Cancelled｜改用 APP-C01 的做法 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-C03 | APP-P03 | 全部 | 原本 W1 等 W2，逆序 |"
+run 0 "這一項已取消：逆序也不紅（不受排程約束），但 --check 點名" "APP-C03（第 [0-9]* 行）已取消"
+run_expr "…計進 skipped_src_cancelled，沒有被評估" \
+  "g['cross_deps']['skipped_src_cancelled']==1 and g['cross_deps']['evaluated']==0"
+
+# 判定順序：依賴已取消先算，不因這一項沒週次而報錯或列為待排。
+baseline
+edit "| APP-O10 | 文件維護 |" "| APP-C03 | 舊做法 | 改用別的了 | W1 | 1 | | Cancelled｜改用 APP-C01 的做法 |
+| APP-O11 | 佈署 | 等平台 | — | — | | Pending｜平台還沒開 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-O11 | APP-C03 | 全部 | 依賴的已取消 |"
+run_expr "依賴已取消先算：skipped_dep_cancelled，不是待排" \
+  "g['cross_deps']['skipped_dep_cancelled']==1 and g['cross_deps']['pending_src_unscheduled']==0"
+
+# 分母守恆（新桶）：每條邊恰好落進一個桶。
+baseline
+edit "| APP-O10 | 文件維護 |" "| APP-C03 | 舊做法 | 改用別的了 | W1 | 1 | | Cancelled｜改用 APP-C01 的做法 |
+| APP-O11 | 佈署 | 等平台 | — | — | | Pending｜平台還沒開 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-P03 | APP-C01 | 全部 | 評估 |
+| APP-O11 | APP-P03 | 全部 | 待排 |
+| APP-C03 | APP-C01 | 全部 | 這一項已取消 |"
+run_expr "分母守恆：評估 1、待排 1、這一項已取消 1，加總等於邊數" \
+  "(lambda c: c['edges']==3 and c['evaluated']==1 and c['pending_src_unscheduled']==1 \
+   and c['skipped_src_cancelled']==1 and c['evaluated']+c['skipped_dep_missing'] \
+   +c['pending_src_unscheduled']+c['skipped_src_cancelled']+c['skipped_dep_cancelled'] \
+   +c['skipped_dep_no_week']+c['src_no_week_error']==c['edges'])(g['cross_deps'])"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
