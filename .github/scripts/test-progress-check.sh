@@ -218,6 +218,16 @@ run_all_absent() {
   echo "✓ $desc"; PASS=$((PASS + 1))
 }
 
+# run_trace_has <說明> <輸出裡要有的字>：`--trace` 的輸出（里程碑可追溯性的細節）
+run_trace_has() {
+  local desc="$1" needle="$2"
+  if (cd "$W" && bash "$SCRIPT" --trace 2>&1) | grep -q -- "$needle"; then
+    echo "✓ $desc"; PASS=$((PASS + 1)); return
+  fi
+  echo "✗ ${desc} —— --trace 的輸出裡沒有「${needle}」"
+  bump_fail
+}
+
 # run_json_top <說明> <頂層鍵> <期望值（字串比對）>：--json 的頂層欄位
 #
 # `run_field_has` 只看 `items[]`。有些事實不屬於任何一個項目 ——
@@ -576,6 +586,10 @@ selftest_count "run_setup 自測"        run_setup        "自測（不計入）
 selftest_count "run_field_has 自測"    run_field_has    "自測（不計入）" "NO-SUCH-ITEM" "state" "不可能的值"
 selftest_count "run_no_item 自測"      run_no_item      "自測（不計入）" "APP-C01"
 selftest_count "run_blockers_has 自測" run_blockers_has "自測（不計入）" "APP-C01" "NO-SUCH-BLOCKER"
+# run_expr 是 P0 加的共用 oracle，當時漏了這一行 —— 「每個共用 oracle 都要走過一次
+# 失敗路徑」是這支測試自己的規矩，漏登記的 oracle 等於沒被驗過它會不會判紅。
+selftest_count "run_expr 自測"         run_expr         "自測（不計入）" "False"
+selftest_count "run_trace_has 自測"    run_trace_has    "自測（不計入）" "這串字絕不會出現在輸出裡"
 
 selftest "run 自測：退出碼不符時判紅" "期望退出碼 1，實際 0" \
          run 1 "自測（不計入）" ""
@@ -2093,6 +2107,66 @@ edit "| 這一項 | 依賴 |" "已知的跨項依賴：
 | 這一項 | 依賴 |"
 xdep "| APP-P03 | APP-C01 | 全部 | 正本 |"
 run 1 "正本與舊表並存要紅（兩份會漂）" "同時有〈跨項依賴〉正本表與舊的"
+
+# ── 里程碑可追溯性（2026-09-25）──────────────────────────────────
+#
+# **報告，不擋**：沒被指到的工作再多，`--check` 都是 0。但**預設就印一行**
+# （含 --check）——一份沒有人跑的報告，就是「機制沒起作用、沒人知道」的形狀。
+# 單位是 WBS ID；不算 Cancelled／Regular；不用週次截斷。
+
+baseline
+run 0 "可追溯性：預設輸出（含 --check）就有一行摘要" "里程碑可追溯性：① 0 項已排週次"
+run_expr "baseline 的可追溯性：DEP-G01 沒排週次也沒被指到；APP-O10（常態）不算" \
+  "d['milestone_trace']['status']=='available' and d['milestone_trace']['pool']==3 \
+   and d['milestone_trace']['covered']==['APP-C01','APP-P03'] \
+   and d['milestone_trace']['uncovered_scheduled']==[] \
+   and d['milestone_trace']['uncovered_unscheduled']==['DEP-G01'] \
+   and d['milestone_trace']['excluded']==['APP-O10']"
+
+baseline
+edit "| APP-C01、APP-P03 |" "| APP-C01 |"
+run 0 "已排週次卻沒被指到：只是報告，--check 仍是 0" "① 1 項已排週次，卻沒有被任何里程碑指到"
+run_expr "沒被指到的那一項進了 ①" "d['milestone_trace']['uncovered_scheduled']==['APP-P03']"
+# 抓 `↳` 前綴，不抓 ID：`--trace` 也印一般狀態表，那裡本來就有 APP-P03。
+run_trace_has "--trace 列出是哪一項" "↳ APP-P03"
+
+baseline
+edit "| APP-C01、APP-P03 |" "| APP-C01、APP-P03、DEP-G01 |"
+run 0 "全部被指到也要講（不然跟「沒有看」長得一樣）" "3 項全部被某個里程碑指到"
+
+# 單位是 WBS ID：Cancelled 的不算進分母，也不會出現在未涵蓋裡。
+baseline
+edit "| APP-C01、APP-P03 |" "| APP-C01 |"
+edit "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | |" "| APP-P03 | 清單元件 | 列表與翻頁 | W2 | 5 | | Cancelled｜不做了 |"
+run_expr "Cancelled 的項目不算未涵蓋" \
+  "d['milestone_trace']['uncovered_scheduled']==[] and 'APP-P03' in d['milestone_trace']['excluded']"
+
+# 舊的兩欄里程碑：**未評估，不是全部被指到、也不是全部沒被指到。**
+baseline
+edit "| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |
+|---|---|---|---|
+| M1 一個人跑完主流程 | W2 | 進來、看到、做完一件事 | APP-C01、APP-P03 |" "| 週 | 這一週結束時，使用者能做什麼 |
+|---|---|
+| **W1** | 骨架立起來 |"
+run 0 "舊格式的里程碑：摘要明說「未評估」" "里程碑可追溯性：未評估（〈里程碑〉是舊的兩欄格式"
+run_expr "舊格式：status unavailable、清單是 None（不是 []）" \
+  "d['milestone_trace']['status']=='unavailable' and d['milestone_trace']['uncovered_scheduled'] is None \
+   and d['milestone_trace']['covered'] is None"
+
+baseline
+python3 - "$W/docs/WBS.md" <<'PY2'
+import io, sys
+p = sys.argv[1]
+t = io.open(p, encoding="utf-8").read()
+i, j = t.index("## 里程碑"), t.index("> 這一節底下")
+io.open(p, "w", encoding="utf-8").write(t[:i] + t[j:])
+PY2
+run 0 "沒有〈里程碑〉：摘要明說「未評估」" "docs/WBS.md 沒有〈里程碑〉"
+run_expr "沒有〈里程碑〉的原因碼" "d['milestone_trace']['reason']=='no_milestone_section'"
+
+# --json 不准多出那一行摘要（下游在解析 stdout）。
+baseline
+run_json_parses "--json 的 stdout 還是合法 JSON（摘要不准混進去）"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
