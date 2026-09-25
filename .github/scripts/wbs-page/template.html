@@ -166,6 +166,11 @@ input[type=search]{font:inherit;font-size:13px;padding:6px 12px;border:1px solid
 .mile .mw{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent)}
 .mile strong{color:var(--ink);font-weight:600}
 .mile code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);padding:.5px 4px;border-radius:3px}
+.mile .msub{font-weight:400;color:var(--muted);font-size:12px;margin-left:6px}
+.mile .mt{font-weight:400;color:var(--muted);font-size:11px}
+.mile .mc{display:block;margin-top:4px;font-size:12px;color:var(--muted)}
+.mile .mnote{font-size:12px;color:var(--muted);background:var(--surface-2)}
+.mile .mnote.bad{color:var(--wait);background:var(--wait-soft)}
 footer{margin-top:30px;padding-top:16px;border-top:1px solid var(--line);
   font-size:12px;color:var(--muted);line-height:1.65}
 footer code{font-family:var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:3px;font-size:.9em}
@@ -223,7 +228,7 @@ footer code{font-family:var(--mono);background:var(--surface-2);padding:1px 5px;
   </div>
 
   <section class="mile">
-    <h3>里程碑 —— 這一週結束時，使用者能做什麼</h3>
+    <h3>里程碑 <span class="msub" id="mile-sub"></span></h3>
     <ol id="mile"></ol>
   </section>
 

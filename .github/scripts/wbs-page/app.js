@@ -93,8 +93,24 @@ const $ = id => document.getElementById(id);
 })();
 
 /* ── 里程碑 ── */
+// **「沒有涵蓋資料」要講出來，不要無聲降級。** 舊的兩欄格式（每週一句話）
+// 讀得懂，但它沒有「靠哪些」—— 畫面上若跟正本長得一樣，讀的人會以為
+// 每個里程碑的範圍都查得到。解析不出來的那種更要講：那是一節空白。
+const MM = D.milestones_meta || {};
+$("mile-sub").textContent =
+  MM.schema === "canonical" ? "每一個里程碑的驗收結果，與它靠哪些工作項目" :
+  MM.schema === "legacy_week_goal" ? "這一週結束時，使用者能做什麼（舊格式）" : "";
 $("mile").innerHTML = D.milestones.map(m =>
-  `<li><span class="mw">${esc(m.w)}</span><span>${md(m.text)}</span></li>`).join("");
+  `<li><span class="mw">${esc(m.id || m.w)}${
+    m.source_format === "canonical" ? `<br><span class="mt">${esc(m.target_week)}</span>` : ""
+  }</span><span>${md(m.text)}${
+    m.covers && m.covers.length ? `<span class="mc">靠 ${m.covers.map(c => `<code>${esc(c)}</code>`).join("、")}</span>` : ""
+  }</span></li>`).join("") + (
+  MM.schema === "legacy_week_goal"
+    ? `<li class="mnote"><span></span><span>舊格式：沒有「靠哪些」欄，看不出每個里程碑涵蓋了哪些工作項目。四欄正本（里程碑／目標週／驗收結果／靠哪些）見 <code>prompts/00-map.md</code>。</span></li>`
+  : MM.reason === "milestone_table_not_parsed"
+    ? `<li class="mnote bad"><span></span><span>有〈里程碑〉這一節，但一列都解析不出來 —— 跑 <code>bash .github/scripts/progress.sh --check</code> 看原因。</span></li>`
+  : "");
 
 $("foot").innerHTML =
   `完整內容在 <code>專案-frontend/docs/WBS.md</code>，狀態用 <code>bash .github/scripts/progress.sh --all</code> 查。<br>

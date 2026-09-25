@@ -1655,3 +1655,28 @@ node .agents/skills/llm-team/setup.mjs --sync-check               # 快照沒被
 **還沒驗的**：真的寫手＋複審者跑一張票（stdin 路徑對真 agy 只在 plan／accept-edits 各試過一個提示）。下一張 llm-team 票就是活樣本：收貨摘要要看到複審者正常簽，`review/input.json` 的 `status` 是 `ok`。
 
 **過程**：codex（gpt-5.6-sol）＋Gemini（3.1 pro）兩輪。第一輪一致：stdin、`JSON.stringify`、`--print=`、`stdin.end` 接 EPIPE、缺欄位＝unknown、三段各自測；分歧在截斷（A vs B）。第二輪用「哪個輸出會錯」論證，兩位都選 B。lockfile 一項分歧採 codex。順帶記錄：config repo 的 Stop hook 會被**別的 session** 觸發，真源改到一半就被 `4e027ca` 自動同步吃掉——之後改真源要在 config repo 的 worktree 做，不在主 checkout。
+
+## 2026-09-25　里程碑表照文件寫會整張消失：解析器認表頭；WBS 對照專案管理教科書的四項調整（P0 先做）
+
+**起因**：拿專案管理的 WBS 文章（Asana、projectmanager.com.tw）對照我們的 `docs/WBS.md` ＋ `progress.sh`，看有沒有該補的。對照時去看里程碑，發現 `progress.sh` 只認 `| **W` 開頭的列，而 `prompts/00-map.md` 教的是 `| M1 … | 意思 | 靠哪些 |`。實測：**照文件寫 → `milestones = []`、`wbs.html` 里程碑區塊整塊空白、`--check` rc=0。** GuildHub 剛好寫成 `| **W1** |` 才沒踩到。同一段程式還有三種同類吃法，都實測過：掃到檔尾，所以後面一張「每週負荷」參考表的 `| **W9** | 41 |` 變成一個叫「41」的里程碑；`_mi > 0` 在標題位於檔首時整段跳過；讀的是原始檔不是 `visible_lines()`，圍籬裡的範例也算資料。**這個 bug 活到今天的原因是 `test-progress-check.sh` 的 baseline fixture 從來沒有里程碑表。**
+
+**決定（P0，本 PR）**：
+1. 〈里程碑〉的正本是**四欄**：`| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |`（codex 提；原本三欄沒有目標週，網頁的按週分組就接不起來）。里程碑＝有名字、代表可驗收結果、知道靠哪些工作項目；「每週一句話」只是週目標，表達不了範圍。
+2. 解析器**認表頭、不猜資料列**；只讀 `visible_lines()`；只讀〈里程碑〉這一節的**第一張表**（空行、小標、說明文字即結束）。
+3. 舊的兩欄 `| 週 | 這一週結束時… |` 是**有期限的相容層**：讀得懂，但 `--json` 標 `source_format: legacy_week_goal`、`coverage_status: unavailable`、`covers: null`（**`null` 不是 `[]`**：「不知道涵蓋了什麼」跟「涵蓋了零項」是兩件事）。**表頭第一欄一定要是「週」**——只認兩欄的話，同一節底下那張「這一項 | 依賴」的跨項依賴表會被當成里程碑（實測：GuildHub 13 列變 23 列）。三個 repo 遷完就拔。
+4. 新違規：有〈里程碑〉卻一列都讀不出來、表頭認不出來、欄數對不上、「靠哪些」重複、里程碑 ID 重複。「靠哪些」指向不存在的 ID 本來就會被整份文件的引用掃描抓到，不重複報。
+5. `--json` 多一個頂層 `milestones_meta`（`found_heading`／`schema`／`rows`／`coverage_status`／`reason`）；每個里程碑多 `id`／`target_week`／`covers`／`coverage_status`／`source_format`，`w` 留作網頁按週分組的相容欄位。**顯示欄位留原文、結構用 `plain()` 比對**（第一版全用 `plain()`，網頁上的粗體與 en dash 全被洗掉，實測後改）。
+6. `wbs.html`：副標依格式顯示；正本印目標週與「靠哪些」；舊格式多一列說明「沒有靠哪些欄」；解析不出來的明說「跑 `--check` 看原因」。**沒有涵蓋資料要講出來，不要無聲降級。**
+
+**已有共識、之後各開一個 PR 的（照順序）**：
+- **P1 依賴圖**：自環、依賴環、普通依賴排程逆序，`--check` 非零。判準 `被依賴者最晚週 <= 依賴者最早週`（**同週合法**：一週是排程桶不是順序；`W13–W16` 被 `W16` 依賴合法、被 `W15` 依賴違規）。**不設參數、不設寬限期**：GuildHub 180 項、47 條邊量出來是 0 個環、0 條可評估的逆序邊（第三個 repo 不消費 `progress.sh`），沒有東西需要豁免。**必須把分母講出來**：`--json` 輸出評估了幾條、因被依賴者沒有週次跳過幾條——而且跳過的要再分「有 `決策≤Wn`（不變量 5 管）」與「被依賴者是 `Cancelled`（明文不做的牆）」與「兩者都不是」。GuildHub 的 47 條是 45＋2＋0；我原本說「47 條全由不變量 5 管」是錯的，codex 指出、量了才知道。測試用混合 fixture 釘住「至少評估一條」與「評估＋各類跳過＝總邊數」——否則有人把規則寫成永遠 skip 也抓不到。同一輪另加「`Done` 而其依賴未完成」（與 DAG 分開的錯誤碼與測試）；依賴是 `Cancelled` 而本項 `Done` 時，改寫阻塞邊、`Cancelled` 列照留。
+- **P2 里程碑可追溯性報告**（不叫「100% 法則」——它只證明有一條引用邊）：報告、不擋。單位是**WBS ID 群組**，不是每一列（續行列沒有 ID）。三態：`available`＋清單／`unavailable`＋`uncovered: null`／無此節。不用週次截斷（已細化但還沒排週次的工作會被靜默排除），分組輸出：已排週次未涵蓋／遠期粗粒度未涵蓋（只印計數與增減，完整清單留 JSON）。
+- **P3 週次錨點**：WBS 裡明寫 `<!-- wbs:week1 YYYY-MM-DD -->`（不要從 git 第一個 commit 推——匯入、rebase、shallow clone 都會讓它無聲失真；人改日期至少 diff 看得見）。`--as-of` 注入點（測試不准依賴真實時鐘）、時區釘死、W1 為該日起七天、缺錨點輸出 `calendar.status: disabled`＋原因。缺口三態：`waiting`→`decided`（那條 `待裁決` 入邊消失或改寫）→`fallback_effective`（截止後仍在，附 `effective_since_week`）——**不是永遠叫「未決」**，fallback 是強制寫的，期限到了語意上就生效。**純報告、exit 0**：時間不能進 `--check` 的退出碼（CI 冪等性；無關 PR 會因週末變紅；人會學會把錨點往後推）。進度代理（「已有 W4 的 change、`決策≤W3` 還掛著」）下一版另列，不取代日曆——專案停三個月它什麼都看不到。
+
+**拒絕的**：小數點階層編號（插一列就重編，引用整片斷，實測重整群組斷過五處）；WBS 字典欄位（第八欄已經因「為一列而造」拆過，七欄上限不動；執行者是 agent，「負責人」資訊量趨近零）；8/80 法則與「點數 ≥13 提醒」（假精確，跟「不要第一天估滿點數」自相矛盾）；逾期進 `--check` 退出碼；從 commit 推錨點；DAG 永久報告或 grandfathering（等於正式承認已知死鎖可以通過 `--check`）。
+
+**怎麼驗**：`test-progress-check.sh` 205 → 223（baseline 補里程碑表＋一張同節的跨項依賴表；正本四欄進 json 含 covers 與目標週；第二張兩欄表不准被吃；敘述保留原文；舊格式 `unavailable`＋`covers is None`；有標題沒有列、表頭認不出來、欄數不符、covers 指向不存在、covers 重複、里程碑 ID 重複各自紅；後面章節 `| **W9** |` 不准被吃；圍籬範例不准當表頭也不准進 json；標題在檔首解析得到；一節只有別的兩欄表時不准當舊格式）。**突變 11 刀，第一輪存活 1**（拿掉「舊格式表頭第一欄是週」不會紅——沒有 fixture 讓跨項依賴表當第一張表），補了一條之後 11/11 紅。GuildHub 真實 WBS 回歸：模板新舊兩版跑同一份資料，里程碑 13＝13、違規 72＝72。網頁：Playwright 與 Chrome DevTools MCP 在這台機器都起不來（Chrome 153 啟動即崩：allocator 被載入兩次），**沒有做真實瀏覽器驗證**；退而求其次用 jsdom 把三份產出的頁面連 `app.js` 跑起來讀 DOM：零 JS 例外、正本印目標週與靠哪些、粗體有渲染、舊格式有說明列、解析失敗有提示列。驗不了的是版面與顏色。
+
+**過程**：codex（gpt-5.6-sol）＋Gemini（3.1 pro high）三輪。第一輪兩位都否決我原本的 P3（逾期進 `--check`），也都獨立指出「依賴圖沒驗 DAG」；codex 另給 `fallback_effective`、涵蓋單位是 ID 群組、「可追溯性」不是 100% 法則。第二輪 Gemini 在錨點與週次截斷兩條翻掉自己第一輪的主張，七條只剩 P1 的過渡機制不一致。第三輪送 GuildHub 的量測（47 條邊、評估 0 條、星狀圖），兩位都改成「直接啟用、不設參數」，並都同意分母要講出來。codex 有一條推錯：「`app-c010-foo` 會同時匹配 `APP-C01`」——程式碼是 `c == pre or c.startswith(pre + "-")`，已要求分隔符。
+
+**順帶看到的**：GuildHub 的 `progress.sh` 跟模板差 163 行，多了一個 `Later` 標記（「決定要做，排在 demo 之後」）——不是逐字拿。拿模板的 `progress.sh` 跑 GuildHub 的資料會紅 72 條「不認得的標記 Later」。GuildHub 那邊拿本 PR 時要合併，不能直接覆蓋。

@@ -608,6 +608,10 @@ grefs = []     # (被提到的群組 ID, 檔名, 行號)
 # `docs/DECISIONS.md` 刻意不驗：它是歷史，會引用當時的 ID 當例子。
 REF_SOURCES = ["docs/WBS.md", "docs/ROADMAP.md"]
 _groups, _milestones, _deps = [], [], []
+# 里程碑那一節的「適用範圍」。**`schema=None` 跟 `rows=0` 要分得出來** ——
+# 沒有這一節、有這一節但讀不出來、讀出來的是舊格式，三件事的處置不一樣。
+_ms_meta = {"found_heading": False, "schema": None, "rows": 0,
+            "coverage_status": "unavailable", "reason": "no_milestone_section"}
 
 def parse_mark(mark: str):
     """回傳 (標記集合, 理由)。格式是 `標記｜理由`，標記之間用 ＋ 串。"""
@@ -1003,14 +1007,107 @@ if wbs_path.exists():
         if len(seg) > 1:
             g["desc"] = "\n".join(l[2:] for l in seg[1].split("\n|", 1)[0].splitlines()
                                    if l.startswith("> "))
-    _mi = _text.find("## 里程碑")
-    if _mi > 0:
-        for line in _text[_mi:].splitlines():
-            if not line.strip().startswith("| **W"):
-                continue
-            cc = [x.strip() for x in line.strip().strip("|").split("|")]
-            if len(cc) >= 2:
-                _milestones.append({"w": re.sub(r"[*]", "", cc[0]), "text": cc[1]})
+    # ── 里程碑 ─────────────────────────────────────────────────────
+    # **認表頭，不要猜資料列長相。** 這裡原本是
+    # `_text.find("## 里程碑")` ＋ `startswith("| **W")`，四種吃法都實測過：
+    #
+    #   照 `00-map.md` 教的格式寫（第一欄是 `M1 …`）→ milestones 全空，
+    #     而 `--check` 照樣 rc=0、網頁的里程碑區塊整塊空白。**最安靜的失敗。**
+    #   後面任何章節的 `| **W9** | 41 |`（例如一張「每週負荷」參考表）
+    #     → 被吃成一個叫「41」的里程碑。掃到檔尾就會這樣。
+    #   `## 里程碑` 剛好在檔首 → `_mi > 0` 為假，整段跳過。
+    #   圍籬裡的格式範例 → 這一段讀的是原始檔，不是 `visible_lines()`，
+    #     所以示範表格會被當成真資料。
+    #
+    # 正本是四欄（`00-map.md`）；GuildHub 還在用的兩欄「每週一句話」是
+    # **有期限的相容層**：讀得懂、但講清楚它沒有涵蓋資料，三個 repo 遷完就拔。
+    _MS_CANON = ["里程碑", "目標週", "驗收結果", "靠哪些"]
+    _ms_head, _ms_rows, _in_ms, _ms_bad, _ms_done = None, 0, False, False, False
+    for lineno, raw in _wbs_vis:
+        # **結構與 ID 看正規化後的字串，顯示欄位留原文。** 兩者混用的代價
+        # 實測過：`plain()` 會剝掉 `**` 與 en dash，於是網頁上的里程碑敘述
+        # （`md(m.text)` 渲染）粗體全失、破折號變成 ASCII。
+        bare = raw.strip()
+        s = plain(bare)
+        if s.startswith("## "):
+            _in_ms = s[3:].strip() == "里程碑"
+            if _in_ms:
+                _ms_meta["found_heading"] = True
+            continue
+        if not _in_ms or _ms_done:
+            continue
+        if not bare.startswith("|"):
+            # **一節裡可以有第二張表。** 實測：GuildHub 的〈里程碑〉底下還有
+            # 一張「這一項 | 依賴」的跨項依賴表，也是兩欄 —— 不在這裡收手，
+            # 那 10 列會變成 10 個里程碑（13 列變 23 列，而且看不出來）。
+            # 表在第一個非表格行（空行、小標、說明文字）就結束。
+            if _ms_rows:
+                _ms_done = True
+            continue
+        cc_raw = [x.strip() for x in bare.strip("|").split("|")]
+        cc = [plain(x) for x in cc_raw]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cc if c):
+            continue                                    # `|---|---|` 分隔列
+        if _ms_head is None:
+            if cc == _MS_CANON:
+                _ms_head = "canonical"
+            elif len(cc) == 2 and cc[0] == "週":
+                # 舊格式：`| 週 | 這一週結束時，使用者能做什麼 |`。
+                # **第一欄一定要是「週」**：只認「兩欄」的話，同一節裡那張
+                # 「這一項 | 依賴」的跨項依賴表會被當成里程碑表（實測）。
+                _ms_head = "legacy_week_goal"
+            else:
+                violations.append(
+                    f"docs/WBS.md 第 {lineno} 行是〈里程碑〉的表頭，但欄位認不出來"
+                    f"（{cc}）。正本是 `| 里程碑 | 目標週 | 驗收結果 | 靠哪些 |`；"
+                    "舊的兩欄格式仍可讀，但會被標成沒有涵蓋資料")
+                _ms_bad = True
+                _in_ms = False
+            continue
+        want = 4 if _ms_head == "canonical" else 2
+        if len(cc) != want:
+            violations.append(
+                f"docs/WBS.md 第 {lineno} 行在〈里程碑〉表裡有 {len(cc)} 欄，"
+                f"表頭是 {want} 欄。**欄數對不上那一列就會整列被讀歪**，"
+                "不是少一欄就少一個里程碑")
+            continue
+        _ms_rows += 1
+        if _ms_head == "canonical":
+            mid = cc[0].split()[0] if cc[0].split() else ""
+            covers, _cg, _ce = scan_ids(cc[3], f"docs/WBS.md 第 {lineno} 行")
+            violations.extend(_ce)
+            if len(covers) != len(set(covers)):
+                violations.append(f"里程碑 {mid or cc[0]} 的「靠哪些」裡有重複的 ID")
+            _milestones.append({
+                "id": mid, "name": cc_raw[0], "target_week": cc[1], "text": cc_raw[2],
+                "covers": sorted(set(covers)), "coverage_status": "available",
+                "source_format": "canonical",
+                # `w` 是給網頁按週分組用的相容欄位，不是新的事實來源。
+                "w": cc[1]})
+        else:
+            _milestones.append({
+                "id": cc[0], "name": cc[0], "target_week": cc[0], "text": cc_raw[1],
+                # **`None` 不是 `[]`。** 「不知道涵蓋了什麼」跟「涵蓋了零項」
+                # 是兩個意思，混在一起，P2 的報告會對舊格式喊出 180 項全未涵蓋。
+                "covers": None, "coverage_status": "unavailable",
+                "source_format": "legacy_week_goal", "w": cc[0]})
+    if _milestones and len({m["id"] for m in _milestones}) != len(_milestones):
+        violations.append("〈里程碑〉表裡有重複的里程碑 ID")
+    _ms_meta.update(
+        schema=_ms_head, rows=_ms_rows,
+        coverage_status=("available" if _ms_head == "canonical"
+                         else "unavailable" if _ms_head else "unavailable"),
+        reason=(None if _ms_head == "canonical" else
+                "legacy_milestone_schema_has_no_covers_column"
+                if _ms_head == "legacy_week_goal" else
+                "milestone_table_not_parsed" if _ms_meta["found_heading"] else
+                "no_milestone_section"))
+    if _ms_meta["found_heading"] and not _ms_bad and not _ms_rows:
+        # 有標題、沒有一列讀得出來。**這正是要報的那件事** ——
+        # 不報的話，畫面上是一節正常的里程碑，機器手上是空陣列。
+        violations.append(
+            "docs/WBS.md 有〈里程碑〉這一節，但一列里程碑都解析不出來"
+            f"（表頭：{_ms_head or '認不出來'}）")
     _di = _text.find("已知的跨項依賴")
     if _di > 0:
         for line in _text[_di:_di + 2000].splitlines():
@@ -1405,7 +1502,7 @@ if JSON:
     # `remote_fresh` 是給下游用的。`wbs-page.sh` 與往後的 WBS 區塊都要看它 ——
     # **把從遠端推出來的狀態當成事實寫進版控，是把一個當下的東西凍成一份紀錄。**
     out = {"items": [], "groups": _groups, "affects": {},
-           "milestones": _milestones, "deps": _deps,
+           "milestones": _milestones, "milestones_meta": _ms_meta, "deps": _deps,
            "remote_fresh": REMOTE_FRESH, "remote_why": REMOTE_WHY}
     _aff = collections.defaultdict(list)
     for wid in order:
