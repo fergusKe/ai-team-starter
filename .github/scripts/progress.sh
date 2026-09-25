@@ -7,6 +7,7 @@
 #     bash .github/scripts/progress.sh --blocked  # 不在自己手上的，以及誰依賴它
 #     bash .github/scripts/progress.sh --check    # 有規則違規就以非零結束
 #     bash .github/scripts/progress.sh --render   # 更新 docs/WBS.md 的進度區塊
+#     bash .github/scripts/progress.sh --trace    # 哪些工作沒有被任何里程碑指到（報告，不擋）
 #
 # **這份是算出來的，不是寫出來的。** 沒有任何人維護它。
 #
@@ -113,6 +114,7 @@ ONLY_BLOCKED=0
 CHECK=0
 JSON=0
 RENDER=0
+TRACE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)     SHOW_ALL=1 ;;
@@ -120,8 +122,9 @@ while [ $# -gt 0 ]; do
     --check)   CHECK=1 ;;
     --json)    JSON=1 ;;
     --render)  RENDER=1 ;;
+    --trace)   TRACE=1 ;;
     --week)    shift; ONLY_WEEK="${1:-}" ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
   esac
   shift
@@ -147,7 +150,7 @@ elif ! git fetch -q origin 2>/dev/null; then
 fi
 
 SHOW_ALL="$SHOW_ALL" ONLY_WEEK="$ONLY_WEEK" ONLY_BLOCKED="$ONLY_BLOCKED" CHECK="$CHECK" JSON="$JSON" \
-RENDER="$RENDER" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
+RENDER="$RENDER" TRACE="$TRACE" REMOTE_FRESH="$REMOTE_FRESH" REMOTE_WHY="$REMOTE_WHY" python3 - <<'PY'
 import os, re, sys, subprocess, pathlib, collections, unicodedata
 
 SHOW_ALL = os.environ.get("SHOW_ALL") == "1"
@@ -155,6 +158,7 @@ ONLY_BLOCKED = os.environ.get("ONLY_BLOCKED") == "1"
 CHECK = os.environ.get("CHECK") == "1"
 JSON = os.environ.get("JSON") == "1"
 RENDER = os.environ.get("RENDER") == "1"
+TRACE = os.environ.get("TRACE") == "1"
 ONLY_WEEK = os.environ.get("ONLY_WEEK") or ""
 # 遠端 refs 是不是這一次抓下來的。**不新鮮的時候要說**，見上面 shell 那段。
 REMOTE_FRESH = os.environ.get("REMOTE_FRESH") == "1"
@@ -1695,6 +1699,39 @@ _dep_graph = {
     "cross_deps": dict(_xdep_meta, **(_xd if _xdep_meta["schema"] == "canonical" else {})),
 }
 
+# ── 里程碑可追溯性（2026-09-25）────────────────────────────────────
+# **報告，不擋。** 哪些 WBS ID 沒有被任何一個里程碑的「靠哪些」指到。
+# 它不是「100% 法則」—— 只證明有一條引用邊，證明不了語意上真的涵蓋，
+# 更證明不了沒有漏掉還沒寫進 WBS 的範圍。
+#
+# 單位是 **WBS ID**，不是每一列：續行列沒有 ID，引用不到它。
+# 不算 `Cancelled`（決定不做）與 `Regular`（常態、沒有完成點）。
+# **不用週次截斷**：已經細化、只是還沒排週次的工作，截掉就被靜默排除了。
+# 分兩組：① 已排週次卻沒被指到（該處理的）；② 沒排週次／遠期粗粒度而沒被指到。
+#
+# 舊的兩欄里程碑沒有「靠哪些」：`status: unavailable`，清單是 `None`，
+# **不是 `[]`** —— 「不知道」與「全部被指到」是兩件事；也不是「全部未涵蓋」。
+def _excluded_from_trace(w):
+    ms, _ = parse_mark(wbs[w].get("mark", ""))
+    return bool({"Cancelled", "Regular"} & set(ms))
+
+
+if _ms_meta["schema"] == "canonical":
+    _covered = set().union(*(set(m["covers"] or []) for m in _milestones))
+    _pool = [w for w in order if not _excluded_from_trace(w)]
+    _unc = [w for w in _pool if w not in _covered]
+    _trace = {
+        "status": "available", "reason": None, "unit": "wbs_id",
+        "pool": len(_pool), "covered": [w for w in _pool if w in _covered],
+        "uncovered_scheduled": [w for w in _unc if week_min(wbs[w]["weeks"]) is not None],
+        "uncovered_unscheduled": [w for w in _unc if week_min(wbs[w]["weeks"]) is None],
+        "excluded": [w for w in order if _excluded_from_trace(w)],
+    }
+else:
+    _trace = {"status": "unavailable", "reason": _ms_meta["reason"], "unit": "wbs_id",
+              "pool": None, "covered": None, "uncovered_scheduled": None,
+              "uncovered_unscheduled": None, "excluded": None}
+
 # ── 對不上任何 WBS ID 的 change（2026-09-12 起是 violation，不只是紅字）────
 #
 # **為什麼從提示升成違規**：有地圖的專案裡，一個 change 開了、id 對不上任何
@@ -1738,6 +1775,37 @@ elif _xdep_meta["schema"] == "canonical" and not JSON and _xd["edges"] and not _
           f"（沒有週次 {_xd['skipped_src_no_week'] + _xd['skipped_dep_no_week']}、"
           f"依賴已取消 {_xd['skipped_dep_cancelled']}）。{X}")
 
+# 里程碑可追溯性：**預設就印一行**（含 --check）。一份沒有人跑的報告，就是
+# 「機制沒起作用、沒人知道」的形狀；零項、舊格式、沒有〈里程碑〉也各自明說 ——
+# 不然「全部被指到」跟「沒有看」長得一樣。`--json` 不印（別弄壞下游的解析）。
+if wbs and not JSON:
+    _tr = _trace
+    print()
+    if _tr["status"] == "available":
+        _n, _m = len(_tr["uncovered_scheduled"]), len(_tr["uncovered_unscheduled"])
+        if not _n and not _m:
+            print(f"{D}里程碑可追溯性：{_tr['pool']} 項全部被某個里程碑指到。{X}")
+        else:
+            print(f"{Y if _n else D}里程碑可追溯性：① {_n} 項已排週次，卻沒有被任何里程碑指到；"
+                  f"② {_m} 項沒排週次／遠期而沒被指到{X}{D}（--trace 看是哪些）{X}")
+    else:
+        _why = {"legacy_milestone_schema_has_no_covers_column": "〈里程碑〉是舊的兩欄格式，沒有「靠哪些」",
+                "milestone_table_not_parsed": "〈里程碑〉解析不出來，見違規",
+                "no_milestone_section": "docs/WBS.md 沒有〈里程碑〉"}.get(_tr["reason"], _tr["reason"])
+        print(f"{D}里程碑可追溯性：未評估（{_why}）。{X}")
+    if TRACE and _tr["status"] == "available":
+        for _title, _ids in (("① 已排週次，卻沒有被任何里程碑指到", _tr["uncovered_scheduled"]),
+                             ("② 沒排週次／遠期，沒有被指到", _tr["uncovered_unscheduled"])):
+            print(f"{B}  {_title}（{len(_ids)}）{X}")
+            for _w in _ids:
+                _wk = "、".join(sorted(wbs[_w]["weeks"])) or (
+                    f"決策≤W{wbs[_w]['deadline']}" if wbs[_w].get("deadline") else "—")
+                # 前綴 `↳` 是給人看、也給測試抓的：`--trace` 同時會印一般的狀態表，
+                # 只抓 ID 的話，狀態表那一列就讓斷言恆真（突變實測存活過）。
+                print(f"    ↳ {_w:<9} {re.sub(r'[*`]', '', wbs[_w]['name'])[:20]:<20} {_wk}")
+        if _tr["excluded"]:
+            print(f"{D}  不算（Cancelled／Regular）：{'、'.join(_tr['excluded'])}{X}")
+
 _todo = setup_todo()
 if _todo and not JSON and not CHECK:
     print()
@@ -1760,6 +1828,7 @@ if JSON:
     out = {"items": [], "groups": _groups, "affects": {},
            "milestones": _milestones, "milestones_meta": _ms_meta, "deps": _deps,
            "deps_meta": _xdep_meta, "dep_graph": _dep_graph,
+           "milestone_trace": _trace,
            "remote_fresh": REMOTE_FRESH, "remote_why": REMOTE_WHY}
     _aff = collections.defaultdict(list)
     for wid in order:
