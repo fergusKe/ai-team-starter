@@ -112,11 +112,19 @@ $("mile").innerHTML = D.milestones.map(m =>
     ? `<li class="mnote bad"><span></span><span>有〈里程碑〉這一節，但一列都解析不出來 —— 跑 <code>bash .github/scripts/progress.sh --check</code> 看原因。</span></li>`
   : "");
 
+// 〈跨項依賴〉驗了沒有，**依格式講**。這一句以前寫死「不驗前端項目彼此的先後、
+// 靠人維護」—— 正本表開始被驗之後，它對正本 repo 說反話（漂掉的文件比沒有文件危險）。
+const XD = D.deps_meta || {};
+const xdNote =
+  XD.schema === "canonical"
+    ? `〈跨項依賴〉${D.deps.length} 條：排程先後、環、「已完成而前置沒完成」都由 <code>--check</code> 驗。`
+  : XD.schema === "legacy_free_text"
+    ? `〈跨項依賴〉還是舊的自由文字表（${D.deps.length} 條）：<strong>排程與環沒有被驗</strong>，` +
+      `改成正本 <code>## 跨項依賴</code>（<code>| 這一項 | 依賴 | 關係 | 說明 |</code>）才會驗。`
+    : `沒有〈跨項依賴〉表。`;
 $("foot").innerHTML =
   `完整內容在 <code>專案-frontend/docs/WBS.md</code>，狀態用 <code>bash .github/scripts/progress.sh --all</code> 查。<br>
-   <code>--check</code> 會驗這張表自己訂的規則，CI 也在跑它 ——
-   但它<strong>只驗「前端工作 vs 後端決策期限」，不驗前端項目彼此的先後</strong>。
-   已知的跨項依賴（${D.deps.length} 條）寫在 WBS 的〈這張表的意思〉，那一段靠人維護。`;
+   <code>--check</code> 會驗這張表自己訂的規則，CI 也在跑它。${xdNote}`;
 
 /* ── 控制 ── */
 $("v-grp").onclick = () => { ui.view = "grp"; render(); };

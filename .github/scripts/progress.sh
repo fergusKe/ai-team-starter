@@ -125,8 +125,9 @@ while [ $# -gt 0 ]; do
     --json)    JSON=1 ;;
     --render)  RENDER=1 ;;
     --trace)   TRACE=1 ;;
-    --as-of)   shift; AS_OF="${1:-}" ;;
-    --week)    shift; ONLY_WEEK="${1:-}" ;;
+    --as-of)   shift; [ $# -gt 0 ] || { echo "--as-of 要接日期（YYYY-MM-DD）" >&2; exit 2; }; AS_OF="$1" ;;
+    # 要接值的參數**沒帶值就停**：`${1:-}` 會把「忘了寫」吞成空字串，然後照常跑。
+    --week)    shift; [ $# -gt 0 ] || { echo "--week 要接週次（例如 W3）" >&2; exit 2; }; ONLY_WEEK="$1" ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^#[[:space:]]\{0,1\}//'; exit 0 ;;
     *) echo "不認得的參數：$1" >&2; exit 2 ;;
   esac
@@ -1107,6 +1108,18 @@ if wbs_path.exists():
             violations.extend(_ce)
             if len(covers) != len(set(covers)):
                 violations.append(f"里程碑 {mid or cc[0]} 的「靠哪些」裡有重複的 ID")
+            # 群組不是涵蓋。`scan_ids` 認得群組、也驗了它存在，但原本收完就丟 ——
+            # 寫 `APP-C` 的里程碑於是被當成「沒有指到 APP-C01」，可追溯性報它未涵蓋，
+            # 而 `--check` 是綠的（實測）。「靠哪些」逐項列出工作項目 ID。
+            for _g in _cg:
+                violations.append(f"里程碑 {mid or cc[0]} 的「靠哪些」寫了群組 {_g}："
+                                  f"只收工作項目 ID，要逐項列出（例如 `{_g}01`）")
+            # 目標週：網頁按週分組靠它配對（`m.w === "W2"`），格式錯那個里程碑就在
+            # 週視圖上靜靜變成「尚未排程」。文法跟工作表的週欄一致：範圍用 en dash。
+            _tw = re.sub(r"[*`]", "", cc_raw[1]).strip()
+            if not re.fullmatch(r"W[0-9]+(–W[0-9]+)?|—", _tw):
+                violations.append(f"里程碑 {mid or cc[0]} 的「目標週」要是 `W3`、`W3–W4`（en dash）"
+                                  f"或 `—`，現在是「{cc_raw[1]}」")
             _milestones.append({
                 "id": mid, "name": cc_raw[0], "target_week": cc[1], "text": cc_raw[2],
                 "covers": sorted(set(covers)), "coverage_status": "available",
@@ -1221,24 +1234,45 @@ if wbs_path.exists():
         violations.append("docs/WBS.md 有〈跨項依賴〉這一節，但一列都解析不出來")
 
     # 相容層：舊的「已知的跨項依賴」兩欄自由文字表。照舊抽給網頁顯示，不驗。
-    _di = _text.find("已知的跨項依賴")
-    if _di >= 0:
-        _legacy = 0
-        for line in _text[_di:_di + 2000].splitlines():
-            if not line.startswith("| `"):
-                continue
-            cc = [x.strip() for x in line.strip().strip("|").split("|")]
-            if len(cc) == 2:
-                _legacy += 1
-                if not _xd_head:
-                    _deps.append({"a": cc[0], "b": cc[1]})
-        if _legacy and _xd_head:
-            violations.append(
-                "docs/WBS.md 同時有〈跨項依賴〉正本表與舊的「已知的跨項依賴」表 —— "
-                "兩份會漂，遷完就刪掉舊的那張")
-        elif _legacy:
-            _xdep_meta.update(schema="legacy_free_text", rows=_legacy,
-                              reason="legacy_cross_dep_table_is_free_text")
+    # **認表頭，不認散文**（跟〈里程碑〉同一個做法）：那一句話之後、下一個標題之前的
+    # **第一張表**，表頭要是 `| 這一項 | 依賴 |`。原本是「原始檔找這個詞＋往後 2000 字元
+    # 裡任何 `| \`` 開頭的兩欄列」—— 一句提到這個詞的散文，加上後面一張無關的兩欄表
+    # （例如舊 ID 對照），就被當成舊表；旁邊有正本表時因此誤報「兩份並存」（實測）。
+    _legacy, _lg = 0, None          # None 還沒看到那句；seek 找第一張表；in 表內；done
+    for lineno, raw in _wbs_vis:
+        bare = raw.strip()
+        s = plain(bare)
+        if _lg is None:
+            if "已知的跨項依賴" in s and not bare.startswith("|"):
+                _lg = "seek"
+            continue
+        if _lg == "done":
+            break
+        if s.startswith("#"):
+            _lg = "done"
+            continue
+        if not bare.startswith("|"):
+            if _lg == "in":
+                _lg = "done"
+            continue
+        cc_raw = [x.strip() for x in bare.strip("|").split("|")]
+        cc = [plain(x) for x in cc_raw]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cc if c):
+            continue
+        if _lg == "seek":
+            _lg = "in" if cc == ["這一項", "依賴"] else "done"
+            continue
+        if len(cc_raw) == 2:
+            _legacy += 1
+            if not _xd_head:
+                _deps.append({"a": cc_raw[0], "b": cc_raw[1]})
+    if _legacy and _xd_head:
+        violations.append(
+            "docs/WBS.md 同時有〈跨項依賴〉正本表與舊的「已知的跨項依賴」表 —— "
+            "兩份會漂，遷完就刪掉舊的那張")
+    elif _legacy:
+        _xdep_meta.update(schema="legacy_free_text", rows=_legacy,
+                          reason="legacy_cross_dep_table_is_free_text")
     if _xd_head == "canonical":
         _xdep_meta.update(schema="canonical", ordering_status="available", reason=None)
 
@@ -1394,8 +1428,11 @@ for wid in order:
         if m and re.fullmatch(r"W(\d+)", want):
             return int(m.group(1)) <= int(want[1:]) <= int(m.group(2))
         return False
-    if ONLY_WEEK and not any(covers(t, ONLY_WEEK) for t in wk):
-        continue
+    # **`--week` 只是顯示篩選，不准在算出狀態之前 `continue`。** 原本這裡直接跳過，
+    # 於是不在那一週的項目在 `_state_of`、`blocks` 裡不存在 —— 依賴圖、週次日曆、
+    # 缺口規則全部拿到殘缺的表：`--week W2 --check` 對同一份 WBS 紅、不加 `--week`
+    # 綠（實測），`--week W1 --json` 直接 KeyError。狀態對每一項都算，篩選只管顯示。
+    _in_week = not ONLY_WEEK or any(covers(t, ONLY_WEEK) for t in wk)
 
     # 人為決定 —— 機器算不出來的那些。理由寫在同一格，用 ｜ 隔開。
     # 標記可以複合：`Alarm+Pending｜理由`。Alarm 是風險訊號，**跟其他標記並存**，
@@ -1494,9 +1531,11 @@ for wid in order:
     if len(detail) > 44:
         detail = detail[:43] + "…"
 
-    tally[state] += 1
     _state_of[wid] = state
     _durable_of[wid] = durable if durable is not None else state
+    if not _in_week:
+        continue
+    tally[state] += 1
     by_group[re.sub(r"[0-9]+$", "", wid)][state] += 1
     if ONLY_BLOCKED and state not in ("等外部", "待裁決"):
         continue
@@ -1679,6 +1718,13 @@ for r in _xdep_rows:
         dmax = week_max(wbs[dep]["weeks"])
         if dmax is None:
             _xd["skipped_dep_no_week"] += 1
+            # 缺口（沒有工作週次、有 `決策≤Wn`）寫在這裡會繞過不變量 5 —— 同一條依賴
+            # 寫在阻塞欄會被抓到「工作排在決策期限之前或同週」。跟「阻塞欄只放缺口」
+            # 對稱：這一張只放工作→工作。
+            if wbs[dep].get("deadline") is not None:
+                violations.append(
+                    f"〈跨項依賴〉第 {r['line']} 行：{dep} 是缺口（決策≤W{wbs[dep]['deadline']}、"
+                    f"沒有工作週次）—— 缺口寫在 {src} 的阻塞欄，這一張只放工作項目彼此的先後")
             continue
         _xd["evaluated"] += 1
         evaluated_here += 1
@@ -1699,8 +1745,16 @@ for r in _xdep_rows:
         missing = [d for d in deps if d in wbs and _state_of.get(d) not in DONE_STATES]
         if missing and (rel == "全部" or not done):
             _xd["done_before_deps"] += 1
+            # 前置「已取消」跟「還沒完成」是兩件事，處置也不同：取消了還做完，
+            # 通常是改用別的做法 —— 那這一列的依賴已經過時，要改寫，不是去補做前置。
+            _cx = [d for d in missing if _state_of.get(d) == "已取消"]
+            _nd = [d for d in missing if d not in _cx]
+            _why = "、".join(
+                ([f"它依賴的 {'、'.join(_nd)} 還沒完成"] if _nd else [])
+                + ([f"它依賴的 {'、'.join(_cx)} 已取消（改用別的做法完成的話，改寫這一列："
+                    f"刪掉或換成實際依賴的項目）"] if _cx else []))
             violations.append(
-                f"{src}：狀態是「{_state_of[src]}」，但它依賴的 {'、'.join(missing)} 還沒完成"
+                f"{src}：狀態是「{_state_of[src]}」，但{_why}"
                 f"（〈跨項依賴〉第 {r['line']} 行，關係「{rel}」）—— 兩邊的紀錄有一邊是錯的")
 _xd["cycles"] = find_cycles(_xg)
 for cyc in _xd["cycles"]:
@@ -1831,7 +1885,10 @@ elif _alines:
         for _g in _deadline_gaps:
             _n = wbs[_g]["deadline"]
             _st = _state_of.get(_g)
-            if _st in ("已完成", "已取消"):
+            # 終態跟依賴圖的「完成」同一個定義（有 change 的看全部封存、沒有的看 Done），
+            # 再加已取消。原本只認 Done／Cancelled：有 change 的項目不准標 Done，
+            # 於是用 change 做掉的缺口永遠不會被判已裁決（實測）。
+            if _st in DONE_STATES + ("已取消",):
                 _cs, _since = "decided", None
             elif _cw <= _n:
                 _cs, _since = "waiting", None
