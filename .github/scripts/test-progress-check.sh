@@ -147,7 +147,7 @@ RM
 run_absent() {
   local want="$1" desc="$2" needle="$3"
   local out rc
-  out="$(cd "$W" && bash "$SCRIPT" --check 2>&1)"; rc=$?
+  out="$(cd "$W" && bash "$SCRIPT" --check ${WEEK:+--week "$WEEK"} 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
     echo "✗ ${desc} —— 期望退出碼 ${want}，實際 ${rc}"
     bump_fail; return
@@ -1993,11 +1993,11 @@ run_expr "同週那條真的被評估了（不是被跳過才綠）" \
 baseline
 xdep "| APP-C01 | APP-P03、APP-O10 | 任一 | 兩個都來不及 |"
 run 1 "「任一」但沒有一個來得及要紅" "沒有一個來得及"
-run_expr "「常態」項目沒有週次：算進跳過，不算評估" \
+run_expr "「常態」項目沒有週次：算進跳過、不算評估（它另外是文法錯誤，見後面）" \
   "g['cross_deps']['evaluated']==1 and g['cross_deps']['skipped_dep_no_week']==1"
 
 baseline
-xdep "| APP-P03 | APP-C01、APP-O10 | 任一 | 骨架來得及就夠 |"
+xdep "| APP-P03 | APP-C01 | 任一 | 骨架來得及就夠 |"
 run 0 "「任一」只要一個來得及就是綠的" ""
 
 # 「任一」要有一個來得及、一個來不及，而且兩個都**真的被評估**才分得出跟「全部」的差別。
@@ -2012,14 +2012,17 @@ edit "| 任一 | 一個來得及" "| 全部 | 一個來得及"
 run 1 "同一列改成「全部」就要紅" "APP-C02（最晚 W3）"
 
 # 分母守恆：每條邊恰好落進一個桶。把規則寫成永遠跳過，「至少評估一條」會紅；
-# 把某種跳過漏算，加總會對不上。
+# 把某種跳過漏算，加總會對不上。fixture 要**合法**：會被跳過又合法的只剩「依賴已取消的項目」
+# （沒有週次的依賴是文法錯誤，見後面）。
 baseline
-xdep "| APP-P03 | APP-C01、APP-O10 | 全部 | 一條可比、一條常態 |
-| APP-C01 | APP-O10 | 全部 | 依賴一個沒有週次的常態項目（缺口不准寫在這張表） |"
+edit "| APP-O10 | 文件維護 |" "| APP-C03 | 舊做法 | 改用別的了 | W1 | 1 | | Cancelled｜改用 APP-C01 的做法 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-P03 | APP-C01、APP-C03 | 全部 | 一條可比、一條依賴已取消的項目 |"
 run 0 "分母守恆那份 fixture 本身是合法的" ""
 run_expr "分母守恆：evaluated＋各類 skipped＝edges，而且至少評估一條" \
-  "(lambda c: c['edges']==3 and c['evaluated']>=1 and c['evaluated']+c['skipped_dep_missing'] \
-   +c['skipped_src_no_week']+c['skipped_dep_cancelled']+c['skipped_dep_no_week']==c['edges'])(g['cross_deps'])"
+  "(lambda c: c['edges']==2 and c['evaluated']==1 and c['skipped_dep_cancelled']==1 \
+   and c['evaluated']+c['skipped_dep_missing']+c['skipped_src_no_week']+c['skipped_dep_cancelled'] \
+   +c['skipped_dep_no_week']==c['edges'])(g['cross_deps'])"
 
 # 說明欄的 ID 是出處，不是依賴（GuildHub 的舊表就是這樣誤判的）。
 baseline
@@ -2351,6 +2354,54 @@ anchor
 mkarchived dep-g01-search
 ASOF=2026-10-12 run_expr "已封存的缺口是 decided" \
   "d['calendar']['gaps'][0]['state']=='已封存' and d['calendar']['gaps'][0]['calendar_state']=='decided'"
+
+
+# ── Fable 複審找到的（2026-09-25）────────────────────────────────
+
+# 前面一段說明先提到「已知的跨項依賴」，真正的舊表在後面：不准因為第一次提到的地方
+# 底下沒有表，就整份放棄（原本會 break，那張表靜靜消失、連「沒有被驗」都不講）。
+baseline
+edit "## 工作項目" "## 說明
+
+先後關係見底下「已知的跨項依賴」那張表。
+
+## 工作項目"
+edit "| 這一項 | 依賴 |" "已知的跨項依賴（改動時要一起看）：
+
+| 這一項 | 依賴 |"
+run 0 "前面先提到那個詞、真正的舊表在後面：照樣認得，而且講「沒有被驗」" "排程與環都沒有被驗"
+run_expr "…而且舊表進了 deps_meta 與 deps" "x['schema']=='legacy_free_text' and x['rows']==1 and len(d['deps'])==1"
+
+# `--week` 之下「哪些項目依賴外部」只算那一週的依賴者（跟上面的統計同一個範圍）。
+baseline
+run 0 "對照：不加 --week 有「哪些項目依賴外部」（DEP-G01 擋著 W2 的 APP-P03）" "哪些項目依賴外部"
+WEEK=W1 run_absent 0 "--week W1：W2 的依賴者不算，那一段不出現" "哪些項目依賴外部"
+WEEK=W2 run 0 "--week W2：那一段標明只算 W2" "只算 W2 的項目"
+
+# 有〈跨項依賴〉這一節卻解析不出來：原因碼跟「沒有這張表」分開（網頁講的話不同）。
+baseline
+edit "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |" "| \`APP-P03\` 清單 | \`APP-C01\` 骨架 |
+
+## 跨項依賴
+
+| 項目 | 依賴 | 關係 | 說明 |
+|---|---|---|---|
+| APP-P03 | APP-C01 | 全部 | 表頭寫錯 |"
+run_expr "表頭認不出來：reason 是 cross_dep_table_not_parsed，不是 no_cross_dep_table" \
+  "x['reason']=='cross_dep_table_not_parsed'"
+
+
+# 〈跨項依賴〉的依賴沒有工作週次（不是缺口、也不是已取消）：排不出先後，文法錯誤。
+# 原本靜靜落進「沒有週次」的桶，同一列另一條邊被評估到時連分母那行都不印（Fable 複審實測）。
+baseline
+edit "| APP-O10 | 文件維護 |" "| APP-O11 | 佈署 | 等平台 | — | — | | Pending｜平台還沒開 |
+| APP-O10 | 文件維護 |"
+xdep "| APP-P03 | APP-O11、APP-C01 | 全部 | 要先有平台 |"
+run 1 "依賴一個沒排週次的項目要紅（先排週次）" "APP-O11 沒有工作週次，排不出先後"
+
+baseline
+xdep "| APP-P03 | APP-O10 | 全部 | 依賴常態維運 |"
+run 1 "依賴一個常態（Regular）項目要紅（拆出有週次的一次性項目再依賴）" "APP-O10 沒有工作週次，排不出先後"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
