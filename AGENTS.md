@@ -352,7 +352,8 @@ bash .github/scripts/check-scenario-coverage.sh
 
 列出 `openspec/specs/` 裡「沒有任何通過的測試指著它」的 Scenario。**有缺口
 也回 0，不接在 CI 上，不擋任何 PR。** 它的位置在 `prompts/05-verify.md` 那一
-步：把清單攤開，由人對每一條說出處置。
+步：把清單攤開，由人對每一條說出處置。最後一段是**反方向**：通過的測試指著、
+現況規格與進行中 change 都找不到的 ID —— Scenario 退場了，測試還綠著。
 
 **為什麼不是閘門。** 它證明得了的事只有「這個 ID 出現在一個通過的測試標題
 裡」，證明不了那個測試真的在驗那條 Scenario 的行為。當它是閘門，唯一保證會

@@ -1792,3 +1792,21 @@ GuildHub 遷〈跨項依賴〉時，第一版把舊表**原地**改成四欄、�
 
 **怎麼驗**：`test-progress-check.sh` 336 → 341；`progress.sh` 換回修正前，新加的 3 條紅（兩條對照綠）；突變 5 刀全紅。GuildHub main（`b205d3f`，正本表已在標題底下）的 `--check` 輸出逐字不變。
 
+## 2026-10-03　BDD 課程（AIxBDD 2.0）借三點，其餘不採
+
+使用者給了一份 BDD 課程（Gherkin＋DSL＋behave／playwright-bdd，「規格驅動全自動開發」），問適不適合優化我們。讀完 skills 與它的實戰範例，跟 Fable 審一輪（同意／不同意要附具體會錯的情況）。
+
+**不採（Fable 全部同意）**：
+- **可執行 Gherkin＋Truth symlink**：它唯一的機器檢查是「undefined step 會失敗」，等於我們已經降級的「標題帶 ID」閘門——證明測試**掛著**規格，證明不了**驗到**規格。課程自己的範例就有恆真 Then（`if (await chatError.isVisible()) {…}`）、`catch {}` 吞斷言、拒絕只驗 `status >= 400`，違反它自己的 DSL 照樣綠。搬進來會跟 OpenSpec Scenario 變成兩份真相。
+- **實作中遇規格缺口不停下來問、自己採最小假設**：跟「發現規格有問題就停下來」相反（課程自己的 `bdd` 與 `implement` 也互相矛盾）。
+- **truth-delta 表／NOOP 列**：OpenSpec 的 ADDED／MODIFIED／REMOVED 已經是它；NOOP 是為它的 DSL 層搬家而生的。
+- **clarify 題數上限、附推薦的選項表**：推薦選項就是訪談者先猜一個值放最前面，跟 `01-discovery` 的「不確定就列成未決問題，不要猜一個值填進去」相反。
+- **tasks marker（BDD-RED／ALIGN／REMOVE）**：tasks.md 由 OpenSpec 產生；REMOVE 的實質由下面第 1 點接住。
+
+**採用**：
+1. **Scenario 缺口報告加反方向**：通過的測試指著、現況規格與進行中 change（ADDED／MODIFIED）都找不到的 ID。Scenario 退場後測試還綠著、養著沒有規格的程式碼，原本沒有任何地方會講。只報告、退出碼不變，0 個也印。**不預測「archive 後會變孤兒」**：GuildHub 的 REMOVED 區塊把 ID 寫在散文裡、同一段同時列「沿用」與「退場」的 ID（`fe-n08`：S06／S07／S11／S15 沿用、只有 S14 退場），照字面抽會叫人刪掉活的測試（Fable 指出，我核對過）。GuildHub 今天真孤兒 0（10 個看似孤兒的是 e2e 把 `FE-B04-S05` 簡寫成 `B04-S05`，不在 vitest 報告範圍）——0 是「實作 PR 記得刪測試」這個沒人檢查的步驟的結果，報告是那一步被跳過時唯一會講話的東西。
+2. **一個 Scenario 一個動作**（`config.yaml` 規則＋`03` 第 7 題的一行 awk）。判準借課程：「只把其中一個結果改壞，這條還會過嗎？會就拆」；前面的動作改寫成 `GIVEN`。**只適用新寫的**：GuildHub 757 條裡 205 條（27%）有不只一個 `WHEN`／`AND WHEN`（我原本只數 `WHEN` 算成 33 條，Fable 指出漏了 172 條 `AND WHEN`）——main 上的 ID 不能改，回頭拆就是修漂移製造漂移。不做檢查、不擋。
+3. **失敗路徑的 Scenario 要寫出失敗後什麼 SHALL NOT 改變**（`config.yaml` 規則＋`03` 第 1 題），**測試要驗它**（`operations.apply.guidance`）。規格層那半是 Fable 補的：GuildHub 的測試常比規格嚴（`FE-B01-S11` 規格只寫「能重新請求同一頁」，測試自己補了「失敗後下一頁是 no-op」），但那是測試的人自己發明的；換一個人，「拿失敗頁當跳板」會在「已覆蓋」底下通過。粗算 134 條失敗類 Scenario 裡 52 條沒寫不變條件。
+
+**怎麼驗**：`test-scenario-coverage.sh` 15 → 22；`check-scenario-coverage.sh` 換回修改前，新加的 7 條紅；突變 6 刀全紅。GuildHub 真實 vitest 報告（1563 條）上反方向是 0 個——74 個進行中 change 的 ID 正確排除。`03` 那行 awk 原文照抄在 GuildHub 現況規格上跑，列出 205 條（跟 Python 算的一致）。`config.yaml` 用 YAML parser 讀過。
+

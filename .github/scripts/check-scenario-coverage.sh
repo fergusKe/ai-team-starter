@@ -98,13 +98,16 @@ results = data.get("testResults")
 if not isinstance(results, list):
     print("✗ vitest 報告裡沒有 testResults 陣列 —— 格式變了？", file=sys.stderr)
     raise SystemExit(2)
-passed, total = set(), 0
+passed, total, where = set(), 0, {}
 for fres in results:
     for a in fres.get("assertionResults", []) or []:
         total += 1
         if a.get("status") == "passed":
             # 只認葉節點標題 —— ID 寫在 describe 上會沾到底下每一條，包括 skip 的。
-            passed.update(re.findall(r"\[([A-Z0-9-]+)\]", a.get("title", "")))
+            ids = re.findall(r"\[([A-Z0-9-]+)\]", a.get("title", ""))
+            passed.update(ids)
+            for i in ids:
+                where.setdefault(i, set()).add(fres.get("name") or "?")
 if total == 0:
     print("✗ vitest 報告裡一條測試結果都沒有 —— 真的跑到測試了嗎？", file=sys.stderr)
     raise SystemExit(2)
@@ -117,9 +120,41 @@ for s in gaps:
           + (f"\n        註記：{notes[s]}" if s in notes else ""))
 for m in odd:
     print(f"    ⚠ {m}")
+
 if gaps:
     print("\n  這是**待處置清單，不是錯誤**。對每一條給出處置："
           "補測試／改成人工驗證並寫進 tasks.md／說明它為什麼不需要自動測試。")
+
+# **反方向：通過的測試指著、規格裡找不到的 ID。** Scenario 退場（REMOVED → archive）之後，
+# 它的測試還綠著、養著已經沒有規格的程式碼 —— 上面只看「規格 → 測試」，這個方向原本
+# 沒有任何地方會講。進行中 change 的 ADDED／MODIFIED 算「規格裡有」（測試先寫、還沒
+# archive 是正常的）；REMOVED 底下的不算（它正要退場）；已 archive 的 change 不算（內容
+# 已經折進現況規格，沒折進去就是真的沒有）。**沒有也要講 0 個** —— 不講就分不出有沒有看。
+# 不預測「archive 後會變孤兒」：REMOVED 的 ID 常只寫在散文裡、還會同時列「沿用」的 ID，
+# 照字面抽會叫人刪掉活的測試（GuildHub fe-n08 實例）。archive 之後這一段自然會抓到。
+inflight = set()
+cdir = pathlib.Path("openspec/changes")
+if cdir.is_dir():
+    for f in sorted(cdir.rglob("*.md")):
+        if "archive" in f.relative_to(cdir).parts[:1]:
+            continue
+        removed = False
+        for line in io.open(f, encoding="utf-8").read().splitlines():
+            if re.match(r"^##\s", line):
+                removed = bool(re.match(r"^##\s+REMOVED\b", line))
+                continue
+            mid = HEAD_RE.match(line)
+            if mid and not removed:
+                inflight.add(mid.group(1))
+sid_re = re.compile(SID + r"$")
+orphans = sorted(i for i in passed
+                 if sid_re.fullmatch(i) and i not in scenarios and i not in inflight)
+print(f"\n反方向：通過的測試指著、規格裡找不到的 ID：{len(orphans)} 個")
+for i in orphans:
+    print(f"    {i}  {'、'.join(sorted(where.get(i, ())))}")
+if orphans:
+    print("\n  規格已經沒有這條 Scenario，測試卻還綠著。對每一條給出處置："
+          "刪測試（連同只為它存在的程式碼）／它其實還在，把 ID 補回規格／ID 打錯了。")
 PY
 RC=$?
 if [ "$RC" != 0 ]; then
