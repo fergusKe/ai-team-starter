@@ -121,6 +121,10 @@ for s in gaps:
 for m in odd:
     print(f"    ⚠ {m}")
 
+if gaps:
+    print("\n  這是**待處置清單，不是錯誤**。對每一條給出處置："
+          "補測試／改成人工驗證並寫進 tasks.md／說明它為什麼不需要自動測試。")
+
 # **反方向：通過的測試指著、規格裡找不到的 ID。** Scenario 退場（REMOVED → archive）之後，
 # 它的測試還綠著、養著已經沒有規格的程式碼 —— 上面只看「規格 → 測試」，這個方向原本
 # 沒有任何地方會講。進行中 change 的 ADDED／MODIFIED 算「規格裡有」（測試先寫、還沒
@@ -151,9 +155,6 @@ for i in orphans:
 if orphans:
     print("\n  規格已經沒有這條 Scenario，測試卻還綠著。對每一條給出處置："
           "刪測試（連同只為它存在的程式碼）／它其實還在，把 ID 補回規格／ID 打錯了。")
-if gaps:
-    print("\n  這是**待處置清單，不是錯誤**。對每一條給出處置："
-          "補測試／改成人工驗證並寫進 tasks.md／說明它為什麼不需要自動測試。")
 PY
 RC=$?
 if [ "$RC" != 0 ]; then

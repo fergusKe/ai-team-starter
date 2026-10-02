@@ -1808,5 +1808,5 @@ GuildHub 遷〈跨項依賴〉時，第一版把舊表**原地**改成四欄、�
 2. **一個 Scenario 一個動作**（`config.yaml` 規則＋`03` 第 7 題的一行 awk）。判準借課程：「只把其中一個結果改壞，這條還會過嗎？會就拆」；前面的動作改寫成 `GIVEN`。**只適用新寫的**：GuildHub 757 條裡 205 條（27%）有不只一個 `WHEN`／`AND WHEN`（我原本只數 `WHEN` 算成 33 條，Fable 指出漏了 172 條 `AND WHEN`）——main 上的 ID 不能改，回頭拆就是修漂移製造漂移。不做檢查、不擋。
 3. **失敗路徑的 Scenario 要寫出失敗後什麼 SHALL NOT 改變**（`config.yaml` 規則＋`03` 第 1 題），**測試要驗它**（`operations.apply.guidance`）。規格層那半是 Fable 補的：GuildHub 的測試常比規格嚴（`FE-B01-S11` 規格只寫「能重新請求同一頁」，測試自己補了「失敗後下一頁是 no-op」），但那是測試的人自己發明的；換一個人，「拿失敗頁當跳板」會在「已覆蓋」底下通過。粗算 134 條失敗類 Scenario 裡 52 條沒寫不變條件。
 
-**怎麼驗**：`test-scenario-coverage.sh` 15 → 22；`check-scenario-coverage.sh` 換回修改前，新加的 7 條紅；突變 6 刀全紅。`03` 那行 awk 原文照抄在 GuildHub 現況規格上跑，列出 205 條（跟 Python 算的一致）。`config.yaml` 用 YAML parser 讀過。
+**怎麼驗**：`test-scenario-coverage.sh` 15 → 22；`check-scenario-coverage.sh` 換回修改前，新加的 7 條紅；突變 6 刀全紅。GuildHub 真實 vitest 報告（1563 條）上反方向是 0 個——74 個進行中 change 的 ID 正確排除。`03` 那行 awk 原文照抄在 GuildHub 現況規格上跑，列出 205 條（跟 Python 算的一致）。`config.yaml` 用 YAML parser 讀過。
 
