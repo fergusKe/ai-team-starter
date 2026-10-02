@@ -220,6 +220,58 @@ FAKE_JSON="$(json_all_pass)"
 run 0 "只看 openspec/specs，changes 底下的都不掃" "0 條沒有" "DEMO-0"
 
 echo
+echo "── 反方向：測試指著、規格裡找不到的 ID ──"
+# 規格把一條 Scenario 退場（REMOVED、archive）之後，它的測試還綠著、養著已經沒有規格的
+# 程式碼 —— 原本只看「規格 → 測試」，這個方向沒有任何地方會講（BDD 課程 [BDD-REMOVE]
+# 的等價物；2026-10-03 Fable 審查）。**一樣只報告，退出碼不變。**
+orphan_json() {
+  printf '%s' '{"testResults":[{"name":"tests/old.test.ts","assertionResults":[
+    {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]},
+    {"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["demo"]},
+    {"title":"[DEMO-01-S09] 已經退場的那條","status":"passed","ancestorTitles":["demo"]}]}]}'
+}
+setup
+FAKE_JSON="$(json_all_pass)"
+run 0 "沒有孤兒也要講 0 個（沒講就分不出有沒有看）" "規格裡找不到的 ID：0 個"
+
+setup
+FAKE_JSON="$(orphan_json)"
+run 0 "測試指著規格沒有的 ID：點名、附測試檔，不擋（rc=0）" "DEMO-01-S09.*tests/old.test.ts"
+run 0 "…而且計數是 1" "規格裡找不到的 ID：1 個"
+
+# 進行中 change 的 ADDED／MODIFIED：測試先寫、還沒 archive，是正常的，不算孤兒。
+setup
+mkdir -p "$W/repo/openspec/changes/new/specs/demo"
+printf '## ADDED Requirements\n\n### Requirement: 新的\n\n#### Scenario: [DEMO-01-S09] 新的\n\n- **WHEN** a\n- **THEN** b\n' \
+  > "$W/repo/openspec/changes/new/specs/demo/spec.md"
+FAKE_JSON="$(orphan_json)"
+run 0 "進行中 change 的 ADDED 裡有這個 ID：不算孤兒" "規格裡找不到的 ID：0 個"
+
+# 進行中 change 的 REMOVED 底下就算有這個標題，也不算「規格裡有」（它正要退場）。
+setup
+mkdir -p "$W/repo/openspec/changes/new/specs/demo"
+printf '## REMOVED Requirements\n\n### Requirement: 舊的\n\n#### Scenario: [DEMO-01-S09] 舊的\n' \
+  > "$W/repo/openspec/changes/new/specs/demo/spec.md"
+FAKE_JSON="$(orphan_json)"
+run 0 "只出現在進行中 change 的 REMOVED：照樣是孤兒" "規格裡找不到的 ID：1 個"
+
+# 已 archive 的 change 不算「規格裡有」—— 它的內容已經折進現況規格，沒折進去就是真的沒有。
+setup
+mkdir -p "$W/repo/openspec/changes/archive/2026-01-01-old/specs/demo"
+printf '## ADDED Requirements\n\n#### Scenario: [DEMO-01-S09] 舊的\n' \
+  > "$W/repo/openspec/changes/archive/2026-01-01-old/specs/demo/spec.md"
+FAKE_JSON="$(orphan_json)"
+run 0 "只出現在已 archive 的 change：照樣是孤兒" "規格裡找不到的 ID：1 個"
+
+# skipped／failed 的測試不算「還綠著養程式碼」，不列。
+setup
+FAKE_JSON='{"testResults":[{"assertionResults":[
+  {"title":"[DEMO-01-S01] 第一條","status":"passed","ancestorTitles":["demo"]},
+  {"title":"[DEMO-01-S02] 第二條","status":"passed","ancestorTitles":["demo"]},
+  {"title":"[DEMO-01-S09] 退場","status":"skipped","ancestorTitles":["demo"]}]}]}'
+run 0 "skipped 的測試帶著退場 ID：不列" "規格裡找不到的 ID：0 個"
+
+echo
 printf '通過 %s / 失敗 %s / 共 %s\n' "$PASS" "$FAIL" "$((PASS + FAIL))"
 if [ "$FAIL" -eq 0 ]; then
   rm -rf "$W"
