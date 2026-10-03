@@ -61,9 +61,15 @@ import {
   writeTreeOf,
   USAGE_MODES,
   MEASUREMENT_SCHEMA_VERSION,
+  resolveGeminiBin,
+  buildGeminiArgs,
+  resolveGeminiApiKey,
+  parseGeminiRun,
+  runGemini,
+  runGeminiAsync,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
-import { main as councilMain, parseVerdicts, buildReviewPrompt } from './council.mjs'
+import { main as councilMain, parseVerdicts, buildReviewPrompt, buildReviewQuestions, REFUTE_SENTENCE } from './council.mjs'
 import {
   main as setupMain,
   matcherCovers,
@@ -75,9 +81,52 @@ import {
   codexMatcherCoversShell,
   harnessRoles,
 } from './setup.mjs'
+import { getHarness } from './harnesses/index.mjs'
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+}
+
+// ─────────────────── 1.15.0 測試接縫：假 harness（取代 1.14.0 的 deps.runAgyAsync／runCodexAsync／runGeminiAsync／runAgy／assertSettings） ───────────────────
+// council.mjs runOne／write.mjs main 只查 registry（deps.getHarness 可注入）。本檔既有測試的假函式仍收「1.14.0 runner 的引數形狀」、
+// 回「1.14.0 runner 的回傳形狀」，一個斷言都不用改：
+//   runReview(args)：args ＝ 真 harness 的 review.args(opts)（agy：mode plan＋NO_EXEC_HEADER；codex：effort 預設 high；gemini：NO_EXEC_HEADER＋resolveKey）
+//   runWrite(args)：args ＝ 真 harness 的 write.args(opts)（{ model, mode:'accept-edits', prompt, cwd, extraArgs, timeoutMs }；續輪 extraArgs ＝ ['--conversation', id]）
+//   preflight(settingsFile, repoRoot, config)：舊 assertSettings 形狀（回 true ＝ 過；throw ＝ G2 擋，訊息原封進 🔴 G2：）
+// 回傳值經真 harness 的 normalize 轉成統一形狀——引數由真 harness 算、形狀由真 harness 轉，假的只有「不 spawn」這一段。
+export function fakeHarnessFrom({ name, runReview, runWrite, preflight }) {
+  const real = getHarness(name)
+  const h = { ...real }
+  if (runReview) {
+    h.review = {
+      ...real.review,
+      run: async (opts) => real.review.normalize(await runReview(real.review.args(opts))),
+      runSync: (opts) => real.review.normalize(runReview(real.review.args(opts))),
+    }
+  }
+  if (runWrite) {
+    h.write = {
+      ...real.write,
+      run: (opts) => real.write.normalize(runWrite(real.write.args({ ...opts, conversationId: undefined }))),
+      resume: (opts) => real.write.normalize(runWrite(real.write.args(opts))),
+    }
+  }
+  if (preflight) {
+    h.preflight = (env, config, deps = {}) => {
+      try {
+        preflight(undefined, deps.repoRoot ?? null, config)
+        return []
+      } catch (e) {
+        return [{ ok: false, label: `${name} preflight`, message: e.message }]
+      }
+    }
+  }
+  return h
+}
+
+/** deps.getHarness：指定名字用假 harness，其餘走真 registry。 */
+export function fakeGetHarness(fakes) {
+  return (name) => fakes[name] || getHarness(name)
 }
 
 // ─────────────────── schema v2 測試 fixture（三種統整者 profiles） ───────────────────
@@ -88,6 +137,7 @@ export const M = {
   agyGemini: { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' },
   codexSol: { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' },
   claudeCode: { harness: 'claude', model: 'claude-code', quotaBucket: 'anthropic' },
+  geminiPro: { harness: 'gemini', model: 'gemini-2.5-pro', quotaBucket: 'gemini-api' },
 }
 
 export function v2Profiles(override = {}) {
@@ -494,11 +544,11 @@ describe('validateProfiles：config 不變式（每條各自紅、各自指名 p
     )
   })
 
-  test('統整者與 reviewer／blockReviewer／adjudicator 同 quotaBucket ⇒ 各自 throw 含「同 quotaBucket」', () => {
+  test('1.22.0 隔離上下文：與統整者同 quotaBucket 的 reviewer／blockReviewer／adjudicator ⇒ 過（獨立性靠全新上下文，不靠換桶）', () => {
     const anthropicViaAgy = { harness: 'agy', model: 'claude-opus-4-6-thinking', quotaBucket: 'anthropic' }
-    assert.throws(loadOf(cfgWith({ reviewers: [anthropicViaAgy] })), /reviewers\[0\] 與統整者同 quotaBucket=anthropic/)
-    assert.throws(loadOf(cfgWith({ blockReviewers: [anthropicViaAgy] })), /blockReviewers\[0\] 與統整者同 quotaBucket=anthropic/)
-    assert.throws(loadOf(cfgWith({ adjudicator: { harness: 'codex', model: 'x', quotaBucket: 'anthropic' } })), /adjudicator 與統整者同 quotaBucket=anthropic/)
+    assert.doesNotThrow(loadOf(cfgWith({ reviewers: [anthropicViaAgy] })))
+    assert.doesNotThrow(loadOf(cfgWith({ blockReviewers: [anthropicViaAgy] })))
+    assert.doesNotThrow(loadOf(cfgWith({ adjudicator: { harness: 'codex', model: 'x', quotaBucket: 'anthropic' } })))
   })
 
   test('adjudicator 出現在 reviewers ⇒ throw 含「裁決者 ∉ 一般票複審名單」；只在 blockReviewers ⇒ 過', () => {
@@ -521,14 +571,18 @@ describe('validateProfiles：config 不變式（每條各自紅、各自指名 p
     assert.throws(loadOf(cfgWith({ blockReviewers: [] })), /profiles\.claude\.blockReviewers 必須是非空陣列/)
   })
 
-  test('🔴 claude harness 只准當 coordinator：出現在 reviewers／blockReviewers／adjudicator ⇒ 各自 throw（Fergus 2026-09-14 硬約束）', () => {
+  test('1.22.0 隔離上下文：claude 當 reviewers／blockReviewers／adjudicator ⇒ 過；統整者本人（同 harness＋model）⇒ 仍拒（Fergus 2026-10-03）', () => {
     const claudeOpus = { harness: 'claude', model: 'opus', quotaBucket: 'anthropic' }
+    const claudeCoord = { harness: 'claude', model: 'claude-code', quotaBucket: 'anthropic' }
     const agyCoord = { harness: 'agy', model: 'gemini-3.1-pro-high', quotaBucket: 'gemini' }
-    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [claudeOpus], blockReviewers: [M.codexSol], adjudicator: 'human' })), /reviewers\[0\] 是 claude harness/)
-    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [claudeOpus], adjudicator: 'human' })), /blockReviewers\[0\] 是 claude harness/)
-    assert.throws(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [M.codexSol], adjudicator: claudeOpus })), /adjudicator 是 claude harness/)
-    // 陽性對照：同一組但 claude 只在 coordinator ⇒ 過
-    assert.doesNotThrow(loadOf(cfgWith({ coordinator: claudeOpus, reviewers: [M.agyGemini], blockReviewers: [M.codexSol], adjudicator: 'human' })))
+    assert.doesNotThrow(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [claudeOpus], blockReviewers: [M.codexSol], adjudicator: 'human' })))
+    assert.doesNotThrow(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [claudeOpus], adjudicator: 'human' })))
+    assert.doesNotThrow(loadOf(cfgWith({ coordinator: agyCoord, reviewers: [M.codexSol], blockReviewers: [M.codexSol], adjudicator: claudeOpus })))
+    // claude 統整＋claude 複審（不同 model）⇒ 過：這正是「額度用完不卡住」要的組合
+    assert.doesNotThrow(loadOf(cfgWith({ coordinator: claudeCoord, reviewers: [claudeOpus], blockReviewers: [claudeOpus, M.codexSol], adjudicator: M.codexSol })))
+    // 陽性對照：統整者本人進名單 ⇒ 仍拒（這條沒撤）
+    assert.throws(loadOf(cfgWith({ coordinator: claudeCoord, reviewers: [claudeCoord], blockReviewers: [M.codexSol], adjudicator: 'human' })), /reviewers\[0\] 就是統整者本人/)
+    assert.throws(loadOf(cfgWith({ coordinator: claudeCoord, reviewers: [M.codexSol], blockReviewers: [M.codexSol], adjudicator: claudeCoord })), /adjudicator 就是統整者本人/)
   })
 })
 
@@ -997,20 +1051,25 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
 
     let capturedPrompt = null
     const deps = {
-      assertSettings: () => true,
-      runAgy: (args) => {
-        capturedPrompt = args.prompt
-        fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: 'ok', conversation_id: 'conv-allowed-heads' },
-          steps: [],
-          conversationId: 'conv-allowed-heads',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: (args) => {
+            capturedPrompt = args.prompt
+            fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: 'ok', conversation_id: 'conv-allowed-heads' },
+              steps: [],
+              conversationId: 'conv-allowed-heads',
+            }
+          },
+        }),
+      }),
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
 
@@ -1050,12 +1109,17 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
 
     let agyCalls = 0
     const deps = {
-      assertSettings: () => true,
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => {
+            agyCalls++
+            return { exit: 0, stdout: '', stderr: '', denied: [], result: { response: 'ok' }, steps: [] }
+          },
+        }),
+      }),
       runInstall: (cmd, cwd) => ({ exit: 7, out: 'boom' }),
-      runAgy: () => {
-        agyCalls++
-        return { exit: 0, stdout: '', stderr: '', denied: [], result: { response: 'ok' }, steps: [] }
-      },
     }
 
     const errs = []
@@ -1090,20 +1154,25 @@ describe('write.mjs：六道守門各自紅、各自的訊息', () => {
 
     let agyCalls = 0
     const deps = {
-      assertSettings: () => true,
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => {
+            agyCalls++
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: 'ok', conversation_id: 'conv-t2' },
+              steps: [],
+              conversationId: 'conv-t2',
+            }
+          },
+        }),
+      }),
       runInstall: (cmd, cwd) => ({ exit: 7, out: 'boom' }),
-      runAgy: () => {
-        agyCalls++
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: 'ok', conversation_id: 'conv-t2' },
-          steps: [],
-          conversationId: 'conv-t2',
-        }
-      },
     }
 
     const origLog = console.log
@@ -2330,15 +2399,20 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
     const outDir = path.join(repo.dir, '.agy-write')
 
     const deps = {
-      assertSettings: () => true,
-      runAgy: () => ({
-        exit: 0,
-        stdout: '',
-        stderr: '',
-        denied: [],
-        result: { response: 'ok' },
-        steps: [],
-        conversationId: null,
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => ({
+            exit: 0,
+            stdout: '',
+            stderr: '',
+            denied: [],
+            result: { response: 'ok' },
+            steps: [],
+            conversationId: null,
+          }),
+        }),
       }),
     }
 
@@ -2375,21 +2449,26 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
     const calls = []
     let roundCount = 0
     const deps = {
-      assertSettings: () => true,
-      runAgy: (args) => {
-        roundCount++
-        calls.push(args)
-        fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: `round ${roundCount} ok`, conversation_id: 'conv-round-1' },
-          steps: [],
-          conversationId: 'conv-round-1',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: (args) => {
+            roundCount++
+            calls.push(args)
+            fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: `round ${roundCount} ok`, conversation_id: 'conv-round-1' },
+              steps: [],
+              conversationId: 'conv-round-1',
+            }
+          },
+        }),
+      }),
       runTest: () => {
         return { exit: roundCount === 1 ? 1 : 0, out: roundCount === 1 ? 'red' : 'green' }
       },
@@ -2426,20 +2505,25 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
 
     let roundCount = 0
     const deps = {
-      assertSettings: () => true,
-      runAgy: (args) => {
-        roundCount++
-        fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: `round ${roundCount} ok`, conversation_id: roundCount === 1 ? 'conv-1' : 'conv-DIFFERENT' },
-          steps: [],
-          conversationId: roundCount === 1 ? 'conv-1' : 'conv-DIFFERENT',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: (args) => {
+            roundCount++
+            fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: `round ${roundCount} ok`, conversation_id: roundCount === 1 ? 'conv-1' : 'conv-DIFFERENT' },
+              steps: [],
+              conversationId: roundCount === 1 ? 'conv-1' : 'conv-DIFFERENT',
+            }
+          },
+        }),
+      }),
       runTest: () => ({ exit: 1, out: 'red' }),
     }
 
@@ -2478,32 +2562,37 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
     const calls = []
     let callCount = 0
     const deps = {
-      assertSettings: () => true,
-      runAgy: (args) => {
-        callCount++
-        calls.push(args)
-        if (callCount === 1) {
-          return {
-            exit: 0,
-            stdout: '',
-            stderr: '',
-            denied: [],
-            result: { response: '', conversation_id: 'conv-tool-err' },
-            steps: [{ tool: 'grep_search', error: 'invalid type for Includes' }],
-            conversationId: 'conv-tool-err',
-          }
-        }
-        fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: 'fixed', conversation_id: 'conv-tool-err' },
-          steps: [],
-          conversationId: 'conv-tool-err',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: (args) => {
+            callCount++
+            calls.push(args)
+            if (callCount === 1) {
+              return {
+                exit: 0,
+                stdout: '',
+                stderr: '',
+                denied: [],
+                result: { response: '', conversation_id: 'conv-tool-err' },
+                steps: [{ tool: 'grep_search', error: 'invalid type for Includes' }],
+                conversationId: 'conv-tool-err',
+              }
+            }
+            fs.writeFileSync(path.join(repo.dir, 'add.test.mjs'), 'test')
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: 'fixed', conversation_id: 'conv-tool-err' },
+              steps: [],
+              conversationId: 'conv-tool-err',
+            }
+          },
+        }),
+      }),
       runTest: () => ({ exit: 0, out: 'pass' }),
     }
 
@@ -2538,30 +2627,35 @@ describe('conversation id 處理（fail-closed 與不續話）', () => {
 
     let callCount = 0
     const deps = {
-      assertSettings: () => true,
-      runAgy: () => {
-        callCount++
-        if (callCount === 1) {
-          return {
-            exit: 0,
-            stdout: '',
-            stderr: '',
-            denied: [],
-            result: { response: '', conversation_id: 'conv-1' },
-            steps: [{ tool: 'grep_search', error: 'invalid type for Includes' }],
-            conversationId: 'conv-1',
-          }
-        }
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: 'fixed', conversation_id: 'conv-DIFFERENT' },
-          steps: [],
-          conversationId: 'conv-DIFFERENT',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => {
+            callCount++
+            if (callCount === 1) {
+              return {
+                exit: 0,
+                stdout: '',
+                stderr: '',
+                denied: [],
+                result: { response: '', conversation_id: 'conv-1' },
+                steps: [{ tool: 'grep_search', error: 'invalid type for Includes' }],
+                conversationId: 'conv-1',
+              }
+            }
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: 'fixed', conversation_id: 'conv-DIFFERENT' },
+              steps: [],
+              conversationId: 'conv-DIFFERENT',
+            }
+          },
+        }),
+      }),
       runTest: () => ({ exit: 0, out: 'pass' }),
     }
 
@@ -2639,20 +2733,25 @@ describe('config 從 worktree 讀（不是主 checkout）', () => {
     const outDir = path.join(worktreeDir, '.agy-write')
 
     const deps = {
-      assertSettings: () => true,
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => ({
+            exit: 0,
+            stdout: '',
+            stderr: '',
+            denied: [],
+            result: { response: 'ok', conversation_id: 'conv-wt-cfg' },
+            steps: [],
+            conversationId: 'conv-wt-cfg',
+          }),
+        }),
+      }),
       runInstall: (cmd) => {
         capturedInstallCmd = cmd
         return { exit: 0, out: '' }
       },
-      runAgy: () => ({
-        exit: 0,
-        stdout: '',
-        stderr: '',
-        denied: [],
-        result: { response: 'ok', conversation_id: 'conv-wt-cfg' },
-        steps: [],
-        conversationId: 'conv-wt-cfg',
-      }),
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
 
@@ -2686,19 +2785,24 @@ describe('agy 無頭第 5 坑：--print-timeout 與 timeoutMs 傳遞', () => {
 
     let capturedTimeoutMs = null
     const deps = {
-      assertSettings: () => true,
-      runAgy: (args) => {
-        capturedTimeoutMs = args.timeoutMs
-        return {
-          exit: 0,
-          stdout: '',
-          stderr: '',
-          denied: [],
-          result: { response: 'ok', conversation_id: 'conv-timeout' },
-          steps: [],
-          conversationId: 'conv-timeout',
-        }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: (args) => {
+            capturedTimeoutMs = args.timeoutMs
+            return {
+              exit: 0,
+              stdout: '',
+              stderr: '',
+              denied: [],
+              result: { response: 'ok', conversation_id: 'conv-timeout' },
+              steps: [],
+              conversationId: 'conv-timeout',
+            }
+          },
+        }),
+      }),
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
 
@@ -2808,14 +2912,22 @@ describe('複審名單依 tier 取自 profile：block 票收 blockReviewers、st
     const codexCalls = []
     const agyCalls = []
     const deps = {
-      runCodexAsync: async (args) => {
-        codexCalls.push(args)
-        return { exit: 0, signal: null, timedOut: false, stdout: '整份：簽', stderr: '' }
-      },
-      runAgyAsync: async (args) => {
-        agyCalls.push(args)
-        return { exit: 0, signal: null, timedOut: false, stdout: '', stderr: '', result: { response: '整份：簽' }, denied: [] }
-      },
+      getHarness: fakeGetHarness({
+        codex: fakeHarnessFrom({
+          name: 'codex',
+          runReview: async (args) => {
+            codexCalls.push(args)
+            return { exit: 0, signal: null, timedOut: false, stdout: '整份：簽', stderr: '' }
+          },
+        }),
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          runReview: async (args) => {
+            agyCalls.push(args)
+            return { exit: 0, signal: null, timedOut: false, stdout: '', stderr: '', result: { response: '整份：簽' }, denied: [] }
+          },
+        }),
+      }),
     }
     const origLog = console.log
     console.log = () => {}
@@ -2856,11 +2968,16 @@ describe('P5：寫手逾時 ⇒ write.main 回 3、寫 timeout.json、台帳 FAI
     let testCalls = 0
     let runCalls = 0
     const deps = {
-      assertSettings: () => true,
-      runAgy: () => {
-        runCalls++
-        return { exit: null, signal: 'SIGTERM', timedOut: true, stdout: '', stderr: '', denied: [], steps: [], result: null, conversationId: null }
-      },
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => {
+            runCalls++
+            return { exit: null, signal: 'SIGTERM', timedOut: true, stdout: '', stderr: '', denied: [], steps: [], result: null, conversationId: null }
+          },
+        }),
+      }),
       runTest: () => {
         testCalls++
         return { exit: 0, out: 'ok' }
@@ -2892,8 +3009,13 @@ describe('P5：寫手逾時 ⇒ write.main 回 3、寫 timeout.json、台帳 FAI
     fs.writeFileSync(brief, 'test')
     const outDir = path.join(repo.dir, '.agy-write')
     const deps = {
-      assertSettings: () => true,
-      runAgy: () => ({ exit: 0, stdout: '', stderr: '', denied: [], steps: [], result: { response: 'ok', conversation_id: 'c1' }, conversationId: 'c1' }),
+      getHarness: fakeGetHarness({
+        agy: fakeHarnessFrom({
+          name: 'agy',
+          preflight: () => true,
+          runWrite: () => ({ exit: 0, stdout: '', stderr: '', denied: [], steps: [], result: { response: 'ok', conversation_id: 'c1' }, conversationId: 'c1' }),
+        }),
+      }),
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
     const code = writeMain(['--worktree', repo.dir, '--brief', brief, '--allow', 'add.test.mjs', '--out', outDir, '--test', 'node --test'], deps)
@@ -4020,6 +4142,128 @@ describe('setup.mjs --check：agy 全域 hook 載入檢查', () => {
     const code = setupMain(['--check', '--coordinator', 'claude'], deps)
     assert.equal(code, 0)
   })
+
+  // ─────────────────── postReviewers setup.mjs --check 測試 ───────────────────
+  test('① harnessRoles：profile 有 postReviewers（codex 席）⇒ 回傳的 Map 裡 codex 的角色清單含 postReviewers[…]，且原本的 blockReviewers[…]／adjudicator 描述仍在。', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [M.codexSol],
+          blockReviewers: [M.agyOpus, M.codexSol],
+          adjudicator: M.codexSol,
+        }
+      })
+    })
+    const models = modelsFrom(cfg, {}, 'claude')
+    const rolesMap = harnessRoles(models)
+    assert.ok(rolesMap.has('codex'))
+    const codexRoles = rolesMap.get('codex')
+    assert.ok(codexRoles.includes('postReviewers[codex/gpt-5-6-sol]'))
+    assert.ok(codexRoles.includes('blockReviewers[codex/gpt-5-6-sol]'))
+    assert.ok(codexRoles.includes('adjudicator[codex/gpt-5-6-sol]'))
+  })
+
+  test('② harnessRoles：postReviewers: []（或 profile 沒這個 key ⇒ modelsFrom 給 []）⇒ 不新增任何角色，且不丟錯。', () => {
+    const cfgWithout = v2Config()
+    const modelsWithout = modelsFrom(cfgWithout, {}, 'claude')
+    assert.deepEqual(modelsWithout.postReviewers, [])
+    const rolesMapWithout = harnessRoles(modelsWithout)
+    const codexRolesWithout = rolesMapWithout.get('codex') || []
+    assert.ok(!codexRolesWithout.some(r => r.startsWith('postReviewers')))
+
+    const mockModels = {
+      coordinator: { harness: 'claude' },
+      writer: { harness: 'agy' },
+      reviewers: [],
+      blockReviewers: [],
+      adjudicator: 'human',
+    }
+    assert.doesNotThrow(() => harnessRoles(mockModels))
+  })
+
+  test('③ 若有某個 harness 只出現在 postReviewers（造一個假 config：postReviewers 放一個不在其他名單的 harness）⇒ 它必須出現在 harnessRoles 的 key 裡', () => {
+    const fakeHarnessMember = { harness: 'gemini', model: 'gemini-2.5-pro', quotaBucket: 'gemini-api' }
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          reviewers: [M.agyOpus],
+          blockReviewers: [M.agyOpus],
+          postReviewers: [fakeHarnessMember],
+          adjudicator: 'human'
+        }
+      })
+    })
+    const models = modelsFrom(cfg, {}, 'claude')
+    const rolesMap = harnessRoles(models)
+    assert.ok(rolesMap.has('gemini'), '🔴 陽性對照：如果拿掉 postReviewers，rolesMap 應該沒有 gemini')
+    assert.deepEqual(rolesMap.get('gemini'), ['postReviewers[gemini/gemini]'])
+  })
+
+  test('④ [config] 摘要行：含 事後審 與該席顯示名；名單空 ⇒ 含 事後審 （未設）', () => {
+    const base = makeValidSetupDeps(null)
+    const customProfiles = v2Profiles({
+      claude: {
+        postReviewers: [M.codexSol]
+      }
+    })
+    const depsWith = { ...base, config: v2Config({ profiles: customProfiles }) }
+    const logsWith = []
+    const origLog = console.log
+    console.log = (m) => logsWith.push(String(m))
+    try {
+      setupMain(['--check', '--coordinator', 'claude'], depsWith)
+    } finally {
+      console.log = origLog
+    }
+    const outWith = logsWith.join('\n')
+    assert.match(outWith, /事後審 codex\/gpt-5-6-sol〔openai〕/)
+
+    const depsWithout = { ...base, config: v2Config() }
+    const logsWithout = []
+    console.log = (m) => logsWithout.push(String(m))
+    try {
+      setupMain(['--check', '--coordinator', 'codex'], depsWithout)
+    } finally {
+      console.log = origLog
+    }
+    const outWithout = logsWithout.join('\n')
+    assert.match(outWithout, /事後審 （未設）/)
+  })
+
+  test('⑤ 真 config.json 走一次：profiles.claude ⇒ 摘要含 sol 那一席；profiles.codex（沒有 postReviewers）⇒ 摘要印「未設」且 harnessRoles 不因此多出角色。', () => {
+    const realConfigPath = fileURLToPath(new URL('./config.json', import.meta.url))
+    const realConfig = JSON.parse(fs.readFileSync(realConfigPath, 'utf8'))
+
+    const base = makeValidSetupDeps(null)
+    const depsClaude = { ...base, config: realConfig }
+    const logsClaude = []
+    const origLog = console.log
+    console.log = (m) => logsClaude.push(String(m))
+    try {
+      setupMain(['--check', '--coordinator', 'claude'], depsClaude)
+    } finally {
+      console.log = origLog
+    }
+    const outClaude = logsClaude.join('\n')
+    assert.match(outClaude, /事後審 codex\/gpt-5-6-sol〔openai〕/)
+
+    const depsCodex = { ...base, config: realConfig }
+    const logsCodex = []
+    console.log = (m) => logsCodex.push(String(m))
+    try {
+      setupMain(['--check', '--coordinator', 'codex'], depsCodex)
+    } finally {
+      console.log = origLog
+    }
+    const outCodex = logsCodex.join('\n')
+    assert.match(outCodex, /事後審 （未設）/)
+
+    const modelsCodex = modelsFrom(realConfig, {}, 'codex')
+    const rolesMapCodex = harnessRoles(modelsCodex)
+    for (const [harness, roles] of rolesMapCodex.entries()) {
+      assert.ok(!roles.some(r => r.startsWith('postReviewers')), `codex profile should not have postReviewers role for harness ${harness}`)
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4158,5 +4402,747 @@ describe('1.12.0 council：diff 不截斷；超過 --diff-cap 停在複審者之
     const r = await run(['--writer-report', report], repo, brief)
     assert.equal(r.code, 0); assert.equal(r.calls, 2)
     assert.deepEqual(r.input.writerReportTruncated, { originalLength: 25000, cap: 20000 })
+  })
+})
+
+describe('1.13.0 council：finding 要引用；parseVerdicts 標出無引用的不簽', () => {
+  test('(i) \'Q2：不簽｜有 fail-open｜改｜ticket.mjs:301\' ⇒ uncited 為 []', () => {
+    const v = parseVerdicts('Q2：不簽｜有 fail-open｜改｜ticket.mjs:301')
+    assert.deepEqual(v.uncited, [])
+  })
+
+  test('(ii) \'Q2：不簽｜有 fail-open｜改\' ⇒ uncited 為 [\'Q2\']', () => {
+    const v = parseVerdicts('Q2：不簽｜有 fail-open｜改')
+    assert.deepEqual(v.uncited, ['Q2'])
+  })
+
+  test('(iii) receipt 形式 \'Q3：不簽｜拿掉修法不紅｜補斷言｜`node x.test.mjs` fail 0\' ⇒ uncited 為 []', () => {
+    const v = parseVerdicts('Q3：不簽｜拿掉修法不紅｜補斷言｜`node x.test.mjs` fail 0')
+    assert.deepEqual(v.uncited, [])
+  })
+
+  test('(iv) \'Q1：簽｜ok｜無\'＋\'整份：不簽\' ⇒ uncited 為 []', () => {
+    const v = parseVerdicts('Q1：簽｜ok｜無\n整份：不簽')
+    assert.deepEqual(v.uncited, [])
+  })
+
+  test('(v) buildReviewQuestions([]) 輸出含「不納入結論」且 Q6 逐字等於既有字串', () => {
+    const questions = buildReviewQuestions([])
+    assert.ok(questions.includes('不納入結論'), '輸出應含「不納入結論」')
+    const q6Line = questions.split('\n').find((l) => l.startsWith('Q6'))
+    assert.equal(q6Line, 'Q6 你認為統整者在 merge 前【必須】親自坐實的一件事是什麼？（只准一件）')
+  })
+})
+
+// 🔴 1.14.0：第四種 harness `gemini`＝Google 官方 Gemini CLI（無頭、按量計費），複審席不再依賴 agy／Antigravity 訂閱額度
+//   （Fergus 2026-09-22 定案）。這裡不打真的 gemini CLI（會花額度、需要真 API key）：resolveGeminiApiKey 用假 exec、
+//   runGemini／runGeminiAsync 用假 spawn，跟本檔既有 runAgy／runCodex 的假 spawn 手法一致。
+//   🔴 絕對不准把真 API key 值放進測試或任何輸出；假 key 一律用字面 'test-key'。
+describe('1.14.0 gemini harness：Gemini CLI 無頭（假 exec／假 spawn，不打真 API）', () => {
+  test('① buildGeminiArgs 組出精確的 gemini CLI 引數', () => {
+    assert.deepEqual(
+      buildGeminiArgs({ model: 'gemini-2.5-pro', prompt: 'hello' }),
+      ['-p', 'hello', '-m', 'gemini-2.5-pro', '--output-format', 'json', '--approval-mode', 'plan', '-e', 'none']
+    )
+  })
+
+  test('② parseGeminiRun：stdout 是含 response 的合法 JSON ⇒ 取 response 與 stats', () => {
+    const res = { status: 0, signal: null, stdout: JSON.stringify({ response: '整份：簽', stats: { tokens: 10 } }), stderr: '' }
+    const r = parseGeminiRun(res)
+    assert.equal(r.response, '整份：簽')
+    assert.deepEqual(r.stats, { tokens: 10 })
+    assert.equal(r.exit, 0)
+  })
+
+  test('③ parseGeminiRun：stdout 不是 JSON、或是沒有 response 欄的合法 JSON ⇒ response 退回整段 stdout 原文、stats 為 null', () => {
+    const res1 = { status: 0, stdout: '不是 json 的純文字回覆', stderr: '' }
+    const r1 = parseGeminiRun(res1)
+    assert.equal(r1.response, '不是 json 的純文字回覆')
+    assert.equal(r1.stats, null)
+
+    const noResponseStdout = JSON.stringify({ noResponseField: true })
+    const res2 = { status: 0, stdout: noResponseStdout, stderr: '' }
+    const r2 = parseGeminiRun(res2)
+    assert.equal(r2.response, noResponseStdout)
+    assert.equal(r2.stats, null)
+  })
+
+  test('④ parseGeminiRun：timedOut ⇒ timedOut:true（用 spawnTimedOut 判）', () => {
+    const res = { status: null, signal: 'SIGTERM', timedOut: true, stdout: '', stderr: '' }
+    const r = parseGeminiRun(res)
+    assert.equal(r.timedOut, true)
+  })
+
+  test('⑤ resolveGeminiApiKey：env 有 ⇒ 用 env（exec 0 次）；env 無、exec 回 "test-key\\n" ⇒ trim 後 "test-key"（options.stdio[2]==="ignore"，Keychain 系統雜訊不外流）；都無／exec throw ⇒ 空字串', () => {
+    let calls = 0
+    let capturedOpts = null
+    const fakeExecOk = (bin, args, opts) => {
+      calls++
+      capturedOpts = opts
+      return 'test-key\n'
+    }
+    assert.equal(resolveGeminiApiKey({ GEMINI_API_KEY: 'test-key' }, fakeExecOk, 'darwin'), 'test-key')
+    assert.equal(calls, 0, 'env 有值時不該呼叫 exec（Keychain）')
+
+    calls = 0
+    assert.equal(resolveGeminiApiKey({}, fakeExecOk, 'darwin'), 'test-key')
+    assert.equal(calls, 1, 'env 無值時應呼叫 exec 讀 Keychain')
+    // 🔴 r2 sol block 複審 Q4：Keychain 沒有項目時 `security` 會把系統訊息直接印到本行程 stderr（不是回傳值也不是丟例外）；
+    //   stdio[2]==='ignore' 才會把子行程的 stderr 丟棄、不外流。
+    assert.ok(Array.isArray(capturedOpts.stdio), 'exec 的 options 要帶 stdio')
+    assert.equal(capturedOpts.stdio[2], 'ignore', 'stderr 一定要 ignore，Keychain 找不到項目時的系統訊息才不會外流')
+    assert.equal(capturedOpts.stdio[1], 'pipe', 'stdout 要 pipe 才讀得到金鑰')
+
+    const fakeExecThrow = () => {
+      throw new Error('security: not found in keychain')
+    }
+    assert.equal(resolveGeminiApiKey({}, fakeExecThrow, 'darwin'), '')
+    // 1.22.1：非 macOS 沒有 Keychain ⇒ 不呼叫 exec、回空字串（CI 跑在 Linux）
+    calls = 0
+    assert.equal(resolveGeminiApiKey({}, fakeExecOk, 'linux'), '')
+    assert.equal(calls, 0, '非 darwin 不該呼叫 security')
+  })
+  test('⑥ runGeminiAsync：注入 resolveKey ⇒ "" ⇒ fail-closed，不呼叫 spawn、keyMissing:true、stderr 不含任何假 key 值', async () => {
+    // 🔴 r3 sol 第二輪坐實：不注入 resolveKey 就用 env:{} 模擬缺 key，darwin 上仍會走到預設值 resolveGeminiApiKey
+    //   真的查 Keychain——本機若剛好有 GEMINI_API_KEY 這個項目，測試就會非決定性地假紅（spawnCalled 變 true）。
+    //   resolveKey 明確注入才能保證測試不觸真 Keychain。
+    let spawnCalled = false
+    const fakeSpawn = async () => {
+      spawnCalled = true
+      return { status: 0, stdout: '', stderr: '' }
+    }
+    const r = await runGeminiAsync({
+      model: 'gemini-2.5-pro',
+      prompt: 'p',
+      cwd: process.cwd(),
+      env: {},
+      spawn: fakeSpawn,
+      resolveKey: () => '',
+    })
+    assert.equal(spawnCalled, false, '沒有 key 不准 spawn（fail-closed）')
+    assert.equal(r.keyMissing, true)
+    assert.equal(r.exit, null)
+    assert.ok(!r.stderr.includes('test-key'), 'stderr 訊息不准含 key 值')
+  })
+
+  test('⑦ runGeminiAsync：注入 resolveKey ⇒ "test-key" ⇒ spawn 收到 GEMINI_API_KEY、args 由 buildGeminiArgs 產、GIT_DIR 等被 cleanGitEnv 剝掉', async () => {
+    let captured = null
+    let resolveKeyCalledWithEnv = null
+    const fakeSpawn = async (bin, args, opts) => {
+      captured = { bin, args, opts }
+      return { status: 0, signal: null, timedOut: false, stdout: JSON.stringify({ response: 'ok', stats: null }), stderr: '' }
+    }
+    const r = await runGeminiAsync({
+      model: 'gemini-2.5-pro',
+      prompt: 'hello',
+      cwd: process.cwd(),
+      // 🔴 env 故意不放 GEMINI_API_KEY：key 全部來自注入的 resolveKey，不是 env 直通，才是這條測試要證明的事。
+      env: { GIT_DIR: '/x', GIT_WORK_TREE: '/y', PATH: '/custom/bin' },
+      spawn: fakeSpawn,
+      resolveKey: (env) => {
+        resolveKeyCalledWithEnv = env
+        return 'test-key'
+      },
+    })
+    assert.equal(r.response, 'ok')
+    assert.ok(resolveKeyCalledWithEnv, 'resolveKey 應被呼叫')
+    assert.deepEqual(captured.args, buildGeminiArgs({ model: 'gemini-2.5-pro', prompt: 'hello' }))
+    assert.equal(captured.opts.env.GEMINI_API_KEY, 'test-key', 'GEMINI_API_KEY 應來自 resolveKey 的回傳值')
+    assert.equal(captured.opts.env.GIT_DIR, undefined, 'GIT_DIR 應被 cleanGitEnv 剝掉')
+    assert.equal(captured.opts.env.GIT_WORK_TREE, undefined, 'GIT_WORK_TREE 應被 cleanGitEnv 剝掉')
+    assert.equal(captured.opts.env.PATH, '/custom/bin', 'PATH 應被保留')
+  })
+
+  test('⑧ council runOne：harness gemini 的成員經 deps.runGeminiAsync 派工，.txt 內容＝response，prompt 不以 NO_EXEC_HEADER 開頭（1.19.0：council 不傳、gemini 預設不加），resolveKey 一併轉傳', async () => {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [M.geminiPro] } }) })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    const geminiCalls = []
+    const fakeResolveKey = () => 'test-key'
+    const deps = {
+      getHarness: fakeGetHarness({
+        gemini: fakeHarnessFrom({
+          name: 'gemini',
+          runReview: async (args) => {
+            geminiCalls.push(args)
+            return { exit: 0, signal: null, timedOut: false, stdout: '', stderr: '', response: '整份：簽', stats: null }
+          },
+        }),
+      }),
+      // 🔴 r3：即使這裡整個 runGeminiAsync 都被 mock 掉（不會真的走到 resolveKey 預設值），仍注入 resolveGeminiApiKey，
+      //   確認 council.mjs runOne 真的把它轉傳給 runGeminiFn（下面斷言 geminiCalls[0].resolveKey 是同一個參考）。
+      resolveGeminiApiKey: fakeResolveKey,
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.equal(geminiCalls.length, 1, 'gemini 成員應經 deps.runGeminiAsync 派工')
+    assert.ok(!geminiCalls[0].prompt.startsWith(NO_EXEC_HEADER), '1.19.0：council 不再傳 noExecHeader、gemini 預設不加 ⇒ 提示不得以 NO_EXEC_HEADER 開頭（陽性對照見同檔 ⑮）')
+    assert.equal(geminiCalls[0].resolveKey, fakeResolveKey, 'runOne 應把 deps.resolveGeminiApiKey 原封轉傳成 resolveKey')
+    const txt = fs.readFileSync(path.join(outDir, 'gemini-gemini.txt'), 'utf8')
+    assert.equal(txt, '整份：簽', '.txt 內容應等於 r.response')
+  })
+
+  test('⑬a 動態坐實：連續兩次注入【不同】的 resolveKey 回傳值 ⇒ spawn 收到的 GEMINI_API_KEY 逐次跟著變、且每次 resolveKey 只被呼叫一次（key 完全由注入值決定，沒有走到別的來源）', async () => {
+    let calls = 0
+    const makeResolveKey = (val) => (env) => {
+      calls++
+      return val
+    }
+    const capturedKeys = []
+    const fakeSpawn = async (bin, args, opts) => {
+      capturedKeys.push(opts.env.GEMINI_API_KEY)
+      return { status: 0, signal: null, timedOut: false, stdout: JSON.stringify({ response: 'ok', stats: null }), stderr: '' }
+    }
+    await runGeminiAsync({ model: 'gemini-2.5-pro', prompt: 'p', cwd: process.cwd(), env: {}, spawn: fakeSpawn, resolveKey: makeResolveKey('key-A') })
+    await runGeminiAsync({ model: 'gemini-2.5-pro', prompt: 'p', cwd: process.cwd(), env: {}, spawn: fakeSpawn, resolveKey: makeResolveKey('key-B') })
+    assert.deepEqual(capturedKeys, ['key-A', 'key-B'], 'spawn 收到的 key 應逐次等於注入的 resolveKey 回傳值，不是固定值（排除被某個快取／全域值蓋掉的可能）')
+    assert.equal(calls, 2, 'resolveKey 每次呼叫各一次，沒有多呼叫也沒有被跳過')
+  })
+
+  // 🔴 ⑬b：sol 第二輪原本要求「spy child_process.execFileSync 證明 security 0 次」——實測發現這在 Node ESM 下做不到：
+  //   `import { execFileSync } from 'node:child_process'`（lib.mjs 的引入方式）建立的是模組具名匯出的靜態繫結，
+  //   `import * as cp from '...'` 拿到的是【凍結】的 Module Namespace Object，`cp.execFileSync = fn` 或
+  //   `t.mock.method(cp, 'execFileSync', fn)` 一律丟 `TypeError: Cannot assign/redefine … read only property`；
+  //   `import cp from 'node:child_process'`（default import，值是底層 CJS 的 module.exports）雖然可寫，但改它
+  //   完全不影響 lib.mjs 內部已綁定的具名匯出（已實測驗證：改 default-import 物件的 execFileSync 後，另一處用
+  //   具名 import 呼叫 execFileSync 仍執行原函式、不受影響）——因為 lib.mjs 內 `resolveKey = resolveGeminiApiKey`
+  //   這個預設參數捕捉的是它自己模組作用域內的區域繫結，不是任何外部可觸及的物件屬性。動態 spy 在這個模組結構下
+  //   無法成立，換成靜態坐實：直接讀 lib.mjs 原始碼，剝掉註解後斷言 `resolveGeminiApiKey` 這個識別字全檔只出現
+  //   3 次——它自己的函式定義，以及 `runGemini`／`runGeminiAsync` 兩處的預設參數值——沒有第 4 個出現處代表
+  //   兩個函式體內都不存在任何「繞過 resolveKey、直接呼叫 resolveGeminiApiKey(env)」的路徑。這條連同 ⑬a
+  //   一起构成完整的「resolveKey 注入後不會碰到真 Keychain」的證據鏈（動態：key 完全由注入值決定；
+  //   靜態：程式碼裡沒有繞過注入的呼叫點）。
+  // 🔴 1.15.0（sol block r1 Q5）：runner 本體搬到 harnesses/gemini.mjs、lib.mjs 只剩同名 re-export，靜態坐實改讀 gemini.mjs：
+  //   (1) 匯出身分：lib.mjs 的三個名字就是 gemini.mjs 的同一個函式（不是包裝）；
+  //   (2) gemini.mjs 剝註解後識別字恰好 5 處＝定義、runGemini／runGeminiAsync 兩處預設參數、auth.resolve 的預設值、
+  //       deps.resolveGeminiApiKey 接縫（setup --check ⑪⑫ 用）——【呼叫形】`resolveGeminiApiKey(` 只准出現 1 次（定義本身），
+  //       多一次就是某個函式體繞過 resolveKey 注入直接讀 Keychain。這是本票唯一改斷言的既有測試（統整者指名）。
+  test('⑬b 靜態坐實：lib.mjs 的 resolveGeminiApiKey／runGemini／runGeminiAsync 與 harnesses/gemini.mjs 同參考；gemini.mjs 剝掉註解後識別字恰好 5 處、呼叫形只有定義 1 處——沒有任何函式體內繞過 resolveKey 直接呼叫它', async () => {
+    const gemini = await import('./harnesses/gemini.mjs')
+    assert.equal(runGemini, gemini.runGemini, 'lib.runGemini 要是 gemini.mjs 的同一個函式')
+    assert.equal(runGeminiAsync, gemini.runGeminiAsync, 'lib.runGeminiAsync 要是 gemini.mjs 的同一個函式')
+    assert.equal(resolveGeminiApiKey, gemini.resolveGeminiApiKey, 'lib.resolveGeminiApiKey 要是 gemini.mjs 的同一個函式')
+    const src = fs.readFileSync(fileURLToPath(new URL('./harnesses/gemini.mjs', import.meta.url)), 'utf8')
+    const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+    const occurrences = stripped.match(/resolveGeminiApiKey/g) || []
+    assert.equal(occurrences.length, 5, `預期恰好 5 處（定義＋兩個預設參數＋auth 預設值＋deps 接縫），實際 ${occurrences.length} 處——多出來的很可能是繞過 resolveKey 的直接呼叫`)
+    const callForm = stripped.match(/resolveGeminiApiKey\(/g) || []
+    assert.equal(callForm.length, 1, `呼叫形 resolveGeminiApiKey( 只准是定義那 1 處，實際 ${callForm.length} 處`)
+    assert.match(stripped, /function resolveGeminiApiKey\(env = process\.env, exec = execFileSync, platform = os\.platform\(\)\)/)
+    assert.match(stripped, /function runGemini\(\{[\s\S]{0,300}?resolveKey = resolveGeminiApiKey,/, 'runGemini 的預設參數應是 resolveKey = resolveGeminiApiKey')
+    assert.match(stripped, /async function runGeminiAsync\(\{[\s\S]{0,300}?resolveKey = resolveGeminiApiKey,/, 'runGeminiAsync 的預設參數應是 resolveKey = resolveGeminiApiKey')
+    const libStripped = fs.readFileSync(fileURLToPath(new URL('./lib.mjs', import.meta.url)), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+    assert.doesNotMatch(libStripped, /function runGemini|function resolveGeminiApiKey/, 'lib.mjs 不准再定義（包裝也不行），只准 re-export')
+  })
+
+  test('⑨ validateProfiles 接受 gemini 成員當 reviewer／blockReviewer；quotaBucket "nope" 仍被拒', () => {
+    const cfgOk = v2Config({
+      profiles: v2Profiles({ claude: { reviewers: [M.geminiPro], blockReviewers: [M.geminiPro, M.codexSol] } }),
+    })
+    assert.equal(validateProfiles(cfgOk), true)
+
+    const cfgBad = v2Config({
+      profiles: v2Profiles({ claude: { reviewers: [{ harness: 'gemini', model: 'gemini-2.5-pro', quotaBucket: 'nope' }] } }),
+    })
+    assert.throws(() => validateProfiles(cfgBad), /profiles\.claude\.reviewers\[0\]\.quotaBucket 未知/)
+  })
+
+  test('⑩ 真源模板 config.json：claude profile 的 reviewers ＝ claude/opus；blockReviewers 名單精確 = claude/opus ＋ codex/gpt-5-6-sol（1.22.0）', () => {
+    const cfg = loadConfig(null, fileURLToPath(new URL('./config.json', import.meta.url)))
+    const m = modelsFrom(cfg, {}, 'claude')
+    assert.deepEqual(m.reviewers.map((x) => x.name), ['claude/opus'])
+    assert.deepEqual(m.blockReviewers.map((x) => x.name), ['claude/opus', 'codex/gpt-5-6-sol'])
+  })
+
+  // ── setup.mjs 的 [GEMINI_API_KEY] 閘：其餘一律綠、只讓 gemini key 這件事單獨紅／單獨綠 ──
+  function geminiSetupDeps(cfg, { resolveGeminiApiKeyFn, extraEnv = {} } = {}) {
+    const repoRoot = tmpdir('gemini-setup-repo-')
+    const allowLine = `command(regex:${buildSafeCommandRegex(cfg)})`
+    const settingsFile = makeSettings(allowLine)
+    const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+    const rootWithSlash = repoRoot.endsWith('/') ? repoRoot : repoRoot + '/'
+    s.permissions.allow.push(`read_file(${rootWithSlash})`)
+    s.trustedWorkspaces = [repoRoot]
+    fs.writeFileSync(settingsFile, JSON.stringify(s))
+    const fakeHome = tmpdir('gemini-setup-home-')
+    const guardDir = path.join(fakeHome, '.claude', 'hooks')
+    fs.mkdirSync(guardDir, { recursive: true })
+    const guardFile = path.join(guardDir, 'block-dangerous.sh')
+    fs.writeFileSync(guardFile, '#!/usr/bin/env bash\n')
+    const hooksPayload = {
+      command: {
+        name: 'hooks',
+        data: {
+          hooks: [
+            {
+              name: 'block-dangerous',
+              enabled: true,
+              source: path.join(fakeHome, '.gemini', 'config', 'hooks.json'),
+              actions: [{ event: 'PreToolUse', matcher: 'run_command', type: 'command', command: '~/.claude/skills/llm-team/agy-pretooluse.sh' }],
+            },
+          ],
+        },
+      },
+    }
+    return {
+      repoRoot,
+      settingsFile,
+      config: cfg,
+      agyBin: '/mock/bin/antigravity',
+      which: (bin) => `/mock/bin/${bin}`,
+      runVersion: () => ({ exit: 0, out: 'mock 1.0' }),
+      env: { HOME: fakeHome, LLM_TEAM_GUARD: guardFile, ...extraEnv },
+      runAgyHooks: () => ({ exit: 0, stdout: JSON.stringify(hooksPayload) }),
+      resolveGeminiApiKey: resolveGeminiApiKeyFn,
+    }
+  }
+
+  test('⑪ setup --check：GEMINI_API_KEY 缺（env 無、注入的 resolveGeminiApiKey 回空字串）⇒ failed（exit 1）且輸出含「✗ 缺」（其餘全綠，只有這件事紅）', () => {
+    const cfg = v2Config({ profiles: v2Profiles({ agy: { reviewers: [M.geminiPro] } }) })
+    const deps = geminiSetupDeps(cfg, { resolveGeminiApiKeyFn: () => '' })
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
+    } finally {
+      console.log = origLog
+    }
+    const out = logs.join('\n')
+    assert.equal(code, 1, 'GEMINI_API_KEY 缺 ⇒ --check 要紅')
+    assert.match(out, /\[GEMINI_API_KEY\] ✗ 缺/)
+  })
+
+  test('⑫ setup --check：GEMINI_API_KEY 來自 Keychain（注入的 resolveGeminiApiKey 回 "test-key"）⇒ 全綠、輸出含「GEMINI_API_KEY：Keychain」且【不含】key 值', () => {
+    const cfg = v2Config({ profiles: v2Profiles({ agy: { reviewers: [M.geminiPro] } }) })
+    const deps = geminiSetupDeps(cfg, { resolveGeminiApiKeyFn: () => 'test-key' })
+    const logs = []
+    const origLog = console.log
+    console.log = (m) => logs.push(String(m))
+    let code
+    try {
+      code = setupMain(['--check', '--coordinator', 'agy'], deps)
+    } finally {
+      console.log = origLog
+    }
+    const out = logs.join('\n')
+    assert.equal(code, 0, 'key 可達且其餘環境全綠 ⇒ --check 要過')
+    assert.match(out, /\[GEMINI_API_KEY\] ✓ GEMINI_API_KEY：Keychain/)
+    assert.ok(!out.includes('test-key'), '🔴 輸出不准含 key 值本身')
+  })
+})
+
+describe('llm-team-postreview-tier 新增測試', () => {
+  test('① 沒有 postReviewers 的 profile 照樣通過 validateProfiles', () => {
+    const cfg = v2Config() // Default v2Config has no postReviewers
+    assert.equal(validateProfiles(cfg), true)
+  })
+
+  test('② postReviewers ＝ [該 profile 的 adjudicator] ⇒ 通過', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [M.codexSol], // claude's adjudicator is M.codexSol
+          adjudicator: M.codexSol,
+        }
+      })
+    })
+    assert.equal(validateProfiles(cfg), true)
+  })
+
+  test('③ postReviewers: [] ⇒ throw，訊息含 postReviewers', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [],
+        }
+      })
+    })
+    assert.throws(() => validateProfiles(cfg), /profiles\.claude\.postReviewers 必須是非空陣列/)
+  })
+
+  test('④-1 postReviewers 成員是 coordinator 本人 ⇒ throw', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        agy: {
+          postReviewers: [M.agyGemini], // agy's coordinator is M.agyGemini
+        }
+      })
+    })
+    assert.throws(() => validateProfiles(cfg), /profiles\.agy\.postReviewers\[0\] 就是統整者本人/)
+  })
+
+  test('④-2 postReviewers 成員與 coordinator 同 quotaBucket ⇒ 過（1.22.0 撤同桶不變式）', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [{ harness: 'gemini', model: 'gemini-3.1-pro', quotaBucket: 'anthropic' }], // claude's coord quotaBucket is 'anthropic'
+        }
+      })
+    })
+    assert.doesNotThrow(() => validateProfiles(cfg))
+  })
+
+  test('④-3 postReviewers 成員 harness 是 claude ⇒ 過（1.22.0）；是統整者本人 ⇒ 見上一則仍拒', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        agy: {
+          postReviewers: [M.claudeCode],
+        }
+      })
+    })
+    assert.doesNotThrow(() => validateProfiles(cfg))
+  })
+
+  test('④-4 postReviewers 成員同名單重複 ⇒ throw', () => {
+    const cfg = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [M.codexSol, M.codexSol],
+        }
+      })
+    })
+    assert.throws(() => validateProfiles(cfg), /profiles\.claude\.postReviewers\[1\] 在同一名單重複/)
+  })
+
+  test('⑤ modelsFrom：有 postReviewers ⇒ 每員帶 name；沒有 ⇒ []', () => {
+    const cfgWith = v2Config({
+      profiles: v2Profiles({
+        claude: {
+          postReviewers: [M.codexSol],
+        }
+      })
+    })
+    const mWith = modelsFrom(cfgWith, {}, 'claude')
+    assert.equal(mWith.postReviewers.length, 1)
+    assert.equal(mWith.postReviewers[0].name, 'codex/gpt-5-6-sol')
+
+    const cfgWithout = v2Config() // No postReviewers on claude
+    const mWithout = modelsFrom(cfgWithout, {}, 'claude')
+    assert.deepEqual(mWithout.postReviewers, [])
+  })
+
+  test('⑥ council review --tier postreview --review-only ⇒ 派給 postReviewers 名單，runOne 收到成員', async () => {
+    const customProfiles = v2Profiles({
+      claude: {
+        postReviewers: [M.codexSol]
+      }
+    })
+    const repo = makeRepo({ profiles: customProfiles })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    const membersCalled = []
+    const deps = {
+      runOne: (name, model, prompt, cwd, out, timeoutMs, member) => {
+        membersCalled.push({ name, harness: member.harness, quotaBucket: member.quotaBucket })
+        return { name, model, exit: 0, ms: 10, empty: false, denied: [], text: 'Q1：簽\n整份：簽' }
+      },
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'postreview', '--review-only', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.deepEqual(membersCalled.map(m => m.name), ['codex/gpt-5-6-sol'])
+  })
+
+  test('⑦ council --tier postreview 少了 --review-only ⇒ 回 2，且 deps.runOne 呼叫 0 次', async () => {
+    const customProfiles = v2Profiles({
+      claude: {
+        postReviewers: [M.codexSol]
+      }
+    })
+    const repo = makeRepo({ profiles: customProfiles })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    let runOneCalls = 0
+    const deps = {
+      runOne: () => {
+        runOneCalls++
+        return { exit: 0 }
+      },
+    }
+    const origLog = console.log
+    const origErr = console.error
+    console.log = () => {}
+    console.error = () => {}
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'postreview', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(runOneCalls, 0)
+  })
+
+  test('⑧ council --tier blcok（打錯）⇒ 回 2，deps.runOne 呼叫 0 次', async () => {
+    const repo = makeRepo()
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    let runOneCalls = 0
+    const deps = {
+      runOne: () => {
+        runOneCalls++
+        return { exit: 0 }
+      },
+    }
+    const origLog = console.log
+    const origErr = console.error
+    console.log = () => {}
+    console.error = () => {}
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'blcok', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(runOneCalls, 0)
+  })
+
+  test('⑨ council --tier postreview --review-only 但 profile 沒有 postReviewers ⇒ 回 2，訊息含 postReviewers', async () => {
+    const repo = makeRepo() // default has no postReviewers
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+    let runOneCalls = 0
+    const deps = {
+      runOne: () => {
+        runOneCalls++
+        return { exit: 0 }
+      },
+    }
+    const origLog = console.log
+    const origErr = console.error
+    const errs = []
+    console.log = () => {}
+    console.error = (msg) => errs.push(String(msg))
+    let code
+    try {
+      code = await councilMain(
+        ['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'postreview', '--review-only', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(runOneCalls, 0)
+    assert.match(errs.join('\n'), /postReviewers/)
+  })
+
+  test('⑩ buildReviewPrompt({tier:\'postreview\', …}) 第二段含「事後」且不含「block 級」；tier:\'block\' 與 tier:\'standard\' 的既有字面不變', () => {
+    const pPost = buildReviewPrompt({ brief: 'B', diff: '+x', tier: 'postreview', diffStat: '1 file', writerModel: 'w' })
+    const linesPost = pPost.split('\n')
+    assert.match(linesPost[1], /事後/)
+    assert.doesNotMatch(linesPost[1], /block 級/)
+    assert.match(linesPost[1], /已經合進 main/)
+
+    const pBlock = buildReviewPrompt({ brief: 'B', diff: '+x', tier: 'block', diffStat: '1 file', writerModel: 'w' })
+    const linesBlock = pBlock.split('\n')
+    assert.strictEqual(
+      linesBlock[1],
+      '你是本 repo 的複審者（block 級）。作者是另一個模型（w），你沒有它的對話脈絡，只看下面的 brief 與 diff。' + REFUTE_SENTENCE
+    )
+
+    const pStd = buildReviewPrompt({ brief: 'B', diff: '+x', tier: 'standard', diffStat: '1 file', writerModel: 'w' })
+    const linesStd = pStd.split('\n')
+    assert.strictEqual(
+      linesStd[1],
+      '你是本 repo 的複審者（一般票）。作者是另一個模型（w），你沒有它的對話脈絡，只看下面的 brief 與 diff。' + REFUTE_SENTENCE
+    )
+    // 1.22.0：三種 tier 都帶推翻句（含事後審）
+    assert.ok(linesPost[1].endsWith(REFUTE_SENTENCE))
+    assert.match(REFUTE_SENTENCE, /推翻/)
+  })
+
+  test('⑪ 真 config.json 載入驗證：profiles.claude 包含 postReviewers，而 profiles.codex 沒有', () => {
+    const realConfigPath = fileURLToPath(new URL('./config.json', import.meta.url))
+    const cfg = JSON.parse(fs.readFileSync(realConfigPath, 'utf8'))
+    assert.deepEqual(cfg.profiles.claude.postReviewers, [
+      { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' }
+    ])
+    assert.equal(cfg.profiles.codex.postReviewers, undefined)
+  })
+
+  test('⑫ council plan --tier postreview --review-only ⇒ 回 2 且 deps.runOne 0 次', async () => {
+    const repo = makeRepo()
+    const promptFile = path.join(tmpdir('plan-'), 'plan.md')
+    fs.writeFileSync(promptFile, '規劃這張票')
+    const outDir = path.join(repo.dir, '.plan')
+    let runOneCalls = 0
+    const deps = {
+      runOne: () => {
+        runOneCalls++
+        return { exit: 0 }
+      },
+    }
+    const origLog = console.log
+    const origErr = console.error
+    const errs = []
+    console.log = () => {}
+    console.error = (msg) => errs.push(String(msg))
+    let code
+    try {
+      code = await councilMain(
+        ['plan', '--worktree', repo.dir, '--prompt', promptFile, '--tier', 'postreview', '--review-only', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(runOneCalls, 0)
+    assert.match(errs.join('\n'), /postreview 只准用在 review 子指令/)
+  })
+
+  test('⑬ council plan --tier block ⇒ 正常跑', async () => {
+    const repo = makeRepo()
+    const promptFile = path.join(tmpdir('plan-'), 'plan.md')
+    fs.writeFileSync(promptFile, '規劃這張票')
+    const outDir = path.join(repo.dir, '.plan')
+    let runOneCalls = 0
+    const deps = {
+      runOne: (name, model) => {
+        runOneCalls++
+        return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }
+      },
+    }
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(
+        ['plan', '--worktree', repo.dir, '--prompt', promptFile, '--tier', 'block', '--out', outDir],
+        deps
+      )
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+    assert.equal(runOneCalls, 3)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.19.0：gemini 複審預設不加 NO_EXEC_HEADER（agy 仍加）
+// 事故＝2026-09-22 複審席從 agy 換成 gemini 時，把 agy 的 NO_EXEC_HEADER 一起抄進 harnesses/gemini.mjs 的 reviewArgs
+//   （註解寫「跟 agy 一樣」）。gemini 的 `--approval-mode plan` 本來就是唯讀（工具可用、不能寫）、子行程 env 也帶
+//   GEMINI_CLI_TRUST_WORKSPACE=true，那句「不要讀任何檔案」只是叫它別讀 ⇒ 兩輪 council 八題全部答不出事實。
+// 陽性對照（把修法還原會紅在哪一條）：把 gemini.mjs reviewArgs 的預設改回 NO_EXEC_HEADER ⇒ 本條第 1／2 個斷言紅；
+//   把 agy.mjs 的預設改成 ''（不該動）⇒ 本條最後一個斷言紅。
+// 真跑對照（2026-09-23 統整者）：只把 noExecHeader 傳 ''，gemini 回 docs/WBS.md 934 行、`## 1.8` 段 30 列，兩個都正確。
+// 停止條件：Gemini CLI 的 plan 模式不再能用讀檔工具（或 council 改成不傳 noExecHeader 之外的別種唯讀姿態）時重測本條。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('1.19.0 gemini 複審預設不加 NO_EXEC_HEADER（agy 仍加）', () => {
+  test('⑭ 1.19.0 gemini 複審預設不加 NO_EXEC_HEADER（agy 仍加）', () => {
+    const baseOpts = {
+      model: 'gemini-2.5-pro',
+      prompt: 'PROMPT-BODY',
+      cwd: '/tmp',
+      timeoutMs: 1000,
+      env: {},
+      spawn: () => {},
+      resolveKey: () => 'test-key',
+    }
+
+    // 1. gemini：沒傳 noExecHeader ⇒ prompt 逐字等於原文，前面不加 header。
+    const g = getHarness('gemini').review.args({ ...baseOpts })
+    assert.ok(!g.prompt.startsWith(NO_EXEC_HEADER), 'gemini 複審 prompt 預設不得以 NO_EXEC_HEADER 開頭（它讀得到 repo，叫它別讀＝自傷）')
+    assert.equal(g.prompt, 'PROMPT-BODY', 'gemini 沒傳 noExecHeader ⇒ prompt 逐字等於原文')
+
+    // 2. 呼叫端仍可顯式傳入（能力保留，不是把參數拔掉）。
+    const gExplicit = getHarness('gemini').review.args({ ...baseOpts, noExecHeader: NO_EXEC_HEADER })
+    assert.ok(gExplicit.prompt.startsWith(NO_EXEC_HEADER), '顯式傳 noExecHeader ⇒ 仍加在 prompt 前面')
+    assert.equal(gExplicit.prompt, NO_EXEC_HEADER + 'PROMPT-BODY')
+
+    // 3. 陽性對照：agy 同樣不傳 ⇒ 仍以 NO_EXEC_HEADER 開頭（2026-09-13 實測：無頭模式工具被拒 ⇒ stdout 空、exit 0）。
+    const a = getHarness('agy').review.args({ ...baseOpts })
+    assert.ok(a.prompt.startsWith(NO_EXEC_HEADER), 'agy 複審 prompt 沒傳 noExecHeader 時【仍要】以 NO_EXEC_HEADER 開頭（這條不准跟著改）')
+    assert.equal(a.prompt, NO_EXEC_HEADER + 'PROMPT-BODY')
+  })
+
+  // 🔴 ⑭ 只證明了「預設值」；production 路徑是 council.mjs runOne——1.19.0 之前它【無條件】傳 noExecHeader: NO_EXEC_HEADER，
+  //   等於蓋掉每個 harness 的預設，改 gemini.mjs 的預設是 no-op。本條走真實派工路徑（councilMain → runOne → harness.review.run），
+  //   只注入 deps.spawn／deps.env／deps.resolveGeminiApiKey，不叫起真 CLI、不碰真 key。
+  //   陽性對照：把 council.mjs 那行 `noExecHeader: NO_EXEC_HEADER,` 加回去 ⇒ 本條紅（⑭ 仍綠，因為它不走 council）。
+  test('⑮ 1.19.0 production 路徑：council runOne 真實派工 ⇒ 注入的 spawn 收到的 gemini prompt 不以 NO_EXEC_HEADER 開頭；同一輪 agy prompt（走 stdin）仍以它開頭；兩者正文逐字相同', async () => {
+    const FAKE_AGY_BIN = '/fake/bin/agy'
+    const FAKE_GEMINI_BIN = '/fake/bin/gemini'
+    const repo = makeRepo({ profiles: v2Profiles({ claude: { reviewers: [M.agyGemini, M.geminiPro] } }) })
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'test brief')
+    const outDir = path.join(tmpdir('review-'), 'review')
+
+    const AGY_OK = JSON.stringify({ event: 'result', result: { status: 'SUCCESS', conversation_id: 'c1', response: '整份：簽', denied_actions: [] } }) + '\n'
+    const GEMINI_OK = JSON.stringify({ response: '整份：簽', stats: null })
+    const calls = []
+    const fakeSpawn = async (bin, args, opts) => {
+      calls.push({ bin, args, opts })
+      return { status: 0, signal: null, stdout: bin === FAKE_GEMINI_BIN ? GEMINI_OK : AGY_OK, stderr: '' }
+    }
+    const deps = {
+      env: { LLM_TEAM_COORDINATOR: 'claude', AGY_BIN: FAKE_AGY_BIN, GEMINI_BIN: FAKE_GEMINI_BIN },
+      spawn: fakeSpawn,
+      resolveGeminiApiKey: () => 'test-key',
+    }
+
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--tier', 'standard', '--out', outDir], deps)
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(code, 0)
+
+    const gCall = calls.find((c) => c.bin === FAKE_GEMINI_BIN)
+    const aCall = calls.find((c) => c.bin === FAKE_AGY_BIN)
+    assert.ok(gCall, 'gemini 席要真的被派（假 binary 由 deps.env.GEMINI_BIN 指定）')
+    assert.ok(aCall, 'agy 席要真的被派（假 binary 由 deps.env.AGY_BIN 指定）')
+
+    // gemini：prompt 在 argv（buildGeminiArgs 的 -p 後面）。
+    const gPrompt = gCall.args[gCall.args.indexOf('-p') + 1]
+    assert.ok(!gPrompt.startsWith(NO_EXEC_HEADER), '🔴 council 派給 gemini 的 prompt 不得以 NO_EXEC_HEADER 開頭（council 不准替 harness 決定唯讀姿態）')
+    assert.equal(gPrompt.split('\n')[0], REVIEW_PROMPT_SENTINEL, 'gemini 的 prompt 第一行應直接是複審哨兵，前面沒有任何 header')
+
+    // agy：prompt 走 stdin 的 stream-json（buildAgyStdin）。
+    const aEvent = JSON.parse(aCall.opts.input.trim())
+    assert.equal(aEvent.event, 'user')
+    assert.ok(aEvent.message.content.startsWith(NO_EXEC_HEADER), 'agy 的 prompt【仍要】以 NO_EXEC_HEADER 開頭（agy.mjs 自己的預設，這條不准跟著改）')
+
+    // 兩席拿到的是同一份正文，差別只有那個 header——排除「gemini 少拿了什麼別的東西」。
+    assert.equal(gPrompt, aEvent.message.content.slice(NO_EXEC_HEADER.length), '兩席正文逐字相同，唯一差別是 agy 多了 NO_EXEC_HEADER')
   })
 })

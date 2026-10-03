@@ -4,9 +4,11 @@
 //   node .agents/skills/llm-team/setup.mjs --check --coordinator <claude|agy|codex> [--config <file>]
 //   node .agents/skills/llm-team/setup.mjs --sync-check
 //
-// --check 檢查什麼（2026-09-14 schema v2）：
-//   共同：[config] v2 載入＋不變式；[守門] block-dangerous.sh 候選；寫手 harness（agy）的 settings 對帳（command regex／read_file／trustedWorkspaces——
-//         ticket run 的 G2 不分統整者都會查）；該 profile 每個角色用到的 harness 的 binary（含統整者自己的：agy 找 cask／AGY_BIN、codex `codex --version`／CODEX_BIN、claude `claude --version`／CLAUDE_BIN）。
+// --check 檢查什麼（2026-09-14 schema v2；1.15.0 起 harness 專屬的部分查 harnesses/ registry）：
+//   共同：[config] v2 載入＋不變式；[守門] block-dangerous.sh 候選；該 profile 每個角色用到的 harness 的 binary（含統整者自己的：
+//         各 harness 的 checkBinary——agy 找 cask／AGY_BIN、codex `codex --version`／CODEX_BIN、claude `claude --version`／CLAUDE_BIN、
+//         gemini `gemini --version`／GEMINI_BIN）；有 auth 的 harness 的 key 可達性（gemini：GEMINI_API_KEY env／Keychain，永不印值）；
+//         有 preflight 的 harness 的設定對帳（agy：settings.json 的 command regex／read_file／trustedWorkspaces——ticket run 的 G2 不分統整者都會查）。
 //   agy   統整者：agy 全域 hooks.json 有載入 block-dangerous。
 //   codex 統整者：$CODEX_HOME/hooks.json（預設 ~/.codex/hooks.json）有 PreToolUse 指到 codex-pretooluse.sh（絕對路徑、realpath 與快照或真源相同、可執行），
 //         並真的用 deny canary（force push）跑一次轉接器。
@@ -28,14 +30,12 @@ import {
   loadConfig,
   modelsFrom,
   memberName,
-  buildSafeCommandRegex,
-  agySettingsPath,
-  resolveAgyBin,
-  resolveCodexBin,
   git,
   isDirectRun,
   cleanGitEnv,
 } from './lib.mjs'
+import { getHarness } from './harnesses/index.mjs'
+import { AUTH_SOURCES_OK } from './harnesses/_contract.mjs'
 import { verifySnapshot } from './export.mjs'
 
 const USAGE = [
@@ -130,6 +130,7 @@ export function harnessRoles(models) {
   add(models.writer.harness, '寫手')
   for (const r of models.reviewers) add(r.harness, `reviewers[${r.name}]`)
   for (const r of models.blockReviewers) add(r.harness, `blockReviewers[${r.name}]`)
+  for (const r of (models.postReviewers || [])) add(r.harness, `postReviewers[${r.name}]`)
   if (models.adjudicator !== 'human') add(models.adjudicator.harness, `adjudicator[${models.adjudicator.name}]`)
   return m
 }
@@ -337,7 +338,7 @@ export function main(argv, deps = {}) {
   const coord = models.coordinator
   const fmt = (m) => `${m.name || memberName(m)}〔${m.quotaBucket}〕`
   console.log(
-    `[config] ✓ schema v2、profile ${coordinator}：統整者 ${memberName(coord)}〔${coord.quotaBucket}〕${coord.effort ? `（effort ${coord.effort}）` : ''}｜寫手 ${memberName(models.writer)}〔${models.writer.quotaBucket}〕｜一般票複審 ${models.reviewers.map(fmt).join('＋')}｜block 複審 ${models.blockReviewers.map(fmt).join('＋')}｜一般票裁決 ${models.adjudicator === 'human' ? 'human' : fmt(models.adjudicator)}｜block 未決 ${models.blockAdjudicator}`
+    `[config] ✓ schema v2、profile ${coordinator}：統整者 ${memberName(coord)}〔${coord.quotaBucket}〕${coord.effort ? `（effort ${coord.effort}）` : ''}｜寫手 ${memberName(models.writer)}〔${models.writer.quotaBucket}〕｜一般票複審 ${models.reviewers.map(fmt).join('＋')}｜block 複審 ${models.blockReviewers.map(fmt).join('＋')}｜事後審 ${models.postReviewers && models.postReviewers.length > 0 ? models.postReviewers.map(fmt).join('＋') : '（未設）'}｜一般票裁決 ${models.adjudicator === 'human' ? 'human' : fmt(models.adjudicator)}｜block 未決 ${models.blockAdjudicator}`
   )
 
   let failed = false
@@ -357,34 +358,12 @@ export function main(argv, deps = {}) {
     )
   }
 
-  // ── 共同：各角色用到的 harness 的 binary（含統整者自己的——--check 不一定在統整者的 harness 裡跑）；claude 用 `claude --version`，env CLAUDE_BIN 可覆寫 ──
-  const whichFn =
-    deps.which ||
-    ((cmd) => {
-      const r = spawnSync('which', [cmd], { encoding: 'utf8' })
-      return r.status === 0 ? r.stdout.trim() : null
-    })
-  const runVersion =
-    deps.runVersion ||
-    ((bin) => {
-      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 15000, env: cleanGitEnv(env) })
-      return { exit: r.status, out: ((r.stdout || '') + (r.stderr || '')).trim().split('\n')[0] || '' }
-    })
-  const agyBin = (deps.agyBin !== undefined ? deps.agyBin : resolveAgyBin(env)) || null
-  const agyFound = (agyBin && fs.existsSync(agyBin) ? agyBin : null) || whichFn('antigravity') || whichFn('agy')
-  const codexBin = deps.codexBin !== undefined ? deps.codexBin : resolveCodexBin(env)
-  const claudeBin = deps.claudeBin !== undefined ? deps.claudeBin : env.CLAUDE_BIN || 'claude'
-  const binaryFor = (harness) => {
-    if (harness === 'agy') return agyFound ? { path: agyFound } : null
-    const bin = harness === 'codex' ? codexBin : claudeBin
-    const found = (bin && (path.isAbsolute(bin) && fs.existsSync(bin) ? bin : whichFn(bin))) || null
-    if (!found) return null
-    const v = runVersion(found)
-    if (v.exit !== 0) return { path: found, versionError: `--version exit ${v.exit}` }
-    return { path: found, version: v.out }
-  }
-  for (const [harness, roles] of harnessRoles(models)) {
-    const b = binaryFor(harness)
+  // ── 共同：各角色用到的 harness 的 binary（含統整者自己的——--check 不一定在統整者的 harness 裡跑）；怎麼找、要不要跑 --version 由各 harness 的 checkBinary 決定 ──
+  //    deps.which／deps.runVersion／deps.agyBin／deps.codexBin／deps.claudeBin／deps.geminiBin 原封轉給 checkBinary（既有測試接縫）。
+  const getHarnessFn = deps.getHarness || getHarness
+  const modelHarnesses = harnessRoles(models)
+  for (const [harness, roles] of modelHarnesses) {
+    const b = getHarnessFn(harness).checkBinary(env, deps)
     if (b && !b.versionError) {
       console.log(`[執行檔 ${harness}] ✓ (${b.path}${b.version ? `，${b.version}` : ''}) — 需要它的角色：${roles.join('、')}`)
     } else {
@@ -394,55 +373,65 @@ export function main(argv, deps = {}) {
     }
   }
 
-  // ── 寫手 harness 是 agy ⇒ agy settings 對帳（ticket run 的 G2 不分統整者都會查） ──
+  // ── 有 auth 的 harness（gemini：GEMINI_API_KEY，env 或 macOS Keychain）：key 可達性；🔴 永不印值，只印「來源」或「缺」 ──
+  // 🔴 事故：2026-09-21 agy 訂閱額度用盡（429 RESOURCE_EXHAUSTED）⇒ 複審席零輸出 ⇒ `ticket.mjs land` 被 anyEmpty 擋
+  //   （WAS 票 checkout-activation-mail）；2026-09-22 改走 Gemini CLI API key 後，同一種「用到才發現」失效換了形狀：
+  //   key 缺不會在載入 config 時擋下來，而是撐到第一次 council 呼叫，那時整席（複審或裁決）零輸出、跟訂閱額度用盡
+  //   長一樣的死法。`setup --check` 是唯一能在票流程開工【之前】把這件事攔下來的地方。
+  // 🔴 陽性對照 llm-team.test.mjs「⑪ setup --check：GEMINI_API_KEY 缺…⇒ failed 且輸出含「✗ 缺」」／
+  //   「⑫ …Keychain 取到 ⇒ 輸出含「GEMINI_API_KEY：Keychain」且不含 key 值」。
+  // 🔴 停止條件：council 對 failure.kind === 'auth' 的結果會在 `members.json` 顯形並在收貨摘要印 🔴
+  //   （讓缺 key 在票流程本身就顯形，不用靠 setup 提前攔）時，本閘可從「紅」降為「警告」。
+  for (const [harness] of modelHarnesses) {
+    const h = getHarnessFn(harness)
+    if (!h.auth) continue
+    // 🔴 fail-closed（sol r2 Q2）：只有 'env'／'Keychain' 算可達；'缺' 印 ✗ 缺；其他任何值（undefined、'Env'、拼錯）印 ✗ 未知來源，
+    //    一律 failed——describe 壞掉不能變成放行。回傳值本身不印（避免任何路徑把 key 值印出來）。
+    //    陽性對照 harnesses.test.mjs ⑦「describe 回 undefined／'Env' ⇒ exit 非 0、輸出不含 ✓ GEMINI_API_KEY」。
+    const source = h.auth.describe(env, deps)
+    const reachable = AUTH_SOURCES_OK.includes(source)
+    const missing = source === '缺'
+    console.log(`[${h.auth.envVar}] ${reachable ? `✓ ${h.auth.envVar}：${source}` : missing ? '✗ 缺' : '✗ 未知來源'}`)
+    if (!reachable) {
+      failed = true
+      console.error(
+        missing
+          ? `🔴 ${h.auth.envVar} 不可達（env 與 macOS Keychain 都沒有）；${harness} harness 的角色會在第一次呼叫就死`
+          : `🔴 ${h.auth.envVar} 來源判定不合法（${harness} harness 的 auth.describe 沒回 env|Keychain|缺）；當不可達處理`
+      )
+    }
+  }
+
+  // ── 有 preflight 的 harness（agy：settings.json 對帳——ticket run 的 G2 不分統整者都會查）──
+  //    讀不到設定檔 ⇒ preflight throw ⇒ 印訊息回 2（沿用 1.14.0：agy settings 不存在／解析失敗都是 exit 2）。
   const missingAllow = []
   const missingTrusted = []
   let settingsFile = null
-  let settings = null
-  if (models.writer.harness === 'agy' || coordinator === 'agy') {
-    settingsFile = deps.settingsFile || agySettingsPath(env)
-    if (!fs.existsSync(settingsFile)) {
-      console.error(`🔴 agy settings 不存在：${settingsFile}`)
-      return 2
-    }
+  for (const [harness] of modelHarnesses) {
+    const h = getHarnessFn(harness)
+    if (!h.preflight) continue
+    let checks
     try {
-      settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+      checks = h.preflight(env, config, { repoRoot, settingsFile: deps.settingsFile, role: 'setup' })
     } catch (e) {
-      console.error(`🔴 agy settings 解析失敗（${settingsFile}）：${e.message}`)
+      console.error(`🔴 ${e.message}`)
       return 2
     }
-
-    const allow = (settings.permissions && settings.permissions.allow) || []
-    const wantRegex = buildSafeCommandRegex(config)
-    const wantCommand = `command(regex:${wantRegex})`
-    const hasCommandRegex = allow.includes(wantCommand)
-
-    const rootWithSlash = repoRoot.endsWith('/') ? repoRoot : repoRoot + '/'
-    const hasReadFile = allow.some((a) => {
-      const m = typeof a === 'string' && a.match(/^read_file\((.+)\)$/)
-      if (!m) return false
-      const t = m[1].endsWith('/') ? m[1] : m[1] + '/'
-      return rootWithSlash.startsWith(t) || m[1] === '*'
-    })
-
-    const trusted = settings.trustedWorkspaces || []
-    const hasTrustedWorkspace = trusted.some((tw) => {
-      if (typeof tw !== 'string') return false
-      const t = tw.endsWith('/') ? tw : tw + '/'
-      return rootWithSlash.startsWith(t)
-    })
-
-    console.log(`[command(regex)] ${hasCommandRegex ? '✓ 存在' : '✗ 缺少'}`)
-    console.log(`[read_file(${rootWithSlash})] ${hasReadFile ? '✓ 覆蓋' : '✗ 缺少'}`)
-    console.log(`[trustedWorkspaces] ${hasTrustedWorkspace ? '✓ 覆蓋' : '✗ 缺少'}`)
-    if (!hasCommandRegex) missingAllow.push(wantCommand)
-    if (!hasReadFile) missingAllow.push(`read_file(${rootWithSlash})`)
-    if (!hasTrustedWorkspace) missingTrusted.push(repoRoot)
-    if (missingAllow.length > 0 || missingTrusted.length > 0) failed = true
+    for (const c of checks) {
+      console.log(`[${c.label}] ${c.ok ? `✓ ${c.okText || '通過'}` : `✗ ${c.failText || '缺少'}`}`)
+      if (c.ok) continue
+      failed = true
+      if (c.fix) {
+        if (c.fix.file) settingsFile = c.fix.file
+        if (Array.isArray(c.fix.allow)) missingAllow.push(...c.fix.allow)
+        if (Array.isArray(c.fix.trustedWorkspaces)) missingTrusted.push(...c.fix.trustedWorkspaces)
+      }
+    }
   }
 
   // ── agy 統整者：全域 hooks.json 有載入 block-dangerous ──
   if (coordinator === 'agy') {
+    const agyBin = (deps.agyBin !== undefined ? deps.agyBin : getHarnessFn('agy').resolveBin(env)) || null
     let hooksData = null
     if (deps.runAgyHooks) {
       const res = deps.runAgyHooks(agyBin, repoRoot, env)

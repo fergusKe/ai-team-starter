@@ -1,21 +1,25 @@
 #!/usr/bin/env node
-// ─────────────────── agy 寫手 wrapper（fail-closed） ───────────────────
+// ─────────────────── 寫手 wrapper（fail-closed；harness 由 config.writer.harness 經 registry 決定） ───────────────────
 // 用法：
 //   node .agents/skills/llm-team/write.mjs --worktree <abs> --brief <file> --allow <path> [--allow <path>…]
-//        [--model <model>] [--max-rounds <n>] [--test "<指令>"] [--ledger <file>] [--out <dir>] [--config <file>]
+//        [--model <model>] [--writer-harness <name>] [--max-rounds <n>] [--test "<指令>"] [--ledger <file>] [--out <dir>] [--config <file>]
 //
-// 每輪：跑 agy accept-edits（stream-json）→ 判「工作成功」而非「程序成功」→ 越界檔對帳 → 跑 --test →
-// 紅就把測試輸出餵回 agy（--conversation <id>）再一輪；到 --max-rounds 仍紅 ⇒ exit 3 回統整者。
+// 每輪：跑寫手 harness 的 write.run（agy：accept-edits、stream-json；gemini：auto_edit、stream-json＋policy TOML）→ 判「工作成功」而非「程序成功」
+// → 越界檔對帳 → 跑 --test → 紅就把測試輸出餵回（write.resume：agy 是 --conversation <id>、gemini 是 --resume <session_id>）再一輪；
+// 到 --max-rounds 仍紅 ⇒ exit 3 回統整者。
+// 🔴 1.16.0 寫手鏈：config.writer 可以是有序陣列；`--writer-harness <name>`（或 env LLM_TEAM_WRITER_HARNESS）選席、預設第 0 席。
+//   本檔一次只跑一席、不自動換席；每筆台帳帶 failure（統一形狀），ticket.mjs 收貨摘要看它印「下一席」提示。
 //
 // 🔴 2026-09-13 三方（agy opus-4-6／Gemini 3.1 Pro／codex sol）共識的機械保護，一條都不准拿掉：
 //   G0 installCommand 必須成功（exit 0）——否則寫手一輪都不准啟動。
 //   G1 worktree 分支不是 main、乾淨（開跑前）——否則不准動手。
-//   G2 settings.json 的 allow regex 與 lib.mjs 同源（漂移 ⇒ 寫手第一個指令就死）。
-//   G3 stdout 的 result.response 非空且 denied_actions 空——否則判 FAIL（exit 0 是假的）。
+//   G2 寫手 harness 的 preflight 全過（agy：settings.json 的 allow regex 與 lib.mjs 同源，漂移 ⇒ 寫手第一個指令就死）。
+//   G3 回覆正文（統一形狀 text）非空且 denied 空——否則判 FAIL（exit 0 是假的）。
 //   G4 `git status --porcelain` 的每個檔都在 allowlist——越界 ⇒ FAIL，不修、不還原、回統整者。
 //   G5 每輪都寫台帳（ndjson）：round、baseline sha、changed、denied、test exit。
 //   G6 迴圈上限 --max-rounds（預設從 config.json 讀取，硬上限 5）。
 // 🔴 不做的事：不 stash、不 `git checkout --`、不 commit、不 push——那些是統整者在 merge 閘做的。
+// 🔴 測試接縫：deps.getHarness（注入假 harness 攔 write.run／resume／preflight）、deps.runTest、deps.runInstall、deps.git、deps.changedFiles。
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -23,18 +27,21 @@ import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
   writerFrom,
-  runAgy,
+  writerHarnessArgError,
   git,
   changedFiles,
   outOfScope,
   ledgerAppend,
   parseArgs,
-  assertSettingsAllowRegex,
   CLEAN_GIT_ENV,
   isDirectRun,
   BASE_COMMAND_HEADS,
   WRITER_PROMPT_SENTINEL,
 } from './lib.mjs'
+import { getHarness, WRITER_HARNESSES } from './harnesses/index.mjs'
+
+/** agy 專屬判定搬到 harnesses/agy.mjs（write.lastStepIsToolError）；這裡 re-export 維持既有 import 相容。 */
+export { lastStepIsToolError } from './harnesses/agy.mjs'
 
 export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads }) {
   const allowedLine =
@@ -67,13 +74,6 @@ export function buildWriterPrompt({ brief, worktree, allowlist, round, feedback,
   )
 }
 
-/** 最後一個工具步驟是「參數不合法」那類 TOOL_ERROR（不是 permission）⇒ 整輪會被 agy 靜默結束。 */
-export function lastStepIsToolError(steps) {
-  const tools = (steps || []).filter((s) => s.tool)
-  const last = tools[tools.length - 1]
-  return Boolean(last && last.error && !/permission/i.test(last.error))
-}
-
 function runTest(cmd, cwd) {
   // 🔴 剝掉 node test runner 的子行程標記：在 `node --test` 底下巢狀跑 `node --test` 會被當成 child reporter、exit 0（假綠）。
   const env = { ...CLEAN_GIT_ENV }
@@ -86,7 +86,7 @@ export function main(argv, deps = {}) {
   const a = parseArgs(argv, ['allow'])
   const worktree = a.worktree && path.resolve(a.worktree)
   if (!worktree || !a.brief || !a.allow || a.allow.length === 0) {
-    console.error('用法：--worktree <abs> --brief <file> --allow <path>… [--model] [--max-rounds] [--test "<cmd>"] [--ledger] [--out]')
+    console.error('用法：--worktree <abs> --brief <file> --allow <path>… [--model] [--writer-harness <name>] [--max-rounds] [--test "<cmd>"] [--ledger] [--out]')
     return 2
   }
 
@@ -104,12 +104,26 @@ export function main(argv, deps = {}) {
     return 2
   }
 
-  // 🔴 寫手 harness 只准 agy（本檔就是 agy runner）：writerFrom 讀者側再驗一次，deps.config 注入也繞不過（陽性對照 llm-team.test.mjs「🔴 writer.harness 只准 agy」）。
+  // 🔴 寫手 harness 只准 WRITER_HARNESSES（registry 裡 canWrite 的）：writerFrom 讀者側再驗一次，deps.config 注入也繞不過
+  //    （陽性對照 llm-team.test.mjs「🔴 writer.harness 只准 agy」）。下面再對 registry 查一次 canWrite——deps.getHarness 注入假 harness 也擋。
+  //    `--writer-harness <name>` 只准選 config.writer 列出的席（writerFrom 找不到就 throw 列清單）；
+  //    裸旗標／空字串 ⇒ 拒絕（r3 sol Q2：以前靜默落第 0 席）。
+  const harnessArgErr = writerHarnessArgError(a['writer-harness'], config)
+  if (harnessArgErr) {
+    console.error(`🔴 ${harnessArgErr}`)
+    return 2
+  }
   let writer
   try {
-    writer = writerFrom(config)
+    writer = writerFrom(config, process.env, { harness: a['writer-harness'] })
   } catch (e) {
     console.error(`🔴 config 載入失敗：${e.message}`)
+    return 2
+  }
+  const getHarnessFn = deps.getHarness || getHarness
+  const h = getHarnessFn(writer.harness)
+  if (!h.canWrite || !h.write) {
+    console.error(`🔴 config 載入失敗：writer.harness 只准 ${WRITER_HARNESSES.join('|')}（有 write 介面的 harness），得到 ${JSON.stringify(writer.harness)}`)
     return 2
   }
   const model = a.model || writer.model
@@ -126,9 +140,7 @@ export function main(argv, deps = {}) {
   const ledger = a.ledger || path.join(outDir, 'ledger.ndjson')
   const brief = fs.readFileSync(a.brief, 'utf8')
   const allowlist = a.allow
-  const run = deps.runAgy || runAgy
   const test = deps.runTest || runTest
-  const checkSettings = deps.assertSettings || assertSettingsAllowRegex
   const changedFilesFn = deps.changedFiles || changedFiles
 
   const project = path.basename(repoRoot)
@@ -151,9 +163,18 @@ export function main(argv, deps = {}) {
     return 2
   }
 
-  // G2
+  // G2：寫手 harness 的 preflight（role 'write'；agy ＝ settings.json 對帳；gemini ＝ 產 policy TOML 寫進 outDir；讀不到設定檔 ⇒ throw ⇒ 同樣擋）。
+  //    🔴 回傳的任一條 !ok 就擋，沒有放行分支（sol block r1 Q2）——哪些條屬於寫手角色由 harness 依 role 決定
+  //    （agy 的 trustedWorkspaces 只回給 setup，沿用 1.14.0 write 不查它的射程）。
+  //    outDir 一併交給 harness：harness 的產物（gemini 的 policy TOML）只准落在 outDir——跟台帳同層、不進 worktree，
+  //    所以 G4／ticket 的 changed 不需要任何特例（r2：r1 落在 worktree 底下被統整者真跑坐實會污染收貨摘要、擋 land）。
   try {
-    checkSettings(undefined, repoRoot, config)
+    const checks = h.preflight ? h.preflight(process.env, config, { repoRoot, role: 'write', outDir }) : []
+    const bad = checks.find((p) => !p.ok)
+    if (bad) {
+      console.error(`🔴 G2：${bad.message || `${bad.label} 不通過`}`)
+      return 2
+    }
   } catch (e) {
     console.error(`🔴 G2：${e.message}`)
     return 2
@@ -201,15 +222,12 @@ export function main(argv, deps = {}) {
   let toolErrorRetries = 0
   for (let round = 1; round <= maxRounds; round++) {
     const prompt = buildWriterPrompt({ brief, worktree, allowlist, round, feedback, allowedHeads })
-    const extraArgs = round === 1 ? [] : ['--conversation', conversationId]
-    let r = run({
-      model,
-      mode: 'accept-edits',
-      prompt,
-      cwd: worktree,
-      extraArgs,
-      timeoutMs,
-    })
+    // 第 1 輪 write.run；之後 write.resume 續同一段對話（agy ⇒ --conversation <id>；gemini ⇒ --resume <session_id>）。回傳是統一形狀 WriteResult。
+    // outDir 交給 harness（gemini 從這裡找 preflight 寫的 policy TOML；agy 不用）。
+    let r =
+      round === 1
+        ? h.write.run({ model, prompt, cwd: worktree, timeoutMs, outDir })
+        : h.write.resume({ model, prompt, cwd: worktree, timeoutMs, conversationId, outDir })
 
     // 🔴 P5（2026-09-14）：寫手逾時（spawnSync timeout ⇒ status null、signal SIGTERM）以前會落進 G3 的 FAIL_headless，
     //    ticket 分不出「被拒」與「逾時」，而且 exit 3 後仍跑 --test 再開 council（拿半成品去複審）。
@@ -231,6 +249,7 @@ export function main(argv, deps = {}) {
         signal: r.signal || null,
         timeoutMs,
         conversationId,
+        failure: r.failure || undefined,
         verdict: 'FAIL_timeout',
       })
       console.error(`🔴 第 ${round} 輪：寫手逾時（${timeoutMs} ms，signal=${r.signal || null}），不續話、回統整者。`)
@@ -242,13 +261,13 @@ export function main(argv, deps = {}) {
     //    修法：第 1 輪抓 stream-json 的 conversation_id，之後一律 --conversation <id>。
     //    陽性對照：llm-team.test.mjs「deps.runAgy 第 1 輪回 result 沒有 conversation_id 且無 init ⇒ main 回 3、台帳最後一筆 verdict === "FAIL_conversation_id"（陽性對照）」。
     //    停止條件：拿不到或不一致 ⇒ 台帳 FAIL_conversation_id、return 3、不續話。
-    const initialConvId = r.conversationId || (r.result && r.result.conversation_id) || null
+    const initialConvId = r.conversationId || null
     if (round === 1) {
       conversationId = initialConvId
       if (!conversationId) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
-        const response = (r.result && r.result.response) || ''
+        const response = r.text || ''
         fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
@@ -258,16 +277,18 @@ export function main(argv, deps = {}) {
           exit: r.exit,
           responseChars: response.length,
           conversationId: null,
+          // 1.16.0：額度用盡（gemini result.error Quota／429）通常連 session id 都拿不到，failure 一定要跟著進台帳，ticket 才印得出「下一席」。
+          failure: r.failure || undefined,
           verdict: 'FAIL_conversation_id',
         })
-        console.error('🔴 G3 前置：拿不到 conversation id，不續話')
+        console.error(`🔴 G3 前置：拿不到 conversation id，不續話${r.failure ? `（failure=${r.failure.kind}${r.failure.code ? `:${r.failure.code}` : ''}）` : ''}`)
         return 3
       }
     } else {
       if (initialConvId !== null && initialConvId !== conversationId) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
-        const response = (r.result && r.result.response) || ''
+        const response = r.text || ''
         fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
@@ -277,6 +298,7 @@ export function main(argv, deps = {}) {
           exit: r.exit,
           responseChars: response.length,
           conversationId: initialConvId,
+          failure: r.failure || undefined,
           verdict: 'FAIL_conversation_id',
         })
         console.error(`🔴 G3 前置：續輪回來的 conversation id（${initialConvId}）≠ 第 1 輪（${conversationId}），串錯對話，停`)
@@ -291,8 +313,8 @@ export function main(argv, deps = {}) {
       toolErrorRetries < 2 &&
       r.exit === 0 &&
       r.denied.length === 0 &&
-      !((r.result && r.result.response) || '').trim() &&
-      lastStepIsToolError(r.steps)
+      !(r.text || '').trim() &&
+      h.write.lastStepIsToolError(r.steps)
     ) {
       toolErrorRetries++
       fs.writeFileSync(path.join(outDir, `round-${round}.toolerror-${toolErrorRetries}.stdout.ndjson`), r.stdout)
@@ -305,22 +327,23 @@ export function main(argv, deps = {}) {
         verdict: 'RETRY_toolerror',
         retry: toolErrorRetries,
         lastStep: r.steps[r.steps.length - 1],
+        failure: r.failure || undefined,
       })
       console.error(`🟡 第 ${round} 輪：最後一個工具呼叫參數不合法而整輪中止，續第 ${toolErrorRetries} 次`)
-      r = run({
+      r = h.write.resume({
         model,
-        mode: 'accept-edits',
         prompt: '上一個工具呼叫的參數不合法（見錯誤訊息），整輪被中止了。請換合法參數從那一步繼續，規則不變。',
         cwd: worktree,
-        extraArgs: ['--conversation', conversationId],
         timeoutMs,
+        conversationId,
+        outDir,
       })
 
-      const retryConvId = r.conversationId || (r.result && r.result.conversation_id) || null
+      const retryConvId = r.conversationId || null
       if (retryConvId !== null && retryConvId !== conversationId) {
         fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout || '')
         fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr || '')
-        const response = (r.result && r.result.response) || ''
+        const response = r.text || ''
         fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
         ledgerAppend(ledger, {
           ...baseEntry,
@@ -330,6 +353,7 @@ export function main(argv, deps = {}) {
           exit: r.exit,
           responseChars: response.length,
           conversationId: retryConvId,
+          failure: r.failure || undefined,
           verdict: 'FAIL_conversation_id',
         })
         console.error(`🔴 G3 前置：續輪回來的 conversation id（${retryConvId}）≠ 第 1 輪（${conversationId}），串錯對話，停`)
@@ -338,7 +362,7 @@ export function main(argv, deps = {}) {
     }
     fs.writeFileSync(path.join(outDir, `round-${round}.stdout.ndjson`), r.stdout)
     fs.writeFileSync(path.join(outDir, `round-${round}.stderr.txt`), r.stderr)
-    const response = (r.result && r.result.response) || ''
+    const response = r.text || ''
     fs.writeFileSync(path.join(outDir, `round-${round}.response.md`), response)
     const changed = changedFilesFn(worktree).filter((f) => !isIgnored(f))
     const oos = outOfScope(changed, allowlist)
@@ -353,13 +377,19 @@ export function main(argv, deps = {}) {
       denied: r.denied,
       changed,
       outOfScope: oos,
-      usage: r.result && r.result.usage,
+      // 台帳沿用 1.14.0 形狀：沒有 usage 就不寫這個欄（統一形狀的 null 不落地）。
+      usage: r.usage || undefined,
+      // 1.16.0：統一形狀的 failure（auth／quota／policy／timeout／process／protocol），null 不落地；ticket 收貨摘要讀最後一筆判「額度用盡 ⇒ 下一席」。
+      failure: r.failure || undefined,
     }
-    // G3
-    if (r.exit !== 0 || r.denied.length || !response.trim()) {
+    // G3：exit 非 0、被拒、正文空 ⇒ FAIL；r4（sol r3 Q2）：harness 回【任何非 null 的 failure】也 FAIL——
+    //    r3 只擋 protocol，漏了「exit 0、正文非空、init 有 session id、但 result.status error（quota）」這種形狀：
+    //    harness 已經說這輪失敗了，write.mjs 不該再看正文替它放行。timeout 仍由上面 P5 先判（寫 timeout.json、FAIL_timeout），
+    //    這裡永遠碰不到 kind timeout。訊息印 failure=<kind>:<code>，ticket 靠台帳的 failure 印下一席。
+    if (r.exit !== 0 || r.denied.length || !response.trim() || r.failure) {
       ledgerAppend(ledger, { ...entry, verdict: 'FAIL_headless' })
       console.error(
-        `🔴 G3 第 ${round} 輪：agy 無頭中止（exit=${r.exit}，denied=${JSON.stringify(r.denied)}，response ${response.length} 字）。stderr：\n${r.stderr.slice(0, 500)}`
+        `🔴 G3 第 ${round} 輪：${writer.harness} 無頭中止（exit=${r.exit}，denied=${JSON.stringify(r.denied)}，response ${response.length} 字${r.failure ? `，failure=${r.failure.kind}${r.failure.code ? `:${r.failure.code}` : ''}` : ''}）。stderr：\n${r.stderr.slice(0, 500)}`
       )
       return 3
     }

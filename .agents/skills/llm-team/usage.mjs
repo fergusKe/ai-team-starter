@@ -28,6 +28,7 @@ import { homedir } from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { isDirectRun, loadConfig, git, MEASUREMENT_SCHEMA_VERSION } from './lib.mjs'
+import { isTranscriptMeasurable } from './harnesses/index.mjs'
 
 /** ③ cohort 自證 JSON 的輸出格式版本（與 lib.mjs 的 MEASUREMENT_SCHEMA_VERSION 是兩個不同的版本欄——一個是量測方法、一個是這份 JSON 的形狀）。 */
 export const COHORT_JSON_SCHEMA_VERSION = 1
@@ -1032,7 +1033,8 @@ export async function measureTicketLive(ticket, localDir, config, repoRoot, deps
   if (!coordinator || !profile) {
     return { measurable: false, reason: 'coordinator-profile-unknown', usageWindow: { from: window.from, to: window.to } }
   }
-  if (harness !== 'claude') {
+  // 只有 transcriptMeasurable 的 harness（claude）有 Claude Code transcript；其餘（含未知 harness）記 measurable:false。
+  if (!isTranscriptMeasurable(harness)) {
     return { measurable: false, reason: `no-transcript-for-harness:${harness}`, usageWindow: { from: window.from, to: window.to } }
   }
 
@@ -1654,7 +1656,7 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
     return 0
   }
 
-  if (harness !== 'claude') {
+  if (!isTranscriptMeasurable(harness)) {
     console.log(`ℹ 此 harness（${harness}）沒有 Claude Code transcript，apiCalls 不可量`)
     if (flags['--write']) {
       summary.usage = {
