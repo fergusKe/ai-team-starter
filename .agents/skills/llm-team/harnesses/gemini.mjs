@@ -58,9 +58,10 @@ export function buildGeminiArgs({ model, prompt }) {
  *   不被捕捉、直接丟棄；stdout 仍要 `'pipe'` 才讀得到金鑰。陽性對照 llm-team.test.mjs「⑤ resolveGeminiApiKey…」
  *   斷言 exec 收到的 options.stdio[2] === 'ignore'。
  */
-export function resolveGeminiApiKey(env = process.env, exec = execFileSync) {
+// 🔴 1.22.1：platform 可注入。1.14.0 的測試假設一定走 Keychain，只在 macOS 上綠；模板 CI（Linux）第一次跑到它就紅（ai-team-starter #48）。
+export function resolveGeminiApiKey(env = process.env, exec = execFileSync, platform = os.platform()) {
   if (env.GEMINI_API_KEY) return env.GEMINI_API_KEY
-  if (os.platform() !== 'darwin') return ''
+  if (platform !== 'darwin') return ''
   try {
     const out = exec('security', ['find-generic-password', '-s', 'GEMINI_API_KEY', '-w'], {
       encoding: 'utf8',

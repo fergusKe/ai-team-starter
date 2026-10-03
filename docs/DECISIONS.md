@@ -1818,7 +1818,7 @@ GuildHub 遷〈跨項依賴〉時，第一版把舊表**原地**改成四欄、�
 > 他們「隔離上下文」也很適合我們使用／我們應該是採用這個模式／要使用哪個模型其實都可以／這樣就不會像我們現在被限定在要呼叫不同模型
 > 像你說的有一樣結果／可是他的結構漂亮多了
 
-**改了什麼**（真源 fergus-claude-config `00eb765`，快照 1.12.0 → 1.22.0）：
+**改了什麼**（真源 fergus-claude-config `00eb765`＋`2fe01be`，快照 1.12.0 → 1.22.1）：
 - **撤兩條不變式**：「統整者與複審者／裁決者不同 quotaBucket」、「`claude` 只准當 coordinator」。保留「統整者本人不在名單」。這兩條讓複審綁死在別家額度上——codex／Gemini 一用完，複審就停擺。
 - **`claude` 有了 review 介面**：`claude -p` 無頭、JSON 輸出、prompt 走 stdin、`--no-session-persistence`、`--setting-sources project`（不載使用者層 settings，使用者層的 hook 不會在複審者身上跑）、唯讀工具 `Read,Grep,Glob`、`dontAsk`。
 - **複審 prompt 第二行帶「推翻句」**：你沒寫、看不到統整者怎麼想，任務是設法推翻，推翻不了才簽。

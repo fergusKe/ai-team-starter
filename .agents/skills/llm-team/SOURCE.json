@@ -1,8 +1,8 @@
 {
-  "version": "1.22.0",
-  "sourceCommit": "00eb765f9ec84765a488f4bc2ba95f5a766df28f",
+  "version": "1.22.1",
+  "sourceCommit": "2fe01be71994c6f11d9872e179b608c3151b40c1",
   "sourceDirty": false,
-  "exportedAt": "2026-10-03T08:18:11.504Z",
+  "exportedAt": "2026-10-03T08:29:06.084Z",
   "files": [
     "prompts/07-ticket.md",
     "prompts/08-pr-review.md",

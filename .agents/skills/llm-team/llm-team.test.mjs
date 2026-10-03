@@ -4481,11 +4481,11 @@ describe('1.14.0 gemini harness：Gemini CLI 無頭（假 exec／假 spawn，不
       capturedOpts = opts
       return 'test-key\n'
     }
-    assert.equal(resolveGeminiApiKey({ GEMINI_API_KEY: 'test-key' }, fakeExecOk), 'test-key')
+    assert.equal(resolveGeminiApiKey({ GEMINI_API_KEY: 'test-key' }, fakeExecOk, 'darwin'), 'test-key')
     assert.equal(calls, 0, 'env 有值時不該呼叫 exec（Keychain）')
 
     calls = 0
-    assert.equal(resolveGeminiApiKey({}, fakeExecOk), 'test-key')
+    assert.equal(resolveGeminiApiKey({}, fakeExecOk, 'darwin'), 'test-key')
     assert.equal(calls, 1, 'env 無值時應呼叫 exec 讀 Keychain')
     // 🔴 r2 sol block 複審 Q4：Keychain 沒有項目時 `security` 會把系統訊息直接印到本行程 stderr（不是回傳值也不是丟例外）；
     //   stdio[2]==='ignore' 才會把子行程的 stderr 丟棄、不外流。
@@ -4496,9 +4496,12 @@ describe('1.14.0 gemini harness：Gemini CLI 無頭（假 exec／假 spawn，不
     const fakeExecThrow = () => {
       throw new Error('security: not found in keychain')
     }
-    assert.equal(resolveGeminiApiKey({}, fakeExecThrow), '')
+    assert.equal(resolveGeminiApiKey({}, fakeExecThrow, 'darwin'), '')
+    // 1.22.1：非 macOS 沒有 Keychain ⇒ 不呼叫 exec、回空字串（CI 跑在 Linux）
+    calls = 0
+    assert.equal(resolveGeminiApiKey({}, fakeExecOk, 'linux'), '')
+    assert.equal(calls, 0, '非 darwin 不該呼叫 security')
   })
-
   test('⑥ runGeminiAsync：注入 resolveKey ⇒ "" ⇒ fail-closed，不呼叫 spawn、keyMissing:true、stderr 不含任何假 key 值', async () => {
     // 🔴 r3 sol 第二輪坐實：不注入 resolveKey 就用 env:{} 模擬缺 key，darwin 上仍會走到預設值 resolveGeminiApiKey
     //   真的查 Keychain——本機若剛好有 GEMINI_API_KEY 這個項目，測試就會非決定性地假紅（spawnCalled 變 true）。
@@ -4633,7 +4636,7 @@ describe('1.14.0 gemini harness：Gemini CLI 無頭（假 exec／假 spawn，不
     assert.equal(occurrences.length, 5, `預期恰好 5 處（定義＋兩個預設參數＋auth 預設值＋deps 接縫），實際 ${occurrences.length} 處——多出來的很可能是繞過 resolveKey 的直接呼叫`)
     const callForm = stripped.match(/resolveGeminiApiKey\(/g) || []
     assert.equal(callForm.length, 1, `呼叫形 resolveGeminiApiKey( 只准是定義那 1 處，實際 ${callForm.length} 處`)
-    assert.match(stripped, /function resolveGeminiApiKey\(env = process\.env, exec = execFileSync\)/)
+    assert.match(stripped, /function resolveGeminiApiKey\(env = process\.env, exec = execFileSync, platform = os\.platform\(\)\)/)
     assert.match(stripped, /function runGemini\(\{[\s\S]{0,300}?resolveKey = resolveGeminiApiKey,/, 'runGemini 的預設參數應是 resolveKey = resolveGeminiApiKey')
     assert.match(stripped, /async function runGeminiAsync\(\{[\s\S]{0,300}?resolveKey = resolveGeminiApiKey,/, 'runGeminiAsync 的預設參數應是 resolveKey = resolveGeminiApiKey')
     const libStripped = fs.readFileSync(fileURLToPath(new URL('./lib.mjs', import.meta.url)), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
