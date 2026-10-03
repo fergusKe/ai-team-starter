@@ -1,18 +1,12 @@
-// ─────────────────── 多模型派工（agy／codex）共用層 ───────────────────
+// ─────────────────── 多模型派工共用層（config／roster／brief 預檢／spawn／git） ───────────────────
 // 跨專案模板版：不變量留程式碼，專案特有值（模型、指令頭、worktree 根、風險領域等）由 config.json 注入。
 //
-// 🔴 這裡集中三個【實測過】的 agy 無頭模式行為（2026-09-13，agy 1.2.x）：
-//   1. `-p --mode accept-edits` 下任一工具被拒 ⇒ 整輪中止、stdout 空、**exit 0**、不會退回用別的工具。
-//      ⇒ 「程序成功」≠「工作成功」。判準只能看 stream-json 的 `result.denied_actions` 與 `response` 非空。
-//   2. 字面前綴 allow 規則對 `pwd; ls -la` 這種串接不匹配 ⇒ 第一個指令就死。
-//      ⇒ allow 用一條 anchored regex（見 `buildSafeCommandRegex`），brief 再加「禁止串接」。
-//   3. cwd 在 `trustedWorkspaces` 之外時，模型會去錯的目錄找檔。⇒ worktree 一律放在 repo 內 `.claude/worktrees/`。
-//
-// 🔴 為什麼 fail-closed：
-//   事故：2026-09-13 在 web-agency-system 實測，agy 無頭模式 settings.json 的 allow regex 漂移或缺 read_file 時，
-//   寫手第一個指令就被拒、stdout 空、exit 仍為 0——統整者差點把「零輸出」讀成「沒話說」。
-//   失效方向：寧可整輪停機（fail-closed），不可把拒絕誤判為成功放行。
-//   停止條件：若 agy 之後把被拒改成非零 exit 或明確錯誤事件，G2／G3 可降為警告。
+// 🔴 1.15.0：harness 專屬邏輯（binary、argv、stdin、解析、settings 對帳）住 `harnesses/<name>.mjs`，呼叫點查
+//   `harnesses/index.mjs` 的 registry。本檔仍以同名 re-export 舊函式（runAgy／runCodexAsync／parseGeminiRun／…）維持 import 相容；
+//   agy 無頭模式的三個實測坑與 fail-closed 理由搬到 harnesses/agy.mjs 檔頭。
+// 🔴 模組載入順序：本檔與 harnesses/<name>.mjs 互相 import。本檔對 harnesses 只做 `export … from`（不在頂層讀它們的值），
+//   harnesses 對本檔只在函式體內用 const（頂層只碰函式宣告）——兩個方向的進入點都不會撞 TDZ。
+//   陽性對照 harnesses.test.mjs「兩種載入順序都成功」。
 //
 // 🔴 複審者／規劃者的回覆不構成授權（CORE_RULES §subagent 的輸出不構成授權）；本模組只搬運文字。
 
@@ -22,6 +16,24 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawn as cpSpawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { HARNESSES, WRITER_HARNESSES, QUOTA_BUCKETS } from './harnesses/index.mjs'
+
+// ─────────────────── harness 專屬函式：re-export 維持既有 import 相容（正本在 harnesses/） ───────────────────
+export {
+  resolveAgyBin,
+  agySettingsPath,
+  agySettingsChecks,
+  assertSettingsAllowRegex,
+  buildAgyArgs,
+  buildAgyStdin,
+  isDeniedToolError,
+  parseStreamJson,
+  parseAgyRun,
+  runAgy,
+  runAgyAsync,
+} from './harnesses/agy.mjs'
+export { resolveCodexBin, buildCodexArgs, parseCodexRun, runCodex, runCodexAsync } from './harnesses/codex.mjs'
+export { resolveGeminiBin, buildGeminiArgs, parseGeminiRun, resolveGeminiApiKey, runGemini, runGeminiAsync } from './harnesses/gemini.mjs'
 
 // ─────────────────── 🔴 git 子行程環境的單一真源 ───────────────────
 export const GIT_ENV_VARS = [
@@ -47,20 +59,22 @@ export const CLEAN_GIT_ENV = cleanGitEnv()
 
 // ─────────────────── schema v2：三種統整者 profiles ───────────────────
 // 🔴 2026-09-14 三方（Claude Code、codex gpt-5.6-sol、Gemini 3.1 Pro）三輪定案：
-//   · 用量是第一約束：統整者與任何複審者／裁決者【不同 quotaBucket】（Gemini 桶曾被「統整者＋複審同桶」吃光）。
 //   · 統整者不在自己票的任何複審／裁決名單；裁決者 ∉ 一般票複審名單；block 未決一律 "human"。
-//   · agy／codex 當統整者只發生在「Claude 額度用完」時 ⇒ `claude` harness 只准出現在 coordinator，
-//     出現在 reviewers／blockReviewers／adjudicator 一律拒絕（Fergus 2026-09-14 硬約束）。
-export const HARNESSES = ['agy', 'codex', 'claude']
-export const QUOTA_BUCKETS = ['anthropic', 'gemini', 'agy-claude', 'openai']
+// 🔴 1.22.0（Fergus 2026-10-03）撤掉兩條：「統整者與複審者／裁決者不同 quotaBucket」與「claude 只准當 coordinator」。
+//   獨立性改靠【隔離上下文】（每位複審者是全新無頭行程，只拿到 brief＋diff＋判準），不靠換廠商；模型只是設定值。
+//   理由：那兩條讓複審綁死在別家額度上，codex／Gemini 用完複審就停擺（使用者原話：「這樣就不會像我們現在被限定在要呼叫不同模型」）。
+//   代價（照記）：同桶 ⇒ 統整者與複審者一起吃同一份額度；同模型 ⇒ 盲點相關。要跨廠商就在 config 裡放別家成員——還是准。
+//   陽性對照 llm-team.test.mjs「1.22.0 隔離上下文：claude 當複審／裁決、與統整者同桶 ⇒ 過；統整者本人 ⇒ 仍拒」。
+// 🔴 1.15.0：HARNESSES／QUOTA_BUCKETS／WRITER_HARNESSES 由 harnesses/index.mjs 的 registry 產生（值與順序跟 1.14.0 字面相同：
+//   HARNESSES ＝ agy|codex|claude|gemini；QUOTA_BUCKETS ＝ anthropic,gemini,agy-claude,openai,gemini-api）。
+//   1.16.0：gemini 長出 write 介面 ⇒ WRITER_HARNESSES ＝ agy|gemini（registry 順序）。
+//   這裡只 re-export，讓既有 `import { HARNESSES } from './lib.mjs'` 照常。
+export { HARNESSES, WRITER_HARNESSES, QUOTA_BUCKETS }
 export const MEMBER_EFFORTS = ['high', 'medium']
-/**
- * 🔴 寫手 harness 只准 agy：唯一的寫手 runner 是 write.mjs（runAgy＋agy 無頭 accept-edits），沒有 codex／claude 的寫手路徑。
- *    2026-09-14 codex 複審 Q1-CLAUDE 坐實：validateMember 對 writer 只驗形狀，`writer.harness="claude"` 會過，
- *    write.mjs 隨後錯用 agy 跑 claude 的 model 字串。陽性對照 llm-team.test.mjs「🔴 writer.harness 只准 agy」。
- *    停止條件：write.mjs 真的長出第二種寫手 runner 那天，把它加進這張表（不是拿掉這道閘）。
- */
-export const WRITER_HARNESSES = ['agy']
+// 🔴 寫手 harness 只准 WRITER_HARNESSES（＝registry 裡 canWrite 的 harness）：
+//    2026-09-14 codex 複審 Q1-CLAUDE 坐實：validateMember 對 writer 只驗形狀，`writer.harness="claude"` 會過，
+//    write.mjs 隨後錯用 agy 跑 claude 的 model 字串。陽性對照 llm-team.test.mjs「🔴 writer.harness 只准 agy」。
+//    1.16.0 gemini 照這條停止條件辦：在 harnesses/gemini.mjs 把 canWrite 翻成 true，這道閘沒動。
 
 // ─────────────────── 1.8.0：量測與 Q6 閘門解耦（usage.mode） ───────────────────
 // 🔴 2026-09-17 codex gpt-5.6-sol 兩輪審查共識（ai-team-starter docs/DECISIONS.md）：`accept --caliber` 之前無條件必填，
@@ -93,15 +107,46 @@ function validateMember(m, where, targetFile) {
   }
 }
 
-/** 寫手成員檢查：形狀＋harness 只准 WRITER_HARNESSES（loadConfig 與 writerFrom 兩處都呼叫——讀者側也要擋，deps.config 注入才繞不過）。 */
-export function validateWriter(writer, targetFile = 'config') {
-  validateMember(writer, 'writer', targetFile)
+function validateWriterSeat(writer, where, targetFile) {
+  validateMember(writer, where, targetFile)
   if (!WRITER_HARNESSES.includes(writer.harness)) {
     throw new Error(
-      `config writer 不合法（${targetFile}）：writer.harness 只准 ${WRITER_HARNESSES.join('|')}（唯一的寫手 runner 是 write.mjs 的 agy），得到 ${JSON.stringify(writer.harness)}`
+      `config writer 不合法（${targetFile}）：${where}.harness 只准 ${WRITER_HARNESSES.join('|')}（registry 裡有 write 介面的 harness），得到 ${JSON.stringify(writer.harness)}`
     )
   }
+}
+
+/**
+ * 寫手成員檢查：形狀＋harness 只准 WRITER_HARNESSES（loadConfig 與 writerFrom 兩處都呼叫——讀者側也要擋，deps.config 注入才繞不過）。
+ * 1.16.0 寫手鏈：`writer` 准許單一成員物件，或【有序陣列】（第 0 席預設；額度用盡時統整者手動換下一席）。
+ * 陣列：非空、逐席驗（每席 harness 必須 canWrite）、同一 harness 不准出現兩次（`--writer-harness <name>` 靠名字選席，重複就選不出來）。
+ */
+export function validateWriter(writer, targetFile = 'config') {
+  if (Array.isArray(writer)) {
+    if (writer.length === 0) throw new Error(`config writer 不合法（${targetFile}）：writer 陣列不可為空（至少一席）`)
+    writer.forEach((w, i) => validateWriterSeat(w, `writer[${i}]`, targetFile))
+    writer.forEach((w, i) => {
+      if (writer.slice(0, i).some((prev) => prev.harness === w.harness)) {
+        throw new Error(`config writer 不合法（${targetFile}）：writer[${i}].harness ${JSON.stringify(w.harness)} 重複（一個 harness 只准一席，--writer-harness 靠名字選席）`)
+      }
+    })
+    return true
+  }
+  validateWriterSeat(writer, 'writer', targetFile)
   return true
+}
+
+/** 寫手席次（有序）：單一物件 ⇒ [它]；陣列 ⇒ 原樣。不驗（呼叫端先 validateWriter）。 */
+export function writerSeats(config) {
+  const w = config?.writer
+  return Array.isArray(w) ? w : w ? [w] : []
+}
+
+/** 目前這席之後的下一席（config 陣列順序）；沒有 ⇒ null。單一物件 config 永遠 null。 */
+export function nextWriterSeat(config, currentHarness) {
+  const seats = writerSeats(config)
+  const i = seats.findIndex((s) => s.harness === currentHarness)
+  return i >= 0 && i + 1 < seats.length ? { ...seats[i + 1] } : null
 }
 
 /** 同一個成員 ＝ harness ＋ model 相同。 */
@@ -109,11 +154,19 @@ export function sameMember(a, b) {
   return Boolean(a && b && a.harness === b.harness && a.model === b.model)
 }
 
+export const REVIEW_TIERS = ['standard', 'block', 'postreview']
+export const TIER_LIST_KEY = {
+  standard: 'reviewers',
+  block: 'blockReviewers',
+  postreview: 'postReviewers'
+}
+
 /**
  * 驗 profiles 不變式（load 時呼叫）。錯誤訊息指名 profile 與哪條不變式。
  * 拒絕：缺 profiles／缺必要欄位、未知 harness／quotaBucket、同一名單成員重複、
- * 統整者出現在任何複審／裁決名單、統整者與任一複審者／裁決者同桶、adjudicator 出現在 reviewers、
- * blockAdjudicator ≠ "human"、reviewers 或 blockReviewers 為空、claude harness 出現在非 coordinator 位置。
+ * 統整者本人（同 harness＋model）出現在任何複審／裁決名單、adjudicator 出現在 reviewers、
+ * blockAdjudicator ≠ "human"、reviewers、blockReviewers 或 (若存在) postReviewers 為空。
+ * （1.22.0 起同桶、claude 當複審／裁決都准——見檔頭。）
  */
 export function validateProfiles(config, targetFile = 'config') {
   const profiles = config?.profiles
@@ -131,7 +184,12 @@ export function validateProfiles(config, targetFile = 'config') {
     validateMember(p.coordinator, `${at}.coordinator`, targetFile)
     const coord = p.coordinator
 
-    for (const listKey of ['reviewers', 'blockReviewers']) {
+    const checkLists = ['reviewers', 'blockReviewers']
+    if (p.postReviewers !== undefined) {
+      checkLists.push('postReviewers')
+    }
+
+    for (const listKey of checkLists) {
       const list = p[listKey]
       if (!Array.isArray(list) || list.length === 0) {
         throw new Error(`config profiles 不合法（${targetFile}）：${at}.${listKey} 必須是非空陣列（不變式：複審名單不可為空）`)
@@ -139,14 +197,8 @@ export function validateProfiles(config, targetFile = 'config') {
       list.forEach((m, i) => {
         const where = `${at}.${listKey}[${i}]`
         validateMember(m, where, targetFile)
-        if (m.harness === 'claude') {
-          throw new Error(`config profiles 不合法（${targetFile}）：${where} 是 claude harness（不變式：claude 只准當 coordinator——agy／codex 統整只在 Claude 額度用完時）`)
-        }
         if (sameMember(m, coord)) {
           throw new Error(`config profiles 不合法（${targetFile}）：${where} 就是統整者本人（不變式：統整者不在自己票的複審名單）`)
-        }
-        if (m.quotaBucket === coord.quotaBucket) {
-          throw new Error(`config profiles 不合法（${targetFile}）：${where} 與統整者同 quotaBucket=${m.quotaBucket}（不變式：統整者與複審者不同桶）`)
         }
         if (list.slice(0, i).some((prev) => sameMember(prev, m))) {
           throw new Error(`config profiles 不合法（${targetFile}）：${where} 在同一名單重複（${m.harness}/${m.model}）`)
@@ -158,15 +210,14 @@ export function validateProfiles(config, targetFile = 'config') {
     if (adj !== 'human') {
       const where = `${at}.adjudicator`
       validateMember(adj, where, targetFile)
-      if (adj.harness === 'claude') {
-        throw new Error(`config profiles 不合法（${targetFile}）：${where} 是 claude harness（不變式：claude 只准當 coordinator）`)
-      }
       if (sameMember(adj, coord)) {
         throw new Error(`config profiles 不合法（${targetFile}）：${where} 就是統整者本人（不變式：統整者不裁決自己的票）`)
       }
-      if (adj.quotaBucket === coord.quotaBucket) {
-        throw new Error(`config profiles 不合法（${targetFile}）：${where} 與統整者同 quotaBucket=${adj.quotaBucket}（不變式：統整者與裁決者不同桶）`)
-      }
+      // 🔴 刻意的例外（2026-09-22）：
+      // 理由：事後審是對「已經合進 main 的一批 commit」的批次複查，沒有裁決步驟（council 跑它一定要 --review-only），
+      // sol (gpt-5.6-sol) 同時是 adjudicator 與唯一事後審席就是設計本身。因此「裁決者 ∉ 名單」那條只約束 reviewers，
+      // 不約束 postReviewers。
+      // 停止條件：若哪天事後審也長出裁決步驟，這條例外要重審。
       if (p.reviewers.some((m) => sameMember(m, adj))) {
         throw new Error(`config profiles 不合法（${targetFile}）：${where} 出現在 reviewers（不變式：裁決者 ∉ 一般票複審名單）`)
       }
@@ -234,10 +285,41 @@ export function loadConfig(repoRoot, configFile = null) {
   return config
 }
 
-/** 寫手（不需要統整者 profile）；env LLM_TEAM_WRITER 覆寫 writer.model。harness 不准覆寫、只准 agy（讀者側再擋一次）。 */
-export function writerFrom(config, env = process.env) {
+/**
+ * 寫手（不需要統整者 profile）。config.writer 單物件或有序陣列（validateWriter 讀者側再擋一次）。
+ * 選席：`opts.harness`（write.mjs／ticket.mjs 的 `--writer-harness`）＞ env LLM_TEAM_WRITER_HARNESS ＞ 第 0 席；
+ * 指定的席不在 config ⇒ throw 並列出可用席。env LLM_TEAM_WRITER 只覆寫【選中那席】的 model，蓋不掉 harness。
+ * 🔴 一次只回一席；下一席由 ticket 收貨摘要提示、統整者手動重跑，這裡不做任何自動遞補。
+ */
+/**
+ * `--writer-harness` 的值合不合法：undefined ＝ 沒給（走預設席）；非空字串 ＝ 席名；其他（裸旗標 parseArgs 得 true、空字串、非字串）
+ * ⇒ 回錯誤訊息（呼叫端印 🔴 並回 2）。r3（sol Q2）：裸旗標以前靜默落第 0 席——統整者以為換席了其實沒有。
+ * @returns {string|null} 錯誤訊息；合法 ⇒ null
+ */
+export function writerHarnessArgError(value, config) {
+  if (value === undefined) return null
+  if (typeof value === 'string' && value.trim()) return null
+  return `--writer-harness 需要席名（可用：${writerSeats(config).map((s) => s.harness).join('、')}）`
+}
+
+export function writerFrom(config, env = process.env, opts = {}) {
   validateWriter(config?.writer, 'config')
-  const w = { ...config.writer }
+  const seats = writerSeats(config)
+  const argErr = writerHarnessArgError(opts.harness, config)
+  if (argErr) throw new Error(argErr)
+  const want = opts.harness || (env && env.LLM_TEAM_WRITER_HARNESS) || null
+  let seat
+  if (want) {
+    seat = seats.find((s) => s.harness === want)
+    if (!seat) {
+      throw new Error(
+        `寫手席 ${JSON.stringify(want)} 不在 config.writer（--writer-harness／LLM_TEAM_WRITER_HARNESS 只准選 config 列出的席）；可用：${seats.map((s) => `${s.harness}/${s.model}`).join(', ')}`
+      )
+    }
+  } else {
+    seat = seats[0]
+  }
+  const w = { ...seat }
   if (env && env.LLM_TEAM_WRITER) w.model = env.LLM_TEAM_WRITER
   return w
 }
@@ -278,9 +360,9 @@ export function nameMembers(members) {
 }
 
 /**
- * 從 config 依統整者 profile 解析角色：{ writer, coordinator, reviewers, blockReviewers, adjudicator, blockAdjudicator }。
+ * 從 config 依統整者 profile 解析角色：{ writer, coordinator, reviewers, blockReviewers, postReviewers, adjudicator, blockAdjudicator }。
  * coordinator 來自參數或 env LLM_TEAM_COORDINATOR；缺或不在 profiles ⇒ throw（訊息列出可用 profiles）。
- * reviewers／blockReviewers 已各自加 name；coordinator 多 `profile` 欄（profile 名）。
+ * reviewers／blockReviewers／postReviewers 已各自加 name；coordinator 多 `profile` 欄（profile 名）。
  */
 export function modelsFrom(config, env = process.env, coordinator = null) {
   const profiles = config?.profiles || {}
@@ -297,6 +379,7 @@ export function modelsFrom(config, env = process.env, coordinator = null) {
     coordinator: { ...p.coordinator, profile: name },
     reviewers: nameMembers(p.reviewers),
     blockReviewers: nameMembers(p.blockReviewers),
+    postReviewers: p.postReviewers ? nameMembers(p.postReviewers) : [],
     adjudicator: p.adjudicator === 'human' ? 'human' : { ...p.adjudicator, name: memberName(p.adjudicator) },
     blockAdjudicator: p.blockAdjudicator,
   }
@@ -614,89 +697,9 @@ export function preflightBriefCommands(briefText, config = null) {
   return { failures }
 }
 
-/** agy binary：cask 裝的不在 PATH，路徑含版本號。可用 `AGY_BIN` 覆寫（測試用假 binary 也走這裡）。 */
-export function resolveAgyBin(env = process.env) {
-  if (env.AGY_BIN) return env.AGY_BIN
-  const root = '/opt/homebrew/Caskroom/antigravity-cli'
-  if (!fs.existsSync(root)) return null
-  const versions = fs.readdirSync(root).filter((d) => !d.startsWith('.')).sort()
-  for (const v of versions.reverse()) {
-    const p = path.join(root, v, 'antigravity')
-    if (fs.existsSync(p)) return p
-  }
-  return null
-}
-
-export function resolveCodexBin(env = process.env) {
-  return env.CODEX_BIN || 'codex'
-}
-
-export function agySettingsPath(env = process.env) {
-  return env.AGY_SETTINGS || path.join(env.HOME || '', '.gemini', 'antigravity-cli', 'settings.json')
-}
-
-/**
- * 對帳：settings.json 的 `permissions.allow` 必須恰好含本檔的 regex 那一條。
- * 失效方向刻意選「擋下來」——allow 漂移的失效方向是寫手第一個指令就死、stdout 空、我以為它沒話說。
- */
-export function assertSettingsAllowRegex(settingsFile = agySettingsPath(), repoRoot = null, config = null) {
-  if (!fs.existsSync(settingsFile)) throw new Error(`agy settings 不存在：${settingsFile}`)
-  const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
-  const allow = (s.permissions && s.permissions.allow) || []
-  const wantRegex = buildSafeCommandRegex(config)
-  const want = `command(regex:${wantRegex})`
-  if (!allow.includes(want)) {
-    throw new Error(`agy settings permissions.allow 缺這條（或與 tools/agy-lib.mjs 漂移）：\n${want}`)
-  }
-  // 🔴 2026-09-13 實測：無頭模式連 trustedWorkspaces 內的 read_file 都要明確 allow，否則第一次 view_file 就整輪死。
-  //    規則的 target 是「repo 根（尾巴 /）」——worktree 在 .claude/worktrees/ 底下，被這條覆蓋。
-  if (repoRoot) {
-    const root = repoRoot.endsWith('/') ? repoRoot : repoRoot + '/'
-    const ok = allow.some((a) => {
-      const m = a.match(/^read_file\((.+)\)$/)
-      if (!m) return false
-      const t = m[1].endsWith('/') ? m[1] : m[1] + '/'
-      return root.startsWith(t) || m[1] === '*'
-    })
-    if (!ok) throw new Error(`agy settings permissions.allow 缺 read_file(${root})（無頭模式讀 worktree 檔會被拒）`)
-  }
-  return true
-}
-
 /** 子行程環境組裝：剝除 git 環境變數。 */
 export function buildSpawnEnv(env = process.env) {
   return cleanGitEnv(env)
-}
-
-/** 組裝 agy 呼叫引數。包含 --print-timeout（避免預設 5m 超時導致 partial output 零輸出）。 */
-// 🔴 1.12.0：prompt 不再放 argv（`-p <prompt>`），改走 stream-json stdin（buildAgyStdin）。
-//   理由：argv 有平台上限（Linux 單一參數 128 KiB；macOS ARG_MAX 1 MiB 含 env），archive-review.sh 2026-09-19 事故就是拿 110 KB
-//   上限擋 change 又不入帳。實測 384 KB prompt 走 stdin 成功（plan 模式）；accept-edits 下 stdin 與 -p 行為相同。
-//   `--print=`（空值）是 agy 的要求：`--print` 沒帶值會把下一個 flag 當 prompt 吃掉；spawn 不經 shell，所以是 `--print=` 不是 `--print=''`。
-//   `--disable-slash-commands`：實測 stream-json 輸入不會展開開頭的 `/plan`，加著是防禦、行為不變。
-//   陽性對照 llm-team.test.mjs「1.12.0 agy stdin」：args 不含 prompt 也不含 -p；input 解析回原文。
-export function buildAgyArgs({ model, mode, timeoutMs = 10 * 60 * 1000, extraArgs = [] }) {
-  const printTimeout = `${Math.max(1, Math.ceil(timeoutMs / 60000))}m`
-  return [
-    '--model',
-    model,
-    '--mode',
-    mode,
-    '--print-timeout',
-    printTimeout,
-    '--output-format',
-    'stream-json',
-    '--input-format',
-    'stream-json',
-    '--disable-slash-commands',
-    ...extraArgs,
-    '--print=',
-  ]
-}
-
-/** stream-json stdin 的唯一一行：{"event":"user","message":{"role":"user","content":<prompt>}}＋換行。JSON.stringify 編碼換行、引號、反斜線。 */
-export function buildAgyStdin(prompt) {
-  return JSON.stringify({ event: 'user', message: { role: 'user', content: String(prompt) } }) + '\n'
 }
 
 /**
@@ -833,201 +836,6 @@ export function spawnTimedOut(res) {
   const r = res || {}
   return r.timedOut === true || Boolean(r.error && r.error.code === 'ETIMEDOUT')
 }
-
-/** 解析 runAgy 或 runAgyAsync 之 spawn 結果物件。 */
-export function parseAgyRun(res) {
-  const r = res || {}
-  const parsed = parseStreamJson(r.stdout || '')
-  return {
-    exit: r.status,
-    signal: r.signal || null,
-    timedOut: spawnTimedOut(r),
-    stdout: r.stdout || '',
-    stderr: r.stderr || '',
-    result: parsed.result,
-    steps: parsed.steps,
-    denied: parsed.denied,
-    conversationId: parsed.conversationId,
-  }
-}
-
-/**
- * 跑一次 agy headless（同步版）。回 { exit, signal, stdout, stderr, result, steps, denied, conversationId }。
- * - `result` 是 stream-json 最後的 result 物件（沒有 ⇒ null）。
- * - `denied` 是被拒的 action 清單（`result.denied_actions` ∪ 步驟裡 permission 失敗的 tool）。
- * 🔴 stderr 一定要保留：無頭拒絕的訊息只出現在 stderr，而 exit 是 0。
- */
-export function runAgy({
-  model,
-  mode,
-  prompt,
-  cwd,
-  timeoutMs = 10 * 60 * 1000,
-  env = process.env,
-  extraArgs = [],
-  spawn = spawnSync,
-}) {
-  const bin = resolveAgyBin(env)
-  if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
-  const args = buildAgyArgs({ model, mode, timeoutMs, extraArgs })
-  const r = spawn(bin, args, {
-    cwd,
-    env: cleanGitEnv(env),
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    input: buildAgyStdin(prompt),
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  return parseAgyRun(r)
-}
-
-/**
- * 跑一次 agy headless（非同步版）。prompt 走 stdin（spawnAsync 的 opts.input：一次 end(payload)，EPIPE 記進 stderr 不炸）。
- */
-export async function runAgyAsync({
-  model,
-  mode,
-  prompt,
-  cwd,
-  timeoutMs = 10 * 60 * 1000,
-  env = process.env,
-  extraArgs = [],
-  spawn = spawnAsync,
-}) {
-  const bin = resolveAgyBin(env)
-  if (!bin) throw new Error('找不到 agy binary（cask antigravity-cli 未裝；或設 AGY_BIN）')
-  const args = buildAgyArgs({ model, mode, timeoutMs, extraArgs })
-  const r = await spawn(bin, args, {
-    cwd,
-    env: cleanGitEnv(env),
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    input: buildAgyStdin(prompt),
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  return parseAgyRun(r)
-}
-
-/**
- * agy 無頭「工具被拒」的訊息形狀（實測 2026-09-13，run_command）：
- *   `permission check failed for command "…": user denied permission to run command`
- * 判準是這兩段字，不是訊息裡有沒有 permission 這個詞——`declaring permissions: … stat …`（ENOENT）不算。
- */
-export function isDeniedToolError(message) {
-  const m = String(message || '')
-  return /permission check failed/i.test(m) || /denied permission/i.test(m)
-}
-
-/** 解析 stream-json：抽 result、工具步驟、被拒清單、conversationId。壞行不丟，記進 steps 讓人看得到。 */
-export function parseStreamJson(text) {
-  let result = null
-  const steps = []
-  const denied = []
-  let initConversationId = null
-  for (const raw of text.split('\n')) {
-    const line = raw.trim()
-    if (!line) continue
-    let d
-    try {
-      d = JSON.parse(line)
-    } catch {
-      steps.push({ unparsed: line.slice(0, 200) })
-      continue
-    }
-    if (d.event === 'init' && d.conversation_id) {
-      initConversationId = d.conversation_id
-    }
-    if (d.event === 'result' && d.result) {
-      result = d.result
-      for (const a of d.result.denied_actions || []) denied.push({ action: a.action, tool: a.display_name })
-    }
-    const su = d.step_update
-    if (su && su.tool_name && (su.state === 'DONE' || su.state === 'ERROR')) {
-      const info = su.tool_info || {}
-      const err = info.error && info.error.message
-      steps.push({ state: su.state, tool: su.tool_name, params: info.parameters || {}, error: err || null })
-      // 🔴 只認 agy 真正「被拒」的形狀（permission check failed … user denied permission）。
-      //    2026-09-15 票 coordinator-usage：ENOENT 的訊息是「declaring permissions: cortex tool view_file: … failed to read file: stat …」，
-      //    以前用 /permission/i 一咬就把它當 denied ⇒ ticket run 回 3、P5 不開 council，而寫手其實 SUCCESS、檔都寫好了
-      //    （偵測「壞了」的字串咬到「在談論壞掉」）。陽性對照 llm-team.test.mjs「ENOENT 不是被拒」。
-      if (err && isDeniedToolError(err)) denied.push({ action: 'permission', tool: su.tool_name, detail: err.slice(0, 200) })
-    }
-  }
-  const conversationId = (result && result.conversation_id) || initConversationId || null
-  return { result, steps, denied, conversationId }
-}
-
-/** 組裝 codex exec 引數（effort 來自成員的 `effort`，預設 high）。 */
-export function buildCodexArgs({ model, prompt, effort = 'high', cwd }) {
-  if (!model) throw new Error('runCodex 需要 model（來自 profile 成員的 model）')
-  return ['exec', '-m', model, '-c', `model_reasoning_effort="${effort}"`, '--sandbox', 'read-only', '-C', cwd, prompt]
-}
-
-/** 解析 runCodex 或 runCodexAsync 之 spawn 結果物件。 */
-export function parseCodexRun(res) {
-  const r = res || {}
-  return {
-    exit: r.status,
-    signal: r.signal || null,
-    timedOut: spawnTimedOut(r),
-    stdout: r.stdout || '',
-    stderr: r.stderr || '',
-  }
-}
-
-/**
- * 跑一次 codex exec（唯讀 sandbox，同步版）。
- * 🔴 stdin 一律接 /dev/null（`< /dev/null`）——否則會掛著等輸入。
- */
-export function runCodex({
-  model,
-  prompt,
-  cwd,
-  effort = 'high',
-  timeoutMs = 15 * 60 * 1000,
-  env = process.env,
-  spawn = spawnSync,
-}) {
-  const bin = resolveCodexBin(env)
-  const args = buildCodexArgs({ model, prompt, effort, cwd })
-  const r = spawn(bin, args, {
-    cwd,
-    env: cleanGitEnv(env),
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  return parseCodexRun(r)
-}
-
-/**
- * 跑一次 codex exec（唯讀 sandbox，非同步版）。
- */
-export async function runCodexAsync({
-  model,
-  prompt,
-  cwd,
-  effort = 'high',
-  timeoutMs = 15 * 60 * 1000,
-  env = process.env,
-  spawn = spawnAsync,
-}) {
-  const bin = resolveCodexBin(env)
-  const args = buildCodexArgs({ model, prompt, effort, cwd })
-  const r = await spawn(bin, args, {
-    cwd,
-    env: cleanGitEnv(env),
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  return parseCodexRun(r)
-}
-
 
 /** worktree 的 git 呼叫（剝掉 hook 環境變數，`-C` 才真的作用在那棵樹）。 */
 export function git(cwd, args) {

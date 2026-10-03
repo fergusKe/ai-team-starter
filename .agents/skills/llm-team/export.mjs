@@ -29,6 +29,17 @@ export const EXPORT_FILES = [
   // 共用流程規則 prompts 也是快照的一部分，正本在此（真源＋快照機制，各 target repo 不准手改）
   'prompts/07-ticket.md',
   'prompts/08-pr-review.md',
+  // 1.15.0：harness 介面與各 harness 模組（lib.mjs／council.mjs／write.mjs／setup.mjs／usage.mjs 都 import 它們，快照缺一個就載不起來）
+  'harnesses/_contract.mjs',
+  'harnesses/index.mjs',
+  'harnesses/agy.mjs',
+  'harnesses/codex.mjs',
+  'harnesses/gemini.mjs',
+  'harnesses/claude.mjs',
+  // 1.16.0：gemini 寫手 stream-json 真跑 fixture（harnesses.test.mjs 讀它們；快照缺了測試就紅）
+  'harnesses/__fixtures__/gemini-write-stream.ndjson',
+  'harnesses/__fixtures__/gemini-write-denied.ndjson',
+  'harnesses.test.mjs',
   'lib.mjs',
   'write.mjs',
   'council.mjs',

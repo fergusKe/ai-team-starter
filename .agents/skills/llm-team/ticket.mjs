@@ -25,12 +25,14 @@ import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
   modelsFrom,
+  writerFrom,
+  writerHarnessArgError,
+  nextWriterSeat,
   memberFileName,
   git,
   changedFiles,
   parseArgs,
   CLEAN_GIT_ENV,
-  assertSettingsAllowRegex,
   agySettingsPath,
   isDirectRun,
   readMembersJson,
@@ -40,6 +42,7 @@ import {
   writeTreeOf,
   MEASUREMENT_SCHEMA_VERSION,
 } from './lib.mjs'
+import { getHarness } from './harnesses/index.mjs'
 import { main as writeMain } from './write.mjs'
 import { main as councilMain, parseVerdicts } from './council.mjs'
 
@@ -56,12 +59,14 @@ function formatReviewerSummary(m) {
   lines.push(`[${m.name} (${m.model})] 整份: ${overall}`)
   if (m.empty) return lines
 
+  const uncitedSet = new Set(Array.isArray(m.uncited) ? m.uncited : (parseVerdicts(m.text || '').uncited || []))
   const textLines = (m.text || '').split('\n').map((l) => l.trim()).filter(Boolean)
   for (const [qn, verdict] of Object.entries(m.q || {})) {
     if (verdict === '不簽') {
       const matchLine = textLines.find((l) => l.startsWith(qn) || l.includes(qn))
       const reason = matchLine ? matchLine.slice(0, 200) : '不簽'
-      lines.push(`  - ${qn} (不簽): ${reason}`)
+      const suffix = uncitedSet.has(qn) ? '　⚠ 無引用（不納入結論，accept 用 --disposition 記 rejected）' : ''
+      lines.push(`  - ${qn} (不簽): ${reason}${suffix}`)
     }
   }
 
@@ -85,6 +90,182 @@ function appendLifecycle(outDir, entry, env = process.env) {
   const full = { ...base, ...entry }
   fs.mkdirSync(outDir, { recursive: true })
   fs.appendFileSync(lifecycleFile, JSON.stringify(full) + '\n')
+}
+
+/**
+ * 4.7.20：跑一次 `tools/product-wbs.mjs --status --json`（15s 逾時）並摘要成 `{generated_at, head_sha, counts}`；
+ * `counts` 由 `items[].status` 現場彙總（工具本身不吐 counts）。工具不存在／spawn 失敗／非 0／JSON 壞 ⇒ `{error}`，
+ * 純觀測、不擋票（run／land 呼叫端都不看這個值決定 exit code）。
+ * 陽性對照 ticket.test.mjs「--status 工具不存在 ⇒ summary.wbsStatusAtRun.error 為字串、run 仍 0」。
+ */
+export function runWbsStatus(repoRoot, deps = {}) {
+  const toolPath = path.join(repoRoot, 'tools', 'product-wbs.mjs')
+  if (!fs.existsSync(toolPath)) {
+    return { error: `tools/product-wbs.mjs 不存在：${toolPath}` }
+  }
+  const spawnFn = deps.spawn || spawnSync
+  let r
+  try {
+    r = spawnFn(process.execPath, [toolPath, '--status', '--json'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 15000,
+      maxBuffer: 16 * 1024 * 1024,
+      env: CLEAN_GIT_ENV,
+    })
+  } catch (e) {
+    return { error: `product-wbs.mjs --status 執行失敗：${e.message}` }
+  }
+  if (!r || r.error) {
+    return { error: `product-wbs.mjs --status 執行失敗：${(r && r.error && r.error.message) || String(r && r.error)}` }
+  }
+  if (r.status !== 0) {
+    return {
+      error: `product-wbs.mjs --status 回 exit ${r.status}${r.signal ? `（signal ${r.signal}）` : ''}：${((r.stderr || '') + '').slice(0, 300)}`,
+    }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(r.stdout || '')
+  } catch (e) {
+    return { error: `product-wbs.mjs --status JSON 解析失敗：${e.message}` }
+  }
+  // 4.7.20 第 3 輪 Q3：JSON.parse 對 "null"／"123"／"[...]"／'"str"' 都不會 throw，但都不是我們要的物件形狀；
+  //   不擋在這裡的話，下面 parsed.items／parsed.generated_at 對 null 取值就直接炸整個 run。防禦寫法：非
+  //   plain object（含 null、陣列）⇒ 當成失敗，純觀測不擋票，只是記不到內容。
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { error: '--status 輸出非物件' }
+  }
+  const counts = {}
+  for (const item of Array.isArray(parsed.items) ? parsed.items : []) {
+    const key = (item && typeof item === 'object' && item.status) || 'unknown'
+    counts[key] = (counts[key] || 0) + 1
+  }
+  return {
+    generated_at: parsed.generated_at ?? null,
+    head_sha: parsed.head_sha ?? null,
+    counts,
+  }
+}
+
+/** 從 dir 開始 realpath；不存在就往上找最近存在的祖先再 realpath（4.7.20 第 3 輪 Q2a）。連 filesystem root 都不存在時回 null（理論上不會發生，防禦性）。 */
+function realpathNearestExisting(dir) {
+  let d = dir
+  while (true) {
+    try {
+      return fs.realpathSync(d)
+    } catch {
+      const parent = path.dirname(d)
+      if (parent === d) return null
+      d = parent
+    }
+  }
+}
+
+/** dir 的 realpath 是否仍在 realRepoRoot 之內（相對路徑不以 '..' 開頭、也不是絕對路徑）。 */
+function isWithinRealRoot(realDir, realRepoRoot) {
+  const rel = path.relative(realRepoRoot, realDir)
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+/**
+ * 4.7.20：對每個 --allow 路徑，從其所在目錄往上找最近的 `CONTEXT.md`（不超出 repoRoot），去重（同一份只回一次）。
+ * 映射＝約定：每個程式區塊放一份 CONTEXT.md；--allow 給的是檔案（可能還沒建立）就從其 dirname 往上找，
+ * 給的是既有目錄就從該目錄往上找。回傳去重後的路徑陣列（依 --allow 出現順序）。
+ *
+ * 4.7.20 第 3 輪（Q2a，gemini 複審坐實）路徑邊界：
+ * - `--allow` 是絕對路徑 ⇒ 一律跳過（不猜它是不是「剛好」在 repo 內）。
+ * - 起始目錄（存在就用它、不存在就用最近存在的祖先）一律 `fs.realpathSync` 解析；解析後若相對 repoRoot
+ *   的路徑以 `..` 開頭或本身是絕對路徑（即跳出 repoRoot，典型形狀＝ --allow 指到一個指向 repo 外的
+ *   symlink 目錄）⇒ 整個 --allow 跳過、不注入任何東西。
+ * - 找到的 `CONTEXT.md` 本身也再 `realpath` 一次並做同樣的邊界檢查（防 CONTEXT.md 檔案自己是指向 repo
+ *   外的 symlink）；沒通過就當作沒找到，繼續（不 fallback 到上一層，就是這個候選失效）。
+ */
+export function collectContextForAllow(allowPaths, repoRoot) {
+  const repoRootAbs = path.resolve(repoRoot)
+  let realRepoRoot
+  try {
+    realRepoRoot = fs.realpathSync(repoRootAbs)
+  } catch {
+    realRepoRoot = repoRootAbs
+  }
+  const seen = new Set()
+  const results = []
+  for (const rel of Array.isArray(allowPaths) ? allowPaths : []) {
+    if (typeof rel !== 'string' || !rel || path.isAbsolute(rel)) continue
+    const abs = path.resolve(repoRootAbs, rel)
+    let startDir
+    try {
+      startDir = fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs)
+    } catch {
+      startDir = path.dirname(abs)
+    }
+    const realStartDir = realpathNearestExisting(startDir)
+    if (realStartDir === null || !isWithinRealRoot(realStartDir, realRepoRoot)) continue
+
+    let dir = realStartDir
+    let found = null
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const candidate = path.join(dir, 'CONTEXT.md')
+      if (fs.existsSync(candidate)) {
+        let realCandidate = null
+        try {
+          realCandidate = fs.realpathSync(candidate)
+        } catch {
+          realCandidate = null
+        }
+        if (realCandidate && isWithinRealRoot(realCandidate, realRepoRoot)) {
+          found = candidate
+        }
+        break
+      }
+      if (path.resolve(dir) === realRepoRoot) break
+      const parent = path.dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    if (found && !seen.has(found)) {
+      seen.add(found)
+      results.push(found)
+    }
+  }
+  return results
+}
+
+/** 找出 content 中最長一串連續反引號的長度；fence 長度取 max(3, 最長串+1)，確保 fence 不會被內容自己的反引號提早關閉（4.7.20 第 3 輪 Q2b）。 */
+function backtickFence(content) {
+  const runs = content.match(/`+/g) || []
+  const longest = runs.reduce((m, run) => Math.max(m, run.length), 0)
+  return '`'.repeat(Math.max(3, longest + 1))
+}
+
+/**
+ * 寫手最後一筆台帳的 failure（write.mjs 1.16.0 起每筆都帶統一形狀 failure；沒有／讀不到 ⇒ null）。
+ * 只讀 `<writeOutDir>/ledger.ndjson`（write.mjs 收到 --out 時的預設台帳位置）；壞行跳過，取最後一筆合法的。
+ */
+export function lastWriterFailure(writeOutDir) {
+  const file = path.join(writeOutDir, 'ledger.ndjson')
+  if (!fs.existsSync(file)) return null
+  let last = null
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const t = line.trim()
+    if (!t) continue
+    try {
+      last = JSON.parse(t)
+    } catch {
+      /* 壞行跳過 */
+    }
+  }
+  return last && last.failure && typeof last.failure === 'object' ? last.failure : null
+}
+
+/** 收貨摘要的「下一席」那一行：只在寫手 failure.kind==='quota' 且 config 還有下一席時才印；不自動重跑。 */
+export function writerQuotaHintLine(summary) {
+  const f = summary.writerFailure
+  const next = summary.writerNext
+  if (!f || f.kind !== 'quota' || !next) return null
+  return `🔴 寫手額度用盡：下一席 ${next.harness}/${next.model}，重跑加 --writer-harness ${next.harness}`
 }
 
 function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
@@ -118,6 +299,9 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
       )
     }
   }
+  // 1.16.0 寫手鏈：額度用盡只【提示】下一席（統整者自己決定要不要重跑；council 09-22 第 4 題：fallback 不自動）。
+  const quotaHint = writerQuotaHintLine(summary)
+  if (quotaHint) lines.push(quotaHint)
 
   if (summary.tierEscalatedBy && summary.tierEscalatedBy.length > 0) {
     lines.push(`tierEscalatedBy: ${summary.tierEscalatedBy.join(', ')}`)
@@ -391,7 +575,7 @@ export async function main(argv, deps = {}) {
       return 2
     }
     const RUN_USAGE =
-      '用法：run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" [--tier standard|block] [--base main] [--review-only] [--write-timeout-ms <ms>]'
+      '用法：run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" (--wbs <id[,id...]>|--wbs-exempt "<理由>") [--tier standard|block] [--base main] [--review-only] [--write-timeout-ms <ms>] [--writer-harness <name>]'
     if (!a.name || !a.brief || !a.branch || !a.allow || a.allow.length === 0 || !a.test) {
       console.error(RUN_USAGE)
       return 2
@@ -403,7 +587,24 @@ export async function main(argv, deps = {}) {
       return 2
     }
 
-    const writeTimeoutRaw = a['write-timeout-ms'] !== undefined ? a['write-timeout-ms'] : (config.writer && config.writer.timeoutMs)
+    // 🔴 1.16.0 寫手鏈：一次只跑一席。`--writer-harness <name>`（或 env LLM_TEAM_WRITER_HARNESS）選 config.writer 陣列裡的席，
+    //    預設第 0 席；不在 config ⇒ exit 2 列出可用席。timeoutMs 也是選中那席的。
+    //    裸旗標（parseArgs 得 true）／空字串 ⇒ 拒絕、不准靜默落第 0 席（r3 sol Q2）。
+    const harnessArgErr = writerHarnessArgError(a['writer-harness'], config)
+    if (harnessArgErr) {
+      console.error(`🔴 ${harnessArgErr}`)
+      return 2
+    }
+    const writerHarnessArg = a['writer-harness']
+    let writer
+    try {
+      writer = writerFrom(config, env, { harness: writerHarnessArg })
+    } catch (e) {
+      console.error(`🔴 ${e.message}`)
+      return 2
+    }
+
+    const writeTimeoutRaw = a['write-timeout-ms'] !== undefined ? a['write-timeout-ms'] : writer.timeoutMs
     let writeTimeoutMs = null
     if (writeTimeoutRaw !== undefined) {
       let n = NaN
@@ -493,15 +694,74 @@ export async function main(argv, deps = {}) {
       tierEscalatedBy = matchedRiskDomains
     }
 
-    // G2 settings 對帳（搬到 worktree add 之前，避免漂移造成 worktree 殘留）
-    // 🔴 2026-09-13 H6 複審坐實：曾寫成「注入 writeMain ⇒ 跳過 G2」，把測試捷徑當契約；G2 只能由 deps.assertSettings 覆寫。陽性對照 ticket.test.mjs「T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（assertSettings 拋錯 ⇒ run 回 2 且未建 worktree）」
-    const checkSettings = deps.assertSettings || assertSettingsAllowRegex
+    // G2 寫手 harness 的 preflight（搬到 worktree add 之前，避免漂移造成 worktree 殘留）
+    // 🔴 2026-09-13 H6 複審坐實：曾寫成「注入 writeMain ⇒ 跳過 G2」，把測試捷徑當契約；G2 只能由 deps 覆寫。陽性對照 ticket.test.mjs「T37 G2 對帳：deps 注入 writeMain 時仍受 G2 約束（assertSettings 拋錯 ⇒ run 回 2 且未建 worktree）」
+    // 🔴 1.16.0：改走 registry 的 `getHarness(writer.harness).preflight(env, config, { repoRoot, role: 'write' })`——不認 harness 名字
+    //    （agy ＝ settings.json 對帳；gemini ＝ 驗 policy TOML 產得出來，這裡不給 outDir 所以不落地，落地在 write.mjs G2 的 outDir——
+    //    不進 worktree，changed 不需要特例；陽性對照 ticket.test.mjs T96/T97）。
+    //    任一條 !ok 或 throw ⇒ exit 2。`deps.assertSettings` 相容保留：有注入就當它是這一席 preflight 的實作（舊簽名 (settingsFile, repoRoot, config)）。
+    const getHarnessFn = deps.getHarness || getHarness
+    const runPreflight = deps.assertSettings
+      ? () => deps.assertSettings(agySettingsPath(env), repoRoot, config)
+      : () => {
+          const h = getHarnessFn(writer.harness)
+          const checks = h.preflight ? h.preflight(env, config, { repoRoot, role: 'write' }) : []
+          const bad = checks.find((c) => !c.ok)
+          if (bad) throw new Error(bad.message || `${bad.label} 不通過`)
+        }
     try {
-      checkSettings(agySettingsPath(env), repoRoot, config)
+      runPreflight()
     } catch (e) {
       console.error(`🔴 G2：${e.message}`)
       return 2
     }
+
+    // 🔴 4.7.20（2026-09-28 業主核准）：開票必填 WBS 對照——`--wbs <id[,id...]>` 或 `--wbs-exempt "<理由>"` 至少擇一；
+    //   兩者都沒給 ⇒ 拒開；exempt 理由必填非空；`--wbs` 的每個 ID 須符合 `^\d+(\.\d+)*[a-z]?$`。
+    //   陽性對照 ticket.test.mjs「缺 --wbs 且無 exempt ⇒ run 回 2」「exempt 理由空 ⇒ run 回 2」「非法 ID ⇒ run 回 2」。
+    const wbsProvided = a.wbs !== undefined
+    const wbsExemptProvided = a['wbs-exempt'] !== undefined
+    if (!wbsProvided && !wbsExemptProvided) {
+      console.error(
+        '🔴 開票必填 --wbs <id[,id...]> 或 --wbs-exempt "<理由>"：前者填本票對應的 WBS ID（逗號分隔可多個），後者給不屬任何 WBS 的票（如守門修補）用，理由必填非空'
+      )
+      return 2
+    }
+    // 🔴 4.7.20 第 2 輪（2026-09-28）：--wbs 與 --wbs-exempt 語意互斥（有 WBS 對照 vs. 明確豁免），同時給代表統整者
+    //   自己也搞不清這張票算哪一種 ⇒ 不猜、直接拒開。陽性對照 ticket.test.mjs「同時給 --wbs 與 --wbs-exempt ⇒ run 回 2」。
+    if (wbsProvided && wbsExemptProvided) {
+      console.error('🔴 --wbs 與 --wbs-exempt 擇一：不可同時給，本票要嘛有 WBS 對照、要嘛明確豁免')
+      return 2
+    }
+    let wbsIds = []
+    let wbsExempt = null
+    if (wbsProvided) {
+      const wbsRaw = typeof a.wbs === 'string' ? a.wbs : ''
+      wbsIds = wbsRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+      if (wbsIds.length === 0) {
+        console.error('🔴 --wbs 不可為空；至少給一個 WBS ID（或改用 --wbs-exempt）')
+        return 2
+      }
+      const WBS_ID_RE = /^\d+(\.\d+)*[a-z]?$/
+      const invalidWbsIds = wbsIds.filter((id) => !WBS_ID_RE.test(id))
+      if (invalidWbsIds.length > 0) {
+        console.error(`🔴 --wbs 含不合法的 WBS ID（格式須為 數字(.數字)*字母?，例 1.13.2）：${invalidWbsIds.join(', ')}`)
+        return 2
+      }
+    } else {
+      const wbsExemptRaw = typeof a['wbs-exempt'] === 'string' ? a['wbs-exempt'].trim() : ''
+      if (!wbsExemptRaw) {
+        console.error('🔴 --wbs-exempt 理由必填非空')
+        return 2
+      }
+      wbsExempt = wbsExemptRaw
+    }
+
+    // 🔴 4.7.20：run 開始跑一次 `tools/product-wbs.mjs --status --json`（觀測，不擋票；工具不存在／失敗 ⇒ 記 error）。
+    const wbsStatusAtRun = (deps.runWbsStatus || runWbsStatus)(repoRoot, deps)
 
     const startedAt = new Date().toISOString()
     const worktreeRoot = config.worktreeRoot || '.claude/worktrees'
@@ -556,6 +816,42 @@ export async function main(argv, deps = {}) {
     fs.mkdirSync(outDir, { recursive: true })
     fs.writeFileSync(path.join(outDir, 'brief.md'), briefContent)
 
+    // 🔴 4.7.20：CONTEXT.md 注入——對每個 --allow 路徑，往上找最近的 CONTEXT.md（不超出 repoRoot），去重；
+    //   附到送寫手／複審的 brief 尾端。順序限制：必須在 riskDomains 比對與 preflightBriefCommands（都在上面、只看原始
+    //   briefContent）**之後**才拼接，注入內容才不會誤觸兩者。找不到任何 CONTEXT.md ⇒ 不附加、effectiveBriefContent＝原文。
+    //   陽性對照 ticket.test.mjs「CONTEXT.md 含『金流』『權限』字樣不因注入而升級 tier」「CONTEXT.md 含 pnpm --filter 不觸發 preflight 失敗」。
+    const contextFiles = (deps.collectContextForAllow || collectContextForAllow)(a.allow, repoRoot)
+    let effectiveBriefContent = briefContent
+    if (contextFiles.length > 0) {
+      // 4.7.20 第 3 輪 Q2b：每份 CONTEXT.md 內容包在 fenced code block 內（並標檔案相對路徑），避免其內文的
+      //   Markdown 語法（標題、既有 fence）跟外層 brief 的結構混在一起；fence 長度依內容自動加長，
+      //   內容含 ` ``` ` 時改用更長的 fence（見 backtickFence），段首標題字串不變。
+      // relDir 標籤用 realpath 過的 repoRoot 當基準（collectContextForAllow 回的 f 也是 realpath 過的）：
+      //   macOS `/var` -> `/private/var` 這類 symlink 會讓「原始 repoRoot」與「realpath 過的 f」前綴不一致，
+      //   兩邊基準沒對齊時 path.relative 會算出一長串 `../` 而不是乾淨的 areaA 這種相對路徑。
+      let realRepoRootForLabel = repoRoot
+      try {
+        realRepoRootForLabel = fs.realpathSync(repoRoot)
+      } catch {
+        /* repoRoot 讀不到 realpath 時退回原始值，僅影響標籤顯示 */
+      }
+      const blocks = contextFiles
+        .map((f) => {
+          const relDir = path.relative(realRepoRootForLabel, path.dirname(f)) || '.'
+          const raw = fs.readFileSync(f, 'utf8').trim()
+          const fence = backtickFence(raw)
+          return `### ${relDir}/CONTEXT.md\n\n${fence}text\n${raw}\n${fence}`
+        })
+        .join('\n\n---\n\n')
+      effectiveBriefContent =
+        briefContent +
+        '\n\n---\n\n【區塊環境說明（自動附加；③驗收指令為統整者 --test 用，非寫手白名單，寫手不准跑）】\n\n' +
+        blocks +
+        '\n'
+    }
+    const effectiveBriefPath = path.join(outDir, 'brief.effective.md')
+    fs.writeFileSync(effectiveBriefPath, effectiveBriefContent)
+
     let runStartCount = 0
     const lifecycleFile = path.join(outDir, 'lifecycle.ndjson')
     if (fs.existsSync(lifecycleFile)) {
@@ -576,7 +872,18 @@ export async function main(argv, deps = {}) {
     const run = runStartCount + 1
     const writeOutDir = path.join(outDir, 'write', 'run-' + run)
 
-    appendLifecycle(outDir, { event: 'run-start', ticket: a.name, run, ...(reviewOnly ? { reviewOnly: true } : {}) }, env)
+    appendLifecycle(
+      outDir,
+      {
+        event: 'run-start',
+        ticket: a.name,
+        run,
+        wbsIds,
+        ...(wbsExempt ? { wbsExempt } : {}),
+        ...(reviewOnly ? { reviewOnly: true } : {}),
+      },
+      env
+    )
 
     // b. 呼叫 write.main
     let writeExit = null
@@ -592,7 +899,7 @@ export async function main(argv, deps = {}) {
         '--worktree',
         worktree,
         '--brief',
-        briefPath,
+        effectiveBriefPath,
         ...a.allow.flatMap((al) => ['--allow', al]),
         '--out',
         writeOutDir,
@@ -601,10 +908,11 @@ export async function main(argv, deps = {}) {
       ]
       if (writeTimeoutMs !== null) writeArgs.push('--timeout-ms', String(writeTimeoutMs))
       if (a.model) writeArgs.push('--model', a.model)
+      if (writerHarnessArg) writeArgs.push('--writer-harness', writerHarnessArg)
       if (configFile) writeArgs.push('--config', configFile)
 
       writeExit = writeMainFn(writeArgs, deps)
-      appendLifecycle(outDir, { event: 'writer-done', ticket: a.name, writeExit }, env)
+      appendLifecycle(outDir, { event: 'writer-done', ticket: a.name, writeExit, writerHarness: writer.harness }, env)
 
       // 🔴 P5：write 非 0（含 2＝守門擋下、3＝被拒／越界／逾時）⇒ 不跑 --test、不開 council；以前 exit 3 落到 changed.length > 0 就拿半成品去複審。
       //    陽性對照 ticket.test.mjs「P5 writeMain 回 3 且有改檔 ⇒ councilMain 假函式沒被呼叫、runTest 沒被呼叫、summary.review === null」；
@@ -678,7 +986,7 @@ export async function main(argv, deps = {}) {
         '--round-start',
         reviewOnly ? mergeBase : roundStartSha,
         '--brief',
-        path.resolve(a.brief),
+        effectiveBriefPath,
         '--out',
         reviewOutDir,
         '--tier',
@@ -720,6 +1028,7 @@ export async function main(argv, deps = {}) {
           const v = parseVerdicts(text)
           const empty = m.empty === true || m.timedOut === true || !text.trim()
           if (empty) anyEmpty = true
+          const uncited = Array.isArray(m.uncited) ? m.uncited : (v.uncited || [])
           reviewMembers.push({
             name: m.name,
             harness: m.harness,
@@ -727,6 +1036,7 @@ export async function main(argv, deps = {}) {
             quotaBucket: m.quotaBucket,
             overall: m.overall !== undefined ? m.overall : v.overall,
             q: m.q && typeof m.q === 'object' ? m.q : v.q,
+            uncited,
             empty,
             timedOut: m.timedOut === true,
             text,
@@ -742,6 +1052,11 @@ export async function main(argv, deps = {}) {
       appendLifecycle(outDir, { event: 'review-done', ticket: a.name, anyEmpty, rosterMismatch }, env)
     }
 
+    // 1.16.0 寫手鏈：寫手最終 failure（write.mjs 台帳最後一筆）＋ config 的下一席。只在 write 非 0 時看；提示由收貨摘要印，這裡不重跑。
+    //    陽性對照 ticket.test.mjs「T90 假寫手台帳 failure quota ⇒ 摘要含「下一席 gemini」；非 quota ⇒ 不含」。
+    const writerFailure = !reviewOnly && writeExit !== 0 ? lastWriterFailure(writeOutDir) : null
+    const writerNext = writerFailure && writerFailure.kind === 'quota' ? nextWriterSeat(config, writer.harness) : null
+
     // 計算 rounds
     let rounds = 1
     if (fs.existsSync(writeOutDir)) {
@@ -756,7 +1071,7 @@ export async function main(argv, deps = {}) {
     if (doReview) {
       reviewObj = {
         tier,
-        members: reviewMembers.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut })),
+        members: reviewMembers.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut, uncited }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut, uncited })),
         anyEmpty,
         membersSource: 'review/members.json',
         reviewedTree: writeTreeOfFn(worktree),
@@ -789,9 +1104,16 @@ export async function main(argv, deps = {}) {
       targetTipSha,
       coordinator: coordinatorProfile,
       reviewers: expectedReviewers,
+      wbsIds,
+      ...(wbsExempt ? { wbsExempt } : {}),
+      wbsStatusAtRun,
       reviewOnly,
       writeExit,
       writeTimedOut,
+      // 1.16.0：實際跑的寫手席＋最終 failure＋（只在 quota 時）下一席；不自動重跑。
+      writer: { harness: writer.harness, model: a.model || writer.model, quotaBucket: writer.quotaBucket },
+      writerFailure,
+      writerNext: writerNext ? { harness: writerNext.harness, model: writerNext.model } : null,
       rounds,
       changed,
       verifyExit,
@@ -996,6 +1318,17 @@ export async function main(argv, deps = {}) {
     const summary = gate.summary
     const summaryChanged = gate.summaryChanged
 
+    // 🔴 4.7.20：land 前跑一次 `tools/product-wbs.mjs --status --json`（觀測，不擋票）並寫回 summary.json（wbsStatusAtLand）。
+    const wbsStatusAtLand = (deps.runWbsStatus || runWbsStatus)(repoRoot, deps)
+    try {
+      const disk = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+      disk.wbsStatusAtLand = wbsStatusAtLand
+      fs.writeFileSync(summaryPath, JSON.stringify(disk, null, 2))
+    } catch (e) {
+      console.error(`⚠️ 寫入 wbsStatusAtLand 失敗（不擋票）：${e.message}`)
+    }
+    summary.wbsStatusAtLand = wbsStatusAtLand
+
     const nowTree = writeTreeOfFn(worktree)
     if (nowTree !== summary.review.reviewedTree) {
       console.error(`🔴 複審後工作樹又變了（reviewed: ${summary.review.reviewedTree}, now: ${nowTree}）；重跑 ticket.mjs run 重新複審`)
@@ -1142,6 +1475,8 @@ export async function main(argv, deps = {}) {
       ticket: a.name,
       branch: summary.branch,
       sha: newMainSha,
+      wbsIds: Array.isArray(summary.wbsIds) ? summary.wbsIds : [],
+      ...(summary.wbsExempt ? { wbsExempt: summary.wbsExempt } : {}),
       ...(landedAfterRebase ? { landedAfterRebase } : {}),
     }
     appendLifecycle(outDir, landedEntry, env)

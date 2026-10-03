@@ -1810,3 +1810,25 @@ GuildHub 遷〈跨項依賴〉時，第一版把舊表**原地**改成四欄、�
 
 **怎麼驗**：`test-scenario-coverage.sh` 15 → 22；`check-scenario-coverage.sh` 換回修改前，新加的 7 條紅；突變 6 刀全紅。GuildHub 真實 vitest 報告（1563 條）上反方向是 0 個——74 個進行中 change 的 ID 正確排除。`03` 那行 awk 原文照抄在 GuildHub 現況規格上跑，列出 205 條（跟 Python 算的一致）。`config.yaml` 用 YAML parser 讀過。
 
+
+## 2026-10-03　複審的獨立性改靠隔離上下文，模型只是設定值（llm-team 1.22.0）
+
+使用者丟了 cloudflare/security-audit-skill 問能不能加進系統。先在 GuildHub 照它的流程試跑一次（quick、只讀原始碼、11 次 agent）：0 筆確認、2 筆待驗證（`resume_token` 就是公開的 profile id；換房間密碼後舊的入場許可不失效），最終評審另外抓到三個狩獵者互相寫「交給別人」、實際沒人查的兩個範圍。工具本身**不加進模板**（它查產品、不查開發流程；模板凍結不加新關卡）。但使用者看完它怎麼做「找的人跟驗的人分開」後定案：
+
+> 他們「隔離上下文」也很適合我們使用／我們應該是採用這個模式／要使用哪個模型其實都可以／這樣就不會像我們現在被限定在要呼叫不同模型
+> 像你說的有一樣結果／可是他的結構漂亮多了
+
+**改了什麼**（真源 fergus-claude-config `00eb765`，快照 1.12.0 → 1.22.0）：
+- **撤兩條不變式**：「統整者與複審者／裁決者不同 quotaBucket」、「`claude` 只准當 coordinator」。保留「統整者本人不在名單」。這兩條讓複審綁死在別家額度上——codex／Gemini 一用完，複審就停擺。
+- **`claude` 有了 review 介面**：`claude -p` 無頭、JSON 輸出、prompt 走 stdin、`--no-session-persistence`、`--setting-sources project`（不載使用者層 settings，使用者層的 hook 不會在複審者身上跑）、唯讀工具 `Read,Grep,Glob`、`dontAsk`。
+- **複審 prompt 第二行帶「推翻句」**：你沒寫、看不到統整者怎麼想，任務是設法推翻，推翻不了才簽。
+- **預設名單**：`claude` profile 一般票複審 `claude/claude-opus-5-5`；block 級 `claude/claude-opus-5-5`＋`codex/gpt-5.6-sol`。要跨廠商就在 config 放別家成員——仍然准。
+- **分工審查要有最後一位評審**（寫在 SKILL〈隔離上下文複審〉第 5 點）：多位審查者各看一塊時，最後派一位全新的覆蓋率評審，只問「哪一塊沒人負責」。council 每位都看整份 diff，不需要這步。
+
+**代價（照記）**：同模型的盲點相關，隔離上下文去不掉。補法是引用必填、允許「待驗證」、需要時加一位別家成員。
+
+**快照一次跳 10 版的說明**：模板與 GuildHub 的快照停在 1.12.0，真源中間的 1.13–1.21（harness registry、gemini CLI 複審／寫手鏈、事後審 `postReviewers` 等）一直沒匯出到這兩個 repo。這次一起帶過來；快照 `test.sh` 全綠、`setup --sync-check` 漂移 0。
+
+**怎麼驗**：真源 `test.sh` 全綠（harnesses 109、llm-team 223）；7 個突變全殺（拿掉推翻句、拿掉 `--setting-sources`、prompt 不走 stdin、正文裡的「429」誤判成額度、`canReview` 翻回 false、拿掉「統整者本人」檢查、加回同桶檢查）。真跑 `claude-sonnet-5-5` 當複審者審一個埋了 `catch { return true }` 的 diff：整份不簽，Q2 自己推出反例 `canEdit({id:'stranger'},{ownerId:'owner'})` ⇒ `true`。
+
+**GuildHub 拿法**：跑 `node ~/.claude/skills/llm-team/export.mjs --to <GuildHub 根>`（不要 `--all`，它會碰 web-agency-system），再把自己 `llm-team.config.json` 的 `claude` profile 名單照上面改；本節逐字搬。

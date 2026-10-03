@@ -107,6 +107,7 @@ node .agents/skills/llm-team/ticket.mjs publish \
 
 ## 三、「不簽」的處理原則
 
+- **finding 要有引用**（1.13.0）：複審者每個不簽／finding 要附 diff 的 `檔:行` 或 receipt；收貨摘要標 `⚠ 無引用` 的題，統整者不納入結論，`accept --disposition MEMBER:QN=rejected:"無引用"` 記處置即可。這是輸出格式的要求，不是新守門；Q6 不受影響。
 - **複審者可能看錯**：複審者沒有對話脈絡，只看到 diff 與 brief。其質疑的前提可能是錯的（例如將既有行為誤判為新 bug）。
 - **統整者必須開檔坐實**：
   - **若坐實確有瑕疵**：不要在原地打補丁；開一張新的修正票，新 brief 明白寫上「統整者已確認」的事實與改動範圍，再交由寫手執行。

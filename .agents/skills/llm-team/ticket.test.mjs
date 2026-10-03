@@ -24,6 +24,14 @@ function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
+// 🔴 T6/T12（下面）測的是「假設定檔裡的 token 絕不能出現在 stdout/stderr」——這裡故意
+// 用陣列 join 拼出來，不寫成連續字面量：本檔是 tracked 檔，會被
+// tools/secret-scan.mjs 的 --self-check 掃到，寫成連續字面量時這支測試檔自己被
+// assignment-generic 規則命中過一次（2026-09-27 校準時發現，不是真的 secret，
+// 但字面量長度剛好落在規則的偵測門檻裡）。拼接後的值刻意保持夠長（≥16 碼），
+// 語意上仍是一個「看起來像 token」的字串，才測得出「絕不洩漏」這件事本身。
+const FAKE_SETTINGS_TOKEN = ['fixture', 'tok', 'never', 'leak', '0000'].join('-')
+
 // ─────────────────── schema v2 測試 fixture（與 llm-team.test.mjs 的 v2Config 同形；測試檔不能互相 import） ───────────────────
 // 統整者預設走 env LLM_TEAM_COORDINATOR=claude（等同 `--coordinator claude`）；要驗「缺 --coordinator」的測試自己給 deps.env = {}。
 const M = {
@@ -110,7 +118,7 @@ function fakeCouncilOut(reviewOutDir, files, opts = {}) {
       if (!m) throw new Error(`fakeCouncilOut：未知成員檔名 ${file}`)
       const text = files[file]
       const v = parseVerdicts(text)
-      return { ...m, overall: v.overall, q: v.q, empty: !text.trim(), timedOut: false, invalid: Boolean(text.trim()) && v.overall === null, exit: 0, signal: null, ms: 1 }
+      return { ...m, overall: v.overall, q: v.q, uncited: v.uncited || [], empty: !text.trim(), timedOut: false, invalid: Boolean(text.trim()) && v.overall === null, exit: 0, signal: null, ms: 1 }
     })
   fs.writeFileSync(path.join(reviewOutDir, 'members.json'), JSON.stringify(members, null, 2))
   return members
@@ -172,7 +180,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't1',
           '--brief',
@@ -228,7 +236,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't2',
           '--brief',
@@ -280,7 +288,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code
     try {
       code = await ticketMain(
-        ['run', '--name', 'q2', '--brief', briefFile, '--branch', 'feat/q2', '--allow', 'a.txt', '--test', 'true'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'q2', '--brief', briefFile, '--branch', 'feat/q2', '--allow', 'a.txt', '--test', 'true'],
         deps
       )
     } finally {
@@ -346,7 +354,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't3',
           '--brief',
@@ -401,7 +409,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't4',
           '--brief',
@@ -678,7 +686,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't9',
           '--brief',
@@ -741,7 +749,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't10',
           '--brief',
@@ -801,7 +809,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code1 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't11-escalate',
           '--brief',
@@ -861,7 +869,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code2 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't11-standard',
           '--brief',
@@ -914,7 +922,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't17',
           '--brief',
@@ -958,7 +966,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't18',
           '--brief',
@@ -1000,7 +1008,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't19',
           '--brief',
@@ -1055,7 +1063,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't20',
           '--brief',
@@ -1108,7 +1116,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't21',
           '--brief',
@@ -1469,7 +1477,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't27',
           '--brief',
@@ -1581,7 +1589,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't29',
           '--brief',
@@ -1915,7 +1923,7 @@ describe('ticket.mjs 票流程測試', () => {
       console.log = (m) => outs.push(String(m))
       let code
       try {
-        code = await ticketMain(['run', '--name', name, '--brief', briefFile, '--branch', `feat/${name}`, '--allow', 'a.txt', '--test', 'true'], deps)
+        code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', name, '--brief', briefFile, '--branch', `feat/${name}`, '--allow', 'a.txt', '--test', 'true'], deps)
       } finally {
         console.log = origLog
       }
@@ -1958,7 +1966,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = () => {}
     let code
     try {
-      code = await ticketMain(['run', '--name', 'q5ok', '--brief', briefFile, '--branch', 'feat/q5ok', '--allow', 'a.txt', '--test', 'true'], deps)
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'q5ok', '--brief', briefFile, '--branch', 'feat/q5ok', '--allow', 'a.txt', '--test', 'true'], deps)
     } finally {
       console.log = origLog
     }
@@ -2151,12 +2159,12 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       // feat/x 應該被擋
       codeFail = await ticketMain(
-        ['run', '--name', 't34-1', '--brief', briefFile, '--branch', 'feat/x', '--allow', 'a.txt', '--test', 'true'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't34-1', '--brief', briefFile, '--branch', 'feat/x', '--allow', 'a.txt', '--test', 'true'],
         deps1
       )
       // agy/x 應該放行
       codePass = await ticketMain(
-        ['run', '--name', 't34-2', '--brief', briefFile, '--branch', 'agy/x', '--allow', 'a.txt', '--test', 'true'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't34-2', '--brief', briefFile, '--branch', 'agy/x', '--allow', 'a.txt', '--test', 'true'],
         deps1
       )
     } finally {
@@ -2177,7 +2185,7 @@ describe('ticket.mjs 票流程測試', () => {
       runTest: () => ({ exit: 0, out: 'ok' }),
     }
     const codeAny = await ticketMain(
-      ['run', '--name', 't34-3', '--brief', briefFile, '--branch', 'custom-branch-without-prefix', '--allow', 'a.txt', '--test', 'true'],
+      ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't34-3', '--brief', briefFile, '--branch', 'custom-branch-without-prefix', '--allow', 'a.txt', '--test', 'true'],
       deps2
     )
     assert.equal(codeAny, 0, 'branchPrefixes 為空陣列時任何名字都應通過')
@@ -2197,7 +2205,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeFail = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't35-early-fail',
           '--brief',
@@ -2241,7 +2249,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const codeWriteFail = await ticketMain(
       [
-        'run',
+        'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
         '--name',
         't35-after-write',
         '--brief',
@@ -2280,7 +2288,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeWrite2Changed = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't35-write2-changed',
           '--brief',
@@ -2335,7 +2343,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       runCode1 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't36-all',
           '--brief',
@@ -2422,7 +2430,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       runCode2 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't36-block',
           '--brief',
@@ -2481,7 +2489,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code
     try {
       code = await ticketMain(
-        ['run', '--name', 'p5', '--brief', briefFile, '--branch', 'feat/p5', '--allow', 'half.txt', '--test', 'true'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'p5', '--brief', briefFile, '--branch', 'feat/p5', '--allow', 'half.txt', '--test', 'true'],
         deps
       )
     } finally {
@@ -2522,7 +2530,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code2
     try {
       code2 = await ticketMain(
-        ['run', '--name', 'p5b', '--brief', briefFile, '--branch', 'feat/p5b', '--allow', 'half.txt', '--test', 'true'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'p5b', '--brief', briefFile, '--branch', 'feat/p5b', '--allow', 'half.txt', '--test', 'true'],
         deps2
       )
     } finally {
@@ -2556,7 +2564,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = await ticketMain(['run', '--name', 'p5t', '--brief', briefFile, '--branch', 'feat/p5t', '--allow', 'x.txt', '--test', 'true'], deps)
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'p5t', '--brief', briefFile, '--branch', 'feat/p5t', '--allow', 'x.txt', '--test', 'true'], deps)
     } finally {
       console.log = origLog
     }
@@ -2588,7 +2596,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.error = (m) => errs.push(String(m))
     let code
     try {
-      code = await ticketMain(['run', '--name', 'c0', '--brief', briefFile, '--branch', 'feat/c0', '--allow', 'x.txt', '--test', 'true'], deps)
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'c0', '--brief', briefFile, '--branch', 'feat/c0', '--allow', 'x.txt', '--test', 'true'], deps)
     } finally {
       console.error = origErr
     }
@@ -2617,7 +2625,7 @@ describe('ticket.mjs 票流程測試', () => {
     console.log = () => {}
     let code2
     try {
-      code2 = await ticketMain(['run', '--coordinator', 'agy', '--name', 'c1', '--brief', briefFile, '--branch', 'feat/c1', '--allow', 'x.txt', '--test', 'true'], deps2)
+      code2 = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--coordinator', 'agy', '--name', 'c1', '--brief', briefFile, '--branch', 'feat/c1', '--allow', 'x.txt', '--test', 'true'], deps2)
     } finally {
       console.log = origLog
     }
@@ -2736,7 +2744,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't37',
           '--brief',
@@ -2808,7 +2816,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't37b',
           '--brief',
@@ -2853,7 +2861,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't38',
           '--brief', briefFile,
           '--branch', 'feat/t38',
@@ -2878,7 +2886,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codePass = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't38',
           '--brief', briefFile,
           '--branch', 'feat/t38',
@@ -2930,7 +2938,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't39',
           '--brief', briefFile,
           '--branch', 'feat/t39--slice',
@@ -2975,7 +2983,7 @@ describe('ticket.mjs 票流程測試', () => {
       async () => {
         await ticketMain(
           [
-            'run',
+            'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
             '--name', 't40',
             '--brief', briefFile,
             '--branch', 'feat/t40',
@@ -3026,7 +3034,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const retCode2 = await runCli(
       [
-        'run',
+        'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
         '--name', 't41',
         '--brief', briefFile,
         '--branch', 'feat/t41',
@@ -4078,7 +4086,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't65',
           '--brief',
@@ -4137,7 +4145,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't66',
           '--brief',
@@ -4183,7 +4191,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't66b',
           '--brief',
@@ -4255,7 +4263,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       runCode = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't67',
           '--brief',
@@ -4369,7 +4377,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       runCode = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't68',
           '--brief',
@@ -4614,7 +4622,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't69',
           '--brief',
@@ -4699,7 +4707,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeA = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't70a',
           '--brief',
@@ -4765,7 +4773,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeB = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't70b',
           '--brief',
@@ -4828,7 +4836,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't71',
           '--brief',
@@ -4891,7 +4899,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't72',
           '--brief',
@@ -4972,7 +4980,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't73',
           '--brief',
@@ -5127,7 +5135,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code1
     try {
       code1 = await ticketMain(
-        ['run', '--name', 't75', '--brief', briefFile, '--branch', 'feat/t75', '--allow', 'a.txt', '--test', 'node --test'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't75', '--brief', briefFile, '--branch', 'feat/t75', '--allow', 'a.txt', '--test', 'node --test'],
         deps1
       )
     } finally {
@@ -5167,7 +5175,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code2
     try {
       code2 = await ticketMain(
-        ['run', '--name', 't75', '--brief', briefFile, '--branch', 'feat/t75', '--allow', 'a.txt', '--test', 'node --test'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't75', '--brief', briefFile, '--branch', 'feat/t75', '--allow', 'a.txt', '--test', 'node --test'],
         deps2
       )
     } finally {
@@ -5251,7 +5259,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code
     try {
       code = await ticketMain(
-        ['run', '--name', 't76', '--brief', briefFile, '--branch', 'feat/t76', '--allow', 'a.txt', '--test', 'node --test'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't76', '--brief', briefFile, '--branch', 'feat/t76', '--allow', 'a.txt', '--test', 'node --test'],
         deps
       )
     } finally {
@@ -5318,7 +5326,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code1
     try {
       code1 = await ticketMain(
-        ['run', '--name', 't77', '--brief', briefFile, '--branch', 'feat/t77', '--allow', 'a.txt', '--test', 'node --test'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't77', '--brief', briefFile, '--branch', 'feat/t77', '--allow', 'a.txt', '--test', 'node --test'],
         deps1
       )
     } finally {
@@ -5350,7 +5358,7 @@ describe('ticket.mjs 票流程測試', () => {
     let code2
     try {
       code2 = await ticketMain(
-        ['run', '--name', 't77', '--brief', briefFile, '--branch', 'feat/t77', '--allow', 'a.txt', '--test', 'node --test', '--review-only'],
+        ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't77', '--brief', briefFile, '--branch', 'feat/t77', '--allow', 'a.txt', '--test', 'node --test', '--review-only'],
         deps2
       )
     } finally {
@@ -5422,7 +5430,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't78',
           '--brief',
@@ -5530,7 +5538,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeRO = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't78-ro',
           '--brief',
@@ -5582,7 +5590,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       codeStd = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't78-std',
           '--brief',
@@ -5642,7 +5650,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't80',
           '--brief', briefFile,
           '--branch', 'feat/t80',
@@ -5702,7 +5710,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code1 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't81-cfg',
           '--brief', briefFile,
           '--branch', 'feat/t81-cfg',
@@ -5753,7 +5761,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code2 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't81-override',
           '--brief', briefFile,
           '--branch', 'feat/t81-override',
@@ -5812,7 +5820,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name', 't82',
           '--brief', briefFile,
           '--branch', 'feat/t82',
@@ -5867,7 +5875,7 @@ describe('ticket.mjs 票流程測試', () => {
       try {
         code = await ticketMain(
           [
-            'run',
+            'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
             '--name', 't83-cli',
             '--brief', briefFile,
             '--branch', 'feat/t83-cli',
@@ -5911,7 +5919,7 @@ describe('ticket.mjs 票流程測試', () => {
       try {
         code = await ticketMain(
           [
-            'run',
+            'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
             '--name', 't83-cfg',
             '--brief', briefFile,
             '--branch', 'feat/t83-cfg',
@@ -5954,7 +5962,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't51',
           '--brief',
@@ -6007,7 +6015,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't52',
           '--brief',
@@ -6051,7 +6059,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't53',
           '--brief',
@@ -6108,7 +6116,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't54',
           '--brief',
@@ -6165,7 +6173,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't55',
           '--brief',
@@ -6227,7 +6235,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't56',
           '--brief',
@@ -6281,7 +6289,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't56',
           '--brief',
@@ -6347,7 +6355,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code1 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't84-with-sess',
           '--brief',
@@ -6412,7 +6420,7 @@ describe('ticket.mjs 票流程測試', () => {
     try {
       code2 = await ticketMain(
         [
-          'run',
+          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
           '--name',
           't84-no-sess',
           '--brief',
@@ -6654,7 +6662,7 @@ describe('setup.mjs 設定對帳測試', () => {
       badSettingsFile,
       JSON.stringify(
         {
-          token: 'SHOULD-NOT-PRINT',
+          token: FAKE_SETTINGS_TOKEN,
           permissions: {
             allow: ['read_file(' + rootSlash + ')'],
           },
@@ -6670,7 +6678,7 @@ describe('setup.mjs 設定對帳測試', () => {
       goodSettingsFile,
       JSON.stringify(
         {
-          token: 'SHOULD-NOT-PRINT',
+          token: FAKE_SETTINGS_TOKEN,
           permissions: {
             allow: [goodAllow, 'read_file(' + rootSlash + ')'],
           },
@@ -6726,8 +6734,8 @@ describe('setup.mjs 設定對帳測試', () => {
     const badOutText = badOuts.join('\n')
     const badErrText = badErrs.join('\n')
     assert.match(badOutText, /command\(regex:/, `stdout 應包含 command(regex:，實際：${badOutText}`)
-    assert.ok(!badOutText.includes('SHOULD-NOT-PRINT'), 'stdout 絕對不應包含 token')
-    assert.ok(!badErrText.includes('SHOULD-NOT-PRINT'), 'stderr 絕對不應包含 token')
+    assert.ok(!badOutText.includes(FAKE_SETTINGS_TOKEN), 'stdout 絕對不應包含 token')
+    assert.ok(!badErrText.includes(FAKE_SETTINGS_TOKEN), 'stderr 絕對不應包含 token')
 
     // 2. 全對 ⇒ exit 0
     const goodOuts = []
@@ -6751,8 +6759,8 @@ describe('setup.mjs 設定對帳測試', () => {
     assert.equal(goodCode, 0, `全對時 exit 應為 0，實際為 ${goodCode}`)
     const goodOutText = goodOuts.join('\n')
     const goodErrText = goodErrs.join('\n')
-    assert.ok(!goodOutText.includes('SHOULD-NOT-PRINT'), 'stdout 絕對不應包含 token')
-    assert.ok(!goodErrText.includes('SHOULD-NOT-PRINT'), 'stderr 絕對不應包含 token')
+    assert.ok(!goodOutText.includes(FAKE_SETTINGS_TOKEN), 'stdout 絕對不應包含 token')
+    assert.ok(!goodErrText.includes(FAKE_SETTINGS_TOKEN), 'stderr 絕對不應包含 token')
 
     // 3. 不存在 ⇒ exit 2
     const nonExistentFile = path.join(tmpSettingsDir, 'not-found.json')
@@ -6807,7 +6815,7 @@ describe('setup.mjs 設定對帳測試', () => {
       badSettingsFile,
       JSON.stringify(
         {
-          token: 'SHOULD-NOT-PRINT-T12',
+          token: FAKE_SETTINGS_TOKEN,
           permissions: {
             allow: ['read_file(' + rootSlash + ')'],
           },
@@ -6859,8 +6867,8 @@ describe('setup.mjs 設定對帳測試', () => {
     const badOutText = badOuts.join('\n')
     const badErrText = badErrs.join('\n')
     assert.match(badOutText, /command\(regex:/, `stdout 應包含 command(regex:，實際：${badOutText}`)
-    assert.ok(!badOutText.includes('SHOULD-NOT-PRINT-T12'), 'stdout 絕對不應包含 token')
-    assert.ok(!badErrText.includes('SHOULD-NOT-PRINT-T12'), 'stderr 絕對不應包含 token')
+    assert.ok(!badOutText.includes(FAKE_SETTINGS_TOKEN), 'stdout 絕對不應包含 token')
+    assert.ok(!badErrText.includes(FAKE_SETTINGS_TOKEN), 'stderr 絕對不應包含 token')
   })
 
   test('setup --sync-check：造 tmp repo → 放快照＋manifest → 全對 exit 0', () => {
@@ -6983,7 +6991,7 @@ describe('1.12.0 ticket：複審者到底看了什麼要印在收貨摘要', () 
     const outs = []; const origLog = console.log; console.log = (m) => outs.push(String(m))
     let code
     try {
-      code = await ticketMain(['run', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'hello.txt', '--test', 'true', ...extra], deps)
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'hello.txt', '--test', 'true', ...extra], deps)
     } finally { console.log = origLog }
     const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', name, 'summary.json'), 'utf8'))
     return { code, summary, out: outs.join('\n'), councilArgs }
@@ -7024,5 +7032,993 @@ describe('1.12.0 ticket：複審者到底看了什麼要印在收貨摘要', () 
     const i = r.councilArgs.indexOf('--diff-cap'); assert.ok(i !== -1 && r.councilArgs[i + 1] === '200000', 'ticket run 要把 --diff-cap 傳給 council')
     assert.match(r.out, /⚠ 本票 diff cap 由 120000 提高至 200000；完整送審 150000 字元/)
     assert.match(r.out, /⚠ writer-report 截斷 20000\/31540 字元/)
+  })
+})
+
+describe('1.13.0 ticket：無引用的不簽在收貨摘要印 ⚠', () => {
+  async function runTicket(name, councilImpl, extra = []) {
+    const repo = makeRepo()
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md'); fs.writeFileSync(briefFile, '# 票\n內容')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+    let councilArgs = null
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => { fs.writeFileSync(path.join(worktreePath, 'hello.txt'), 'hello\n'); return 0 },
+      councilMain: (args) => { councilArgs = args; return councilImpl(reviewOutDir) },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const outs = []; const origLog = console.log; console.log = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'hello.txt', '--test', 'true', ...extra], deps)
+    } finally { console.log = origLog }
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', name, 'summary.json'), 'utf8'))
+    return { code, summary, out: outs.join('\n'), councilArgs }
+  }
+
+  test('一題無引用（Q2）、一題有引用（Q3）⇒ 收貨摘要對 Q2 含「⚠ 無引用」、對 Q3 不含；summary.json review.members[0].uncited 等於 [\'Q2\']', async () => {
+    const r = await runTicket('cite1', (dir) => {
+      fakeCouncilOut(dir, {
+        'agy-opus': 'Q2：不簽｜x｜y\nQ3：不簽｜x｜y｜council.mjs:153\n整份：不簽\nQ6：親跑驗收',
+        'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：親跑驗收',
+      })
+      return 0
+    })
+    assert.equal(r.code, 0)
+    assert.deepEqual(r.summary.review.members[0].uncited, ['Q2'])
+    const lines = r.out.split('\n')
+    const q2Line = lines.find((l) => l.includes('Q2 (不簽)'))
+    const q3Line = lines.find((l) => l.includes('Q3 (不簽)'))
+    assert.ok(q2Line, '收貨摘要應含 Q2 行')
+    assert.ok(q3Line, '收貨摘要應含 Q3 行')
+    assert.match(q2Line, /⚠ 無引用/)
+    assert.doesNotMatch(q3Line, /⚠ 無引用/)
+  })
+})
+
+// ═══════════════════ 1.16.0 寫手鏈（票 llm-team-gemini-writer）：G2 走 registry preflight、--writer-harness 透傳、收貨摘要「下一席」提示 ═══════════════════
+describe('1.16.0 寫手鏈：ticket run', () => {
+  const SEATS = [
+    { harness: 'agy', model: 'gemini-3.8-flash-high', quotaBucket: 'gemini' },
+    { harness: 'gemini', model: 'gemini-3.8-flash', quotaBucket: 'gemini-api' },
+  ]
+  /** 假寫手：從 args 找 --out，寫一筆帶 failure 的台帳（模擬 write.mjs 1.16.0 每筆都帶 failure），回 exitCode。 */
+  function fakeWriter({ exitCode, failure, changeFile = null, calls = [] }) {
+    return (args) => {
+      calls.push(args)
+      const out = args[args.indexOf('--out') + 1]
+      const wt = args[args.indexOf('--worktree') + 1]
+      fs.mkdirSync(out, { recursive: true })
+      fs.writeFileSync(path.join(out, 'round-1.stdout.ndjson'), '')
+      const entry = { schemaVersion: 1, round: 1, verdict: exitCode === 0 ? 'PASS' : 'FAIL_headless', ...(failure ? { failure } : {}) }
+      fs.writeFileSync(path.join(out, 'ledger.ndjson'), JSON.stringify(entry) + '\n')
+      if (changeFile) fs.writeFileSync(path.join(wt, changeFile), 'x')
+      return exitCode
+    }
+  }
+  async function run({ name, cfg, extraArgs = [], deps = {} }) {
+    const repo = makeRepo(cfg)
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, `# ${name}\n內容`)
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'a.txt', '--test', 'true', ...extraArgs], { repoRoot: repo.dir, ...deps })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const summaryFile = path.join(repo.dir, '.local', 'llm-team', name, 'summary.json')
+    const summary = fs.existsSync(summaryFile) ? JSON.parse(fs.readFileSync(summaryFile, 'utf8')) : null
+    return { code, out: outs.join('\n'), errs: errs.join('\n'), summary, repo }
+  }
+
+  test('T90 寫手 exit 3 且台帳 failure.kind quota、config 還有下一席 ⇒ 收貨摘要含「🔴 寫手額度用盡：下一席 gemini/gemini-3.8-flash，重跑加 --writer-harness gemini」；summary.writerNext；不自動重跑（writeMain 只被叫 1 次）', async () => {
+    const calls = []
+    const r = await run({ name: 't90', cfg: { writer: SEATS }, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, failure: { kind: 'quota', code: 'RESOURCE_EXHAUSTED', retryable: false }, calls }) } })
+    assert.equal(r.code, 3)
+    assert.equal(calls.length, 1, '不自動連跑下一席')
+    assert.match(r.out, /🔴 寫手額度用盡：下一席 gemini\/gemini-3\.8-flash，重跑加 --writer-harness gemini/)
+    assert.deepEqual(r.summary.writer, { harness: 'agy', model: 'gemini-3.8-flash-high', quotaBucket: 'gemini' })
+    assert.deepEqual(r.summary.writerFailure, { kind: 'quota', code: 'RESOURCE_EXHAUSTED', retryable: false })
+    assert.deepEqual(r.summary.writerNext, { harness: 'gemini', model: 'gemini-3.8-flash' })
+    assert.equal(r.summary.review, null)
+  })
+  test('T91 陽性對照：failure 不是 quota（policy）⇒ 摘要不含「下一席」；quota 但已是最後一席（--writer-harness gemini）⇒ 不含；quota 但單物件 config ⇒ 不含；write exit 0 ⇒ 不看台帳', async () => {
+    const a = await run({ name: 't91a', cfg: { writer: SEATS }, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, failure: { kind: 'policy', retryable: false } }) } })
+    assert.equal(a.code, 3)
+    assert.doesNotMatch(a.out, /下一席/)
+    assert.equal(a.summary.writerNext, null)
+    assert.deepEqual(a.summary.writerFailure, { kind: 'policy', retryable: false })
+    const b = await run({ name: 't91b', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, failure: { kind: 'quota', retryable: false } }) } })
+    assert.equal(b.code, 3)
+    assert.doesNotMatch(b.out, /下一席/)
+    assert.equal(b.summary.writer.harness, 'gemini')
+    assert.equal(b.summary.writerNext, null)
+    const c = await run({ name: 't91c', cfg: {}, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, failure: { kind: 'quota', retryable: false } }) } })
+    assert.doesNotMatch(c.out, /下一席/)
+    assert.equal(c.summary.writerNext, null)
+    const d = await run({ name: 't91d', cfg: { writer: SEATS }, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, failure: { kind: 'quota', retryable: false } }), councilMain: () => 0, runTest: () => ({ exit: 0, out: '' }) } })
+    assert.equal(d.summary.writerFailure, null, 'write exit 0 ⇒ 不讀台帳的 failure')
+    assert.doesNotMatch(d.out, /下一席/)
+  })
+  test('T92 --writer-harness gemini 透傳給 writeMain（args 含 --writer-harness gemini）；summary.writer 記 gemini 席；沒給 ⇒ args 不含且 summary.writer 是第 0 席 agy', async () => {
+    const calls = []
+    const r = await run({ name: 't92', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, calls }) } })
+    const i = calls[0].indexOf('--writer-harness')
+    assert.ok(i >= 0 && calls[0][i + 1] === 'gemini', JSON.stringify(calls[0]))
+    assert.deepEqual(r.summary.writer, { harness: 'gemini', model: 'gemini-3.8-flash', quotaBucket: 'gemini-api' })
+    const calls2 = []
+    const r2 = await run({ name: 't92b', cfg: { writer: SEATS }, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, calls: calls2 }) } })
+    assert.ok(!calls2[0].includes('--writer-harness'))
+    assert.equal(r2.summary.writer.harness, 'agy')
+  })
+  test('T93 --writer-harness nope ⇒ exit 2、訊息列可用席、不建 worktree、writeMain 0 次；config.writer 陣列的 timeoutMs 取選中那席', async () => {
+    const calls = []
+    const r = await run({ name: 't93', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'nope'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r.code, 2)
+    assert.equal(calls.length, 0)
+    assert.match(r.errs, /寫手席 "nope" 不在 config\.writer.*可用：agy\/gemini-3\.8-flash-high, gemini\/gemini-3\.8-flash/)
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 't93')), false)
+    const seatsWithTimeout = [{ ...SEATS[0], timeoutMs: 1111 }, { ...SEATS[1], timeoutMs: 2222 }]
+    const c1 = []
+    await run({ name: 't93b', cfg: { writer: seatsWithTimeout }, extraArgs: ['--writer-harness', 'gemini'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, calls: c1 }) } })
+    assert.equal(c1[0][c1[0].indexOf('--timeout-ms') + 1], '2222')
+    const c2 = []
+    await run({ name: 't93c', cfg: { writer: seatsWithTimeout }, deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 3, calls: c2 }) } })
+    assert.equal(c2[0][c2[0].indexOf('--timeout-ms') + 1], '1111')
+  })
+  test('T94 G2 走 registry preflight（沒注入 assertSettings）：deps.getHarness 假 gemini 席收到 role write、repoRoot、無 worktree（worktree 還沒建）；回 !ok ⇒ run 2、不建 worktree、writeMain 0 次；全 ok ⇒ 過；T37 的 agy 路徑照舊（假 agy 也走 preflight）', async () => {
+    const { getHarness } = await import('./harnesses/index.mjs')
+    const real = getHarness('gemini')
+    const seen = []
+    const bad = { ...real, preflight: (env, config, d) => { seen.push(d); return [{ ok: false, label: 'policy(toml)', message: 'policy 產不出來' }] } }
+    const calls = []
+    const r = await run({ name: 't94', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { getHarness: (n) => (n === 'gemini' ? bad : getHarness(n)), writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /🔴 G2：policy 產不出來/)
+    assert.equal(calls.length, 0)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].role, 'write')
+    assert.equal(seen[0].repoRoot, r.repo.dir)
+    assert.equal(seen[0].worktree, undefined, 'ticket G2 在 worktree 建立前跑，不給 worktree（不落地）')
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 't94')), false)
+    const ok = { ...real, preflight: () => [{ ok: true, label: 'policy(toml)' }] }
+    const calls2 = []
+    const r2 = await run({ name: 't94b', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { getHarness: (n) => (n === 'gemini' ? ok : getHarness(n)), writeMain: fakeWriter({ exitCode: 3, calls: calls2 }) } })
+    assert.equal(r2.code, 3)
+    assert.equal(calls2.length, 1)
+    // 真 gemini preflight（role write、無 worktree）也是 ok:true 不落地——repo 根不會多出 .gemini/
+    const calls3 = []
+    const r3 = await run({ name: 't94c', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { writeMain: fakeWriter({ exitCode: 3, calls: calls3 }) } })
+    assert.equal(r3.code, 3)
+    assert.equal(calls3.length, 1)
+    assert.equal(fs.existsSync(path.join(r3.repo.dir, '.gemini')), false, 'ticket G2 不在 repo 根落地 policy')
+    // agy 席（預設）走真 agy preflight：AGY_SETTINGS 不存在 ⇒ G2 擋（與 T37 同一條路，只是換成 registry）
+    const r4 = await run({ name: 't94d', cfg: { writer: SEATS }, deps: { env: { ...process.env, AGY_SETTINGS: '/nope/settings.json' }, writeMain: fakeWriter({ exitCode: 0 }) } })
+    assert.equal(r4.code, 2)
+    assert.match(r4.errs, /🔴 G2：agy settings 不存在：\/nope\/settings\.json/)
+  })
+  test('T95 assertSettings 注入相容：有注入 ⇒ 它就是 G2（throw ⇒ 2；回 true ⇒ 過），registry preflight 不被叫', async () => {
+    const { getHarness } = await import('./harnesses/index.mjs')
+    let preflightCalls = 0
+    const spy = { ...getHarness('gemini'), preflight: () => { preflightCalls++; return [] } }
+    const r = await run({ name: 't95', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', 'gemini'], deps: { getHarness: (n) => (n === 'gemini' ? spy : getHarness(n)), assertSettings: () => { throw new Error('舊接縫擋下') }, writeMain: fakeWriter({ exitCode: 0 }) } })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /🔴 G2：舊接縫擋下/)
+    assert.equal(preflightCalls, 0)
+  })
+
+  test('T98 r3（sol Q2）：裸 --writer-harness（parseArgs 得 true）⇒ run 回 2、stderr「🔴 --writer-harness 需要席名（可用：agy、gemini）」、不建 worktree／分支、writeMain 0 次（不准靜默落第 0 席）', async () => {
+    const calls = []
+    const r = await run({ name: 't98', cfg: { writer: SEATS }, extraArgs: ['--writer-harness'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /^🔴 --writer-harness 需要席名（可用：agy、gemini）$/m)
+    assert.equal(calls.length, 0)
+    assert.equal(r.summary, null, 'G2 前就擋，沒有 summary')
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 't98')), false)
+    assert.equal(r.repo.g('branch', '--list', 'feat/t98--s').trim(), '')
+    // 裸旗標後面接別的旗標也是裸（parseArgs 把下一個 -- 開頭當新旗標）
+    const r2 = await run({ name: 't98b', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', '--tier', 'standard'], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r2.code, 2)
+    assert.match(r2.errs, /--writer-harness 需要席名/)
+    assert.equal(calls.length, 0)
+  })
+  test('T99 r3（sol Q2）：--writer-harness "" ⇒ 同樣回 2、不建 worktree、writeMain 0 次；單物件 config 的可用清單只有 agy', async () => {
+    const calls = []
+    const r = await run({ name: 't99', cfg: { writer: SEATS }, extraArgs: ['--writer-harness', ''], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /🔴 --writer-harness 需要席名（可用：agy、gemini）/)
+    assert.equal(calls.length, 0)
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 't99')), false)
+    const r2 = await run({ name: 't99b', cfg: {}, extraArgs: ['--writer-harness', ''], deps: { assertSettings: () => true, writeMain: fakeWriter({ exitCode: 0, calls }) } })
+    assert.equal(r2.code, 2)
+    assert.match(r2.errs, /🔴 --writer-harness 需要席名（可用：agy）/)
+    assert.equal(calls.length, 0)
+  })
+
+  // ─── r2（統整者真跑 `ticket run --writer-harness gemini` 坐實＋sol Q2／Q3）：policy TOML 曾落在 worktree，收貨摘要把它列成改動檔、land 被擋 ───
+  const FIX = path.join(path.dirname(new URL(import.meta.url).pathname), 'harnesses', '__fixtures__', 'gemini-write-stream.ndjson')
+  /** 假 spawn：在 cwd 寫 hello.txt、回真跑 fixture；preflight 用真的（會把 policy 寫進 outDir）。 */
+  async function geminiTicket(name, { preflightOverride = null, stdout = null, seats = SEATS } = {}) {
+    const { getHarness } = await import('./harnesses/index.mjs')
+    const real = getHarness('gemini')
+    const spawnCalls = []
+    const inject = (o) => ({
+      ...o,
+      env: { GEMINI_BIN: '/fake/gemini', PATH: '/x' },
+      resolveKey: () => 'test-key',
+      spawn: (bin, args, opts) => {
+        spawnCalls.push({ args, cwd: opts.cwd })
+        fs.writeFileSync(path.join(opts.cwd, 'hello.txt'), 'hello\n')
+        return { status: 0, signal: null, stdout: stdout !== null ? stdout : fs.readFileSync(FIX, 'utf8'), stderr: '' }
+      },
+    })
+    const fake = {
+      ...real,
+      ...(preflightOverride ? { preflight: preflightOverride(real) } : {}),
+      write: { ...real.write, run: (o) => real.write.run(inject(o)), resume: (o) => real.write.resume(inject(o)) },
+    }
+    const repo = makeRepo({ writer: seats })
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, `# ${name}\n寫 hello.txt`)
+    const worktree = path.join(repo.dir, '.claude', 'worktrees', name)
+    const outDir = path.join(repo.dir, '.local', 'llm-team', name)
+    const outs = []
+    const origLog = console.log
+    const origErr = console.error
+    const errs = []
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    let councilCalls = 0
+    try {
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, '--allow', 'hello.txt', '--test', 'true', '--writer-harness', 'gemini'], {
+        repoRoot: repo.dir,
+        getHarness: (n) => (n === 'gemini' ? fake : getHarness(n)),
+        councilMain: () => {
+          councilCalls++
+          fakeCouncilOut(path.join(outDir, 'review'), { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt' })
+          return 0
+        },
+        runTest: () => ({ exit: 0, out: 'ok' }),
+      })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const summary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    const status = git(worktree, ['status', '--porcelain']).split('\n').map((l) => l.trim()).filter(Boolean)
+    return { code, summary, out: outs.join('\n'), errs: errs.join('\n'), repo, worktree, outDir, spawnCalls, status, councilCalls }
+  }
+  test('T96 成功的 gemini ticket（真 preflight、假 spawn 回真跑 fixture）⇒ run 0、summary.changed 精確＝allowlist、outDir 有 write/run-1/gemini-policy.toml、寫手 argv 帶 --policy 指到它、worktree git status 只有 hello.txt、summary／status 都沒有任何 .gemini 路徑', async () => {
+    const r = await geminiTicket('t96')
+    assert.equal(r.code, 0, r.errs)
+    assert.deepEqual(r.summary.changed, ['hello.txt'], 'changed 精確等於 allowlist（沒有 policy 檔混進來）')
+    assert.equal(r.summary.writeExit, 0)
+    assert.equal(r.summary.writer.harness, 'gemini')
+    const policy = path.join(r.outDir, 'write', 'run-1', 'gemini-policy.toml')
+    assert.ok(fs.existsSync(policy), `policy 應在 outDir：${policy}`)
+    assert.ok(fs.readFileSync(policy, 'utf8').includes('commandPrefix = "npm test"'), 'config.allowCommandHeads 進 policy')
+    assert.equal(r.spawnCalls.length, 1)
+    const i = r.spawnCalls[0].args.indexOf('--policy')
+    assert.equal(r.spawnCalls[0].args[i + 1], policy, '寫手用 --policy 載入 outDir 那份')
+    assert.equal(r.spawnCalls[0].cwd, r.worktree)
+    assert.deepEqual(r.status.map((l) => l.replace(/^\S+\s+/, '')), ['hello.txt'], 'worktree 只多 allow 內的檔（乾淨到可以 land）')
+    assert.equal(fs.existsSync(path.join(r.worktree, '.gemini')), false)
+    assert.ok(!JSON.stringify(r.summary).includes('.gemini'), 'summary 任何欄位都不含 .gemini 路徑')
+    assert.ok(!r.status.some((l) => l.includes('.gemini')), 'git status 不含 .gemini 路徑')
+    assert.ok(!r.out.includes('.gemini') && !r.out.includes('gemini-policy'), '收貨摘要不列 policy 檔')
+    assert.match(r.out, /改動檔: hello\.txt/)
+  })
+  test('T97 陽性對照（sol Q3）：把真 preflight 的 outDir 改成 worktree ⇒ policy 落在 worktree ⇒ write G4 越界 exit 3、summary.changed 含 gemini-policy.toml、run 回 3——T96 的斷言確實咬得到「policy 進 worktree」', async () => {
+    const r = await geminiTicket('t97', { preflightOverride: (real) => (env, config, d) => real.preflight(env, config, { ...d, outDir: d.outDir ? path.join(d.repoRoot, '.claude', 'worktrees', 't97') : undefined }) })
+    assert.equal(r.code, 3)
+    assert.equal(r.summary.writeExit, 3)
+    assert.ok(r.summary.changed.includes('gemini-policy.toml'), JSON.stringify(r.summary.changed))
+    assert.notDeepEqual(r.summary.changed, ['hello.txt'])
+    assert.match(r.errs, /🔴 G4 第 1 輪：越界檔/)
+    assert.ok(r.status.some((l) => l.includes('gemini-policy.toml')), 'worktree 不乾淨（這就是 r1 統整者真跑撞到的形狀）')
+  })
+  test('T100 r4（sol r3 Q2）：假寫手回 init＋正文非空＋exit 0＋result error quota（真 write.mjs、真 preflight；config 兩席 [gemini, agy]、跑第 0 席 gemini）⇒ write G3 擋、run 回 3、不開 council、summary.writerFailure quota、收貨摘要印「下一席 agy/gemini-3.8-flash-high，重跑加 --writer-harness agy」', async () => {
+    const stdout = [
+      '{"type":"init","session_id":"sess-quota","model":"m"}',
+      '{"type":"message","role":"assistant","content":"改好了","delta":true}',
+      '{"type":"result","status":"error","error":{"type":"QuotaExceededError","message":"quota"},"stats":{"total_tokens":1}}',
+    ].join('\n') + '\n'
+    const r = await geminiTicket('t100', { stdout, seats: [SEATS[1], SEATS[0]] })
+    assert.equal(r.code, 3)
+    assert.equal(r.summary.writeExit, 3)
+    assert.equal(r.councilCalls, 0, 'P5：write 非 0 不開 council')
+    assert.equal(r.summary.review, null)
+    assert.equal(r.summary.writer.harness, 'gemini')
+    assert.deepEqual(r.summary.writerFailure, { kind: 'quota', code: 'QuotaExceededError', retryable: false })
+    assert.deepEqual(r.summary.writerNext, { harness: 'agy', model: 'gemini-3.8-flash-high' })
+    assert.match(r.out, /🔴 寫手額度用盡：下一席 agy\/gemini-3\.8-flash-high，重跑加 --writer-harness agy/)
+    assert.match(r.out, /🔴 未複審（write 非 0/)
+    // 同形狀、config [agy, gemini] 且 --writer-harness gemini（最後一席）⇒ 仍擋、但沒有下一席可提示
+    const last = await geminiTicket('t100b', { stdout })
+    assert.equal(last.code, 3)
+    assert.equal(last.summary.writerFailure.kind, 'quota')
+    assert.equal(last.summary.writerNext, null)
+    assert.doesNotMatch(last.out, /下一席/)
+  })
+  test('T101 對照：agy 席的 quota 形狀（非零 exit＋stderr 429，09-21 真事故；假 agy harness 用真 normalize、preflight 假）⇒ run 3、不開 council、收貨摘要印「🔴 寫手額度用盡：下一席 gemini/gemini-3.8-flash，重跑加 --writer-harness gemini」——這條靠 exit≠0 就擋，不依賴 r4 閘', async () => {
+    const { getHarness } = await import('./harnesses/index.mjs')
+    const real = getHarness('agy')
+    const agyStdout = [
+      JSON.stringify({ event: 'init', conversation_id: 'conv-q' }),
+      JSON.stringify({ event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-q', response: '改好了', usage: { total_tokens: 1 } } }),
+    ].join('\n') + '\n'
+    // agy 的 quota 形狀：非零 exit＋stderr 429 RESOURCE_EXHAUSTED（2026-09-21 真事故）；正文非空、conversation id 也有
+    const fake = {
+      ...real,
+      preflight: () => [],
+      write: { ...real.write, run: (o) => real.write.run({ ...o, env: { AGY_BIN: '/fake/agy', PATH: '/x' }, spawn: (b, a, opts) => { fs.writeFileSync(path.join(opts.cwd, 'hello.txt'), 'x'); return { status: 1, signal: null, stdout: agyStdout, stderr: '429 RESOURCE_EXHAUSTED' } } }) },
+    }
+    const repo = makeRepo({ writer: SEATS })
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# t101\n寫 hello.txt')
+    const outs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = () => {}
+    let councilCalls = 0
+    let code
+    try {
+      code = await ticketMain(['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 't101', '--brief', briefFile, '--branch', 'feat/t101--s', '--allow', 'hello.txt', '--test', 'true'], {
+        repoRoot: repo.dir,
+        getHarness: (n) => (n === 'agy' ? fake : getHarness(n)),
+        councilMain: () => { councilCalls++; return 0 },
+        runTest: () => ({ exit: 0, out: 'ok' }),
+      })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 't101', 'summary.json'), 'utf8'))
+    assert.equal(code, 3)
+    assert.equal(summary.writeExit, 3)
+    assert.equal(councilCalls, 0)
+    assert.equal(summary.writer.harness, 'agy')
+    assert.equal(summary.writerFailure.kind, 'quota')
+    assert.deepEqual(summary.writerNext, { harness: 'gemini', model: 'gemini-3.8-flash' })
+    assert.match(outs.join('\n'), /🔴 寫手額度用盡：下一席 gemini\/gemini-3\.8-flash，重跑加 --writer-harness gemini/)
+  })
+})
+
+describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', () => {
+  function wbsWriter({ changeFiles = [] } = {}) {
+    return (args) => {
+      const out = args[args.indexOf('--out') + 1]
+      const wt = args[args.indexOf('--worktree') + 1]
+      fs.mkdirSync(out, { recursive: true })
+      fs.writeFileSync(path.join(out, 'round-1.stdout.ndjson'), '')
+      fs.writeFileSync(path.join(out, 'ledger.ndjson'), JSON.stringify({ schemaVersion: 1, round: 1, verdict: 'PASS' }) + '\n')
+      for (const f of changeFiles) {
+        fs.mkdirSync(path.dirname(path.join(wt, f)), { recursive: true })
+        fs.writeFileSync(path.join(wt, f), 'x')
+      }
+      return 0
+    }
+  }
+  function wbsCouncil(capture = {}) {
+    return (args) => {
+      const reviewOutDir = args[args.indexOf('--out') + 1]
+      capture.args = args
+      capture.brief = args[args.indexOf('--brief') + 1]
+      capture.tier = args[args.indexOf('--tier') + 1]
+      fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
+      return 0
+    }
+  }
+  async function runWbs({ name, cfg = {}, extraArgs = [], deps = {}, briefText = null, allow = ['a.txt'] } = {}) {
+    const repo = makeRepo(cfg)
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, briefText !== null ? briefText : `# ${name}\n內容`)
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    const allowArgs = allow.flatMap((al) => ['--allow', al])
+    let code
+    try {
+      code = await ticketMain(
+        ['run', '--name', name, '--brief', briefFile, '--branch', `feat/${name}--s`, ...allowArgs, '--test', 'true', ...extraArgs],
+        { repoRoot: repo.dir, assertSettings: () => true, ...deps }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const outDir = path.join(repo.dir, '.local', 'llm-team', name)
+    const summaryFile = path.join(outDir, 'summary.json')
+    const summary = fs.existsSync(summaryFile) ? JSON.parse(fs.readFileSync(summaryFile, 'utf8')) : null
+    return { code, out: outs.join('\n'), errs: errs.join('\n'), summary, repo, briefFile, outDir }
+  }
+
+  test('缺 --wbs 且無 --wbs-exempt ⇒ run 回 2、不建 worktree、無 summary.json（陽性對照：拿掉本檢查會往下跑到 writeMain）', async () => {
+    const r = await runWbs({ name: 'wbs-missing', deps: { writeMain: wbsWriter() } })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /開票必填 --wbs/)
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 'wbs-missing')), false)
+    assert.equal(r.summary, null, '拒開不該留下 summary.json')
+  })
+
+  test('--wbs-exempt 給空字串／純空白 ⇒ run 回 2 且訊息「理由必填非空」', async () => {
+    const empty = await runWbs({ name: 'wbs-exempt-empty', extraArgs: ['--wbs-exempt', ''], deps: { writeMain: wbsWriter() } })
+    assert.equal(empty.code, 2)
+    assert.match(empty.errs, /--wbs-exempt 理由必填非空/)
+    const blank = await runWbs({ name: 'wbs-exempt-blank', extraArgs: ['--wbs-exempt', '   '], deps: { writeMain: wbsWriter() } })
+    assert.equal(blank.code, 2)
+    assert.match(blank.errs, /--wbs-exempt 理由必填非空/)
+  })
+
+  test('--wbs 含不合法 ID ⇒ run 回 2 且列出該 ID；格式合法（含逗號分隔、字母尾碼）⇒ 通過並寫入 summary.wbsIds', async () => {
+    const bad = await runWbs({ name: 'wbs-bad-id', extraArgs: ['--wbs', '1.13.2,abc,4.7'], deps: { writeMain: wbsWriter() } })
+    assert.equal(bad.code, 2)
+    assert.match(bad.errs, /不合法的 WBS ID/)
+    assert.match(bad.errs, /abc/)
+    assert.equal(fs.existsSync(path.join(bad.repo.dir, '.claude', 'worktrees', 'wbs-bad-id')), false)
+
+    const capture = {}
+    const good = await runWbs({
+      name: 'wbs-good-id',
+      extraArgs: ['--wbs', ' 1.13.2 , 4.7.20a '],
+      deps: { writeMain: wbsWriter({ changeFiles: ['a.txt'] }), councilMain: wbsCouncil(capture), runTest: () => ({ exit: 0, out: 'ok' }) },
+    })
+    assert.equal(good.code, 0, good.errs)
+    assert.deepEqual(good.summary.wbsIds, ['1.13.2', '4.7.20a'])
+    assert.equal(good.summary.wbsExempt, undefined)
+  })
+
+  test('同時給 --wbs 與 --wbs-exempt ⇒ run 回 2 且訊息「擇一」（陽性對照：拿掉本檢查就會用 --wbs 悄悄蓋過 exempt，兩種語意混在一起不報錯）', async () => {
+    const r = await runWbs({
+      name: 'wbs-both-given',
+      extraArgs: ['--wbs', '1.13.2', '--wbs-exempt', '同時給的測試'],
+      deps: { writeMain: wbsWriter() },
+    })
+    assert.equal(r.code, 2)
+    assert.match(r.errs, /--wbs 與 --wbs-exempt 擇一/)
+    assert.equal(fs.existsSync(path.join(r.repo.dir, '.claude', 'worktrees', 'wbs-both-given')), false)
+    assert.equal(r.summary, null, '拒開不該留下 summary.json')
+  })
+
+  test('summary.json 與 lifecycle（run-start／landed）都帶 wbsIds；--wbs-exempt 情形 wbsIds:[] 且帶 wbsExempt', async () => {
+    const capture1 = {}
+    const r1 = await runWbs({
+      name: 'wbs-lifecycle-1',
+      extraArgs: ['--wbs', '1.13.2'],
+      deps: { writeMain: wbsWriter({ changeFiles: ['a.txt'] }), councilMain: wbsCouncil(capture1), runTest: () => ({ exit: 0, out: 'ok' }) },
+    })
+    assert.equal(r1.code, 0, r1.errs)
+    assert.deepEqual(r1.summary.wbsIds, ['1.13.2'])
+    const lifecycle1 = fs
+      .readFileSync(path.join(r1.outDir, 'lifecycle.ndjson'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+    const runStart1 = lifecycle1.find((e) => e.event === 'run-start')
+    assert.deepEqual(runStart1.wbsIds, ['1.13.2'])
+
+    // land：landed 事件也帶 wbsIds
+    r1.summary.q6Receipt = 'verified'
+    fs.writeFileSync(path.join(r1.outDir, 'summary.json'), JSON.stringify(r1.summary, null, 2))
+    const msgFile = path.join(r1.repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: wbs-lifecycle-1\n')
+    const landCode = await ticketMain(['land', '--name', 'wbs-lifecycle-1', '--msg-file', msgFile], { repoRoot: r1.repo.dir })
+    assert.equal(landCode, 0)
+    const lifecycle1b = fs
+      .readFileSync(path.join(r1.outDir, 'lifecycle.ndjson'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+    const landed1 = lifecycle1b.find((e) => e.event === 'landed')
+    assert.deepEqual(landed1.wbsIds, ['1.13.2'])
+
+    // --wbs-exempt：wbsIds:[]、summary.wbsExempt 為理由
+    const capture2 = {}
+    const r2 = await runWbs({
+      name: 'wbs-lifecycle-2',
+      extraArgs: ['--wbs-exempt', '守門修補（非 WBS）'],
+      deps: { writeMain: wbsWriter({ changeFiles: ['a.txt'] }), councilMain: wbsCouncil(capture2), runTest: () => ({ exit: 0, out: 'ok' }) },
+    })
+    assert.equal(r2.code, 0, r2.errs)
+    assert.deepEqual(r2.summary.wbsIds, [])
+    assert.equal(r2.summary.wbsExempt, '守門修補（非 WBS）')
+  })
+
+  test('product-wbs.mjs --status：專案根沒有 tools/product-wbs.mjs ⇒ summary.wbsStatusAtRun／wbsStatusAtLand 都是 {error}，run／land 仍成功（觀測不擋票）', async () => {
+    const capture = {}
+    const r = await runWbs({
+      name: 'wbs-status-missing',
+      extraArgs: ['--wbs-exempt', '狀態觀測測試'],
+      deps: { writeMain: wbsWriter({ changeFiles: ['a.txt'] }), councilMain: wbsCouncil(capture), runTest: () => ({ exit: 0, out: 'ok' }) },
+    })
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(typeof r.summary.wbsStatusAtRun.error, 'string')
+    assert.match(r.summary.wbsStatusAtRun.error, /product-wbs\.mjs 不存在/)
+
+    r.summary.q6Receipt = 'verified'
+    fs.writeFileSync(path.join(r.outDir, 'summary.json'), JSON.stringify(r.summary, null, 2))
+    const msgFile = path.join(r.repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: wbs-status-missing\n')
+    const landCode = await ticketMain(['land', '--name', 'wbs-status-missing', '--msg-file', msgFile], { repoRoot: r.repo.dir })
+    assert.equal(landCode, 0)
+    const landedSummary = JSON.parse(fs.readFileSync(path.join(r.outDir, 'summary.json'), 'utf8'))
+    assert.equal(typeof landedSummary.wbsStatusAtLand.error, 'string')
+  })
+
+  test('CONTEXT.md 找不到時完全不附加：effective brief 等於原 brief', async () => {
+    const capture = {}
+    const r = await runWbs({
+      name: 'ctx-none',
+      extraArgs: ['--wbs-exempt', 'CONTEXT.md 注入測試（找不到）'],
+      allow: ['areaZ/file1.txt'],
+      deps: {
+        writeMain: wbsWriter({ changeFiles: ['areaZ/file1.txt'] }),
+        councilMain: wbsCouncil(capture),
+        runTest: () => ({ exit: 0, out: 'ok' }),
+      },
+    })
+    assert.equal(r.code, 0, r.errs)
+    const effective = fs.readFileSync(path.join(r.outDir, 'brief.effective.md'), 'utf8')
+    const originalBrief = fs.readFileSync(r.briefFile, 'utf8')
+    assert.equal(effective, originalBrief, '找不到 CONTEXT.md 時 effectiveBriefContent 應等於原 brief')
+    assert.doesNotMatch(effective, /區塊環境說明/)
+  })
+
+  test('CONTEXT.md 已存在時：注入到 effective brief（同區只附一次、不同區各附一次），writeMain／councilMain 收到的 --brief 是注入後的檔案', async () => {
+    const repo = makeRepo()
+    fs.mkdirSync(path.join(repo.dir, 'areaA', 'sub1'), { recursive: true })
+    fs.mkdirSync(path.join(repo.dir, 'areaA', 'sub2'), { recursive: true })
+    fs.mkdirSync(path.join(repo.dir, 'areaB'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, 'areaA', 'CONTEXT.md'), '① 是什麼：areaA 測試區塊\n② 入口：areaA/\n')
+    fs.writeFileSync(path.join(repo.dir, 'areaB', 'CONTEXT.md'), '① 是什麼：areaB 測試區塊\n② 入口：areaB/\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-inject\n改兩個區塊的檔案')
+
+    const capture = {}
+    let writeArgsCaptured = null
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'CONTEXT.md 注入測試',
+          '--name', 'ctx-inject',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-inject--s',
+          '--allow', 'areaA/sub1/file1.txt',
+          '--allow', 'areaA/sub2/file2.txt',
+          '--allow', 'areaB/file3.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: (args) => {
+            writeArgsCaptured = args
+            return wbsWriter({ changeFiles: ['areaA/sub1/file1.txt', 'areaA/sub2/file2.txt', 'areaB/file3.txt'] })(args)
+          },
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-inject')
+    const effectiveBriefPath = path.join(outDir, 'brief.effective.md')
+    const effective = fs.readFileSync(effectiveBriefPath, 'utf8')
+    assert.match(effective, /【區塊環境說明（自動附加；③驗收指令為統整者 --test 用，非寫手白名單，寫手不准跑）】/)
+    const areaACount = (effective.match(/areaA 測試區塊/g) || []).length
+    const areaBCount = (effective.match(/areaB 測試區塊/g) || []).length
+    assert.equal(areaACount, 1, 'areaA 兩個 --allow 落在同區只附一次')
+    assert.equal(areaBCount, 1, 'areaB 只附一次')
+
+    // writeMain／councilMain 都收到注入後的 brief 檔路徑
+    const writeBrief = writeArgsCaptured[writeArgsCaptured.indexOf('--brief') + 1]
+    assert.equal(writeBrief, effectiveBriefPath)
+    assert.equal(capture.brief, effectiveBriefPath)
+  })
+
+  test('陽性對照：CONTEXT.md 內文含「金流」「權限」不會讓 riskDomains 誤升級 tier（拼接若移到 riskDomains 比對之前，本測試會變紅：tier 會被誤判為 block）', async () => {
+    const repo = makeRepo({ riskDomains: ['金流', '權限'] })
+    fs.mkdirSync(path.join(repo.dir, 'areaC'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, 'areaC', 'CONTEXT.md'), '① 是什麼：areaC 涉及金流與權限模組（僅供環境說明，非本票內容）\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-riskdomain\n只是新增一行小小的說明文字')
+
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'riskDomains 陽性對照',
+          '--name', 'ctx-riskdomain',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-riskdomain--s',
+          '--allow', 'areaC/file.txt',
+          '--test', 'true',
+          '--tier', 'standard',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['areaC/file.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    assert.equal(capture.tier, 'standard', 'councilMain 應收到 --tier standard（未被注入內容誤升級）')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-riskdomain')
+    const summary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.equal(summary.review.tier, 'standard')
+    assert.equal(summary.tierEscalatedBy, undefined)
+    // 確認 CONTEXT.md 內容確實有被注入（不是因為沒注入才沒升級）
+    const effective = fs.readFileSync(path.join(outDir, 'brief.effective.md'), 'utf8')
+    assert.match(effective, /涉及金流與權限模組/)
+  })
+
+  test('陽性對照：CONTEXT.md 內文含會被 preflight 判為不安全的指令（符合允許指令頭＋shell 元字元）不會讓 run 被 preflight 擋下（拼接若移到 preflightBriefCommands 之前，本測試會變紅：exit 2）', async () => {
+    const repo = makeRepo({ allowCommandHeads: [] }) // BASE_COMMAND_HEADS 已含 npm test
+    fs.mkdirSync(path.join(repo.dir, 'areaD'), { recursive: true })
+    // 這行如果被 preflight 掃到：以允許指令頭 "npm test" 開頭、但含 `;`（shell 元字元）⇒ 會被判不安全而擋下
+    const dangerousInline = '`npm test' + ';' + ' echo pwned`'
+    fs.writeFileSync(path.join(repo.dir, 'areaD', 'CONTEXT.md'), '③ 驗收指令：' + dangerousInline + '\n')
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-preflight\n單純改一個小檔案，brief 本文不含任何危險指令')
+
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'preflight 陽性對照',
+          '--name', 'ctx-preflight',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-preflight--s',
+          '--allow', 'areaD/file.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['areaD/file.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    assert.doesNotMatch(errs.join('\n'), /brief 指令預檢失敗/)
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-preflight')
+    const effective = fs.readFileSync(path.join(outDir, 'brief.effective.md'), 'utf8')
+    assert.match(effective, /npm test; echo pwned/, '確認危險指令確實被注入了、只是沒被 preflight 掃到')
+  })
+
+  test('陽性對照（Q2a）：--allow 指向一個「內有 CONTEXT.md 但整個目錄是指向 repo 外」的 symlink ⇒ 不注入（拿掉 realpath 邊界檢查會變紅：這裡會被注入外部內容）', async () => {
+    const external = tmpdir('ctx-external-')
+    fs.writeFileSync(path.join(external, 'CONTEXT.md'), '① 是什麼：外部 symlink 內容（不應被注入）\n')
+
+    // symlink 建在 repoRoot 本身（collectContextForAllow 只看 repoRoot，不看 worktree），
+    // 必須在 run 之前就建好，讓 collectContextForAllow 讀 repoRoot 時就看得到它。
+    const repo = makeRepo()
+    fs.symlinkSync(external, path.join(repo.dir, 'linkedArea'))
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-symlink-escape\n單純改一個檔案')
+
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'symlink 邊界測試',
+          '--name', 'ctx-symlink-escape',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-symlink-escape--s',
+          '--allow', 'linkedArea/file1.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['linkedArea/file1.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-symlink-escape')
+    const effective = fs.readFileSync(path.join(outDir, 'brief.effective.md'), 'utf8')
+    const originalBrief = fs.readFileSync(briefFile, 'utf8')
+    assert.equal(effective, originalBrief, 'symlink 指向 repo 外 ⇒ 不應被當成合法 CONTEXT.md 來源，effective 應等於原 brief')
+    assert.doesNotMatch(effective, /外部 symlink 內容/, '外部內容不該出現在 effective brief 裡')
+  })
+
+  test('陽性對照（Q2a）：--allow 是絕對路徑，或相對路徑用 ../ 逃出 repoRoot ⇒ 都不注入（拿掉絕對路徑/邊界檢查會變紅：這裡會被注入 repoRoot 自己的 CONTEXT.md 或 repo 外的 CONTEXT.md）', async () => {
+    const repo = makeRepo()
+    // repoRoot 自己放一份 CONTEXT.md：相對路徑 --allow 「a.txt」找得到它；絕對路徑 --allow 應該完全跳過、找不到
+    fs.writeFileSync(path.join(repo.dir, 'CONTEXT.md'), '① 是什麼：repoRoot 層級的 CONTEXT.md\n')
+    // repo 外再放一份，給 ../ 逃逸的 --allow 用
+    const outsideDir = tmpdir('ctx-outside-')
+    fs.writeFileSync(path.join(outsideDir, 'CONTEXT.md'), '① 是什麼：repo 外層級的 CONTEXT.md（不應被注入）\n')
+    const outsideName = path.basename(outsideDir)
+    // 讓 outsideDir 剛好是 repo.dir 的手足目錄，這樣 '../<outsideName>/file.txt' 才會真的落在 outsideDir 底下
+    // makeRepo 用 os.tmpdir() 建目錄，outsideDir 也是，兩者互為手足（同一層 tmp 母目錄）——用相對路徑算出真正的 '..' 段數
+    const relFromRepoToOutside = path.relative(repo.dir, outsideDir)
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-abs-and-dotdot\n改動與 CONTEXT.md 無關的內容')
+
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', '絕對路徑／../ 邊界測試',
+          '--name', 'ctx-abs-and-dotdot',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-abs-and-dotdot--s',
+          '--allow', path.join(repo.dir, 'a.txt'), // 絕對路徑：即使實際落在 repoRoot 內，也一律跳過
+          '--allow', path.join(relFromRepoToOutside, 'file.txt'), // 相對路徑但用 .. 逃出 repoRoot
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['a.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-abs-and-dotdot')
+    const effective = fs.readFileSync(path.join(outDir, 'brief.effective.md'), 'utf8')
+    const originalBrief = fs.readFileSync(briefFile, 'utf8')
+    assert.equal(effective, originalBrief, '絕對路徑與 .. 逃逸都不該找到任何 CONTEXT.md，effective 應等於原 brief')
+    assert.doesNotMatch(effective, /repoRoot 層級的 CONTEXT\.md/)
+    assert.doesNotMatch(effective, /repo 外層級的 CONTEXT\.md/)
+  })
+
+  test('陽性對照（Q3）：假 tools/product-wbs.mjs --status --json 印字面 "null"（合法 JSON、但不是物件）⇒ run 不崩、summary.wbsStatusAtRun 記 {error}（拿掉非物件防禦會變紅：parsed.items 對 null 取值直接丟例外，run 整個炸掉）', async () => {
+    const capture = {}
+    const r = await runWbs({
+      name: 'wbs-status-null',
+      extraArgs: ['--wbs-exempt', 'status 非物件測試'],
+      deps: {
+        writeMain: wbsWriter({ changeFiles: ['a.txt'] }),
+        councilMain: wbsCouncil(capture),
+        runTest: () => ({ exit: 0, out: 'ok' }),
+      },
+    })
+    fs.mkdirSync(path.join(r.repo.dir, 'tools'), { recursive: true })
+    fs.writeFileSync(path.join(r.repo.dir, 'tools', 'product-wbs.mjs'), "process.stdout.write('null')\n")
+    // 上面那次 run 時工具還不存在（記的是「不存在」的 error）；這裡建好工具後對同一個 repoRoot 重新跑一張新票才是真正的對照。
+    const capture2 = {}
+    const briefFile2 = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile2, '# wbs-status-null-2\n內容')
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code2
+    try {
+      code2 = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'status 非物件測試（第二輪）',
+          '--name', 'wbs-status-null-2',
+          '--brief', briefFile2,
+          '--branch', 'feat/wbs-status-null-2--s',
+          '--allow', 'a.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: r.repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['a.txt'] }),
+          councilMain: wbsCouncil(capture2),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code2, 0, errs.join('\n'))
+    const outDir2 = path.join(r.repo.dir, '.local', 'llm-team', 'wbs-status-null-2')
+    const summary2 = JSON.parse(fs.readFileSync(path.join(outDir2, 'summary.json'), 'utf8'))
+    assert.deepEqual(summary2.wbsStatusAtRun, { error: '--status 輸出非物件' })
+  })
+
+  test('happy path（Q3 對照 + product-wbs 有真內容）：假 tools/product-wbs.mjs --status --json 印合法物件 JSON ⇒ run 與 land 的 wbsStatusAtRun／wbsStatusAtLand 都帶正確的 counts／generated_at／head_sha', async () => {
+    const repo = makeRepo()
+    fs.mkdirSync(path.join(repo.dir, 'tools'), { recursive: true })
+    const fakeStatusJson = JSON.stringify({
+      generated_at: '2026-09-28T00:00:00Z',
+      head_sha: 'a'.repeat(40),
+      items: [
+        { id: '1.1', status: 'delivered' },
+        { id: '1.2', status: 'todo' },
+        { id: '1.3', status: 'delivered' },
+      ],
+    })
+    fs.writeFileSync(
+      path.join(repo.dir, 'tools', 'product-wbs.mjs'),
+      `process.stdout.write(${JSON.stringify(fakeStatusJson)})\n`
+    )
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# wbs-status-happy\n內容')
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'status happy path',
+          '--name', 'wbs-status-happy',
+          '--brief', briefFile,
+          '--branch', 'feat/wbs-status-happy--s',
+          '--allow', 'a.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['a.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'wbs-status-happy')
+    let summary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.deepEqual(summary.wbsStatusAtRun, {
+      generated_at: '2026-09-28T00:00:00Z',
+      head_sha: 'a'.repeat(40),
+      counts: { delivered: 2, todo: 1 },
+    })
+
+    summary.q6Receipt = 'verified'
+    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+    const msgFile = path.join(repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: wbs-status-happy\n')
+    const landCode = await ticketMain(['land', '--name', 'wbs-status-happy', '--msg-file', msgFile], { repoRoot: repo.dir })
+    assert.equal(landCode, 0)
+    const landedSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
+    assert.deepEqual(landedSummary.wbsStatusAtLand, {
+      generated_at: '2026-09-28T00:00:00Z',
+      head_sha: 'a'.repeat(40),
+      counts: { delivered: 2, todo: 1 },
+    })
+  })
+
+  test('陽性對照（Q2b）：CONTEXT.md 內文含三個反引號（``` fenced code）與 "### 標題" ⇒ 注入後整段被包在更長的 fence 內（拿掉 backtickFence 會變紅：外層改用固定 ``` 三反引號會被內文的 ``` 提早關閉，內容碎裂）', async () => {
+    const repo = makeRepo()
+    fs.mkdirSync(path.join(repo.dir, 'areaE'), { recursive: true })
+    const trickyContent =
+      '① 是什麼：areaE 測試\n\n' +
+      '```\n' +
+      '一段示範程式碼\n' +
+      '```\n\n' +
+      '### 這是 CONTEXT.md 內文自己的標題，不是我們的區塊標題\n'
+    fs.writeFileSync(path.join(repo.dir, 'areaE', 'CONTEXT.md'), trickyContent)
+
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# ctx-fence\n改 areaE 底下的檔案')
+
+    const capture = {}
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        [
+          'run', '--wbs-exempt', 'fence 包裹測試',
+          '--name', 'ctx-fence',
+          '--brief', briefFile,
+          '--branch', 'feat/ctx-fence--s',
+          '--allow', 'areaE/file.txt',
+          '--test', 'true',
+        ],
+        {
+          repoRoot: repo.dir,
+          assertSettings: () => true,
+          writeMain: wbsWriter({ changeFiles: ['areaE/file.txt'] }),
+          councilMain: wbsCouncil(capture),
+          runTest: () => ({ exit: 0, out: 'ok' }),
+        }
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    assert.equal(code, 0, errs.join('\n'))
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'ctx-fence')
+    const effective = fs.readFileSync(path.join(outDir, 'brief.effective.md'), 'utf8')
+    assert.match(effective, /### areaE\/CONTEXT\.md/, 'relDir 標籤應乾淨地是 areaE（不是一長串 ../）')
+    // 內文最長反引號串是 3（``` ），外層 fence 必須 ≥4 反引號，且開頭與結尾的 fence 長度相同
+    const fenceMatch = effective.match(/(`{4,})text\n([\s\S]*?)\n\1/)
+    assert.ok(fenceMatch, 'effective brief 應含長度 ≥4 的 fence 把整段包起來\n' + effective)
+    assert.match(fenceMatch[2], /```\n一段示範程式碼\n```/, '內文自己的 ``` 應原樣被包在更長的 fence 內，不被提早截斷')
+    assert.match(fenceMatch[2], /### 這是 CONTEXT\.md 內文自己的標題/, '內文自己的 ### 標題應原樣保留在 fence 內')
+    // 外層區塊標題字串不變
+    assert.match(effective, /【區塊環境說明（自動附加；③驗收指令為統整者 --test 用，非寫手白名單，寫手不准跑）】/)
   })
 })

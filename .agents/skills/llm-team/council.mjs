@@ -2,7 +2,8 @@
 // ─────────────────── 規劃／複審會議（依統整者 profile 派複審者） ───────────────────
 // 用法（`--coordinator` 必帶，或設 env LLM_TEAM_COORDINATOR）：
 //   規劃：node .agents/skills/llm-team/council.mjs plan   --coordinator <claude|agy|codex> --prompt <file> --out <dir> [--tier standard|block] [--config <file>]
-//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block [--writer-report <file>] [--review-only] [--diff-cap <字元數>] [--config <file>]
+//   複審：node .agents/skills/llm-team/council.mjs review --coordinator <claude|agy|codex> --worktree <abs> --base <sha> --brief <file> --out <dir> --tier standard|block|postreview [--writer-report <file>] [--review-only] [--diff-cap <字元數>] [--config <file>]（注意：postreview 必須搭配 --review-only 使用）
+// 🔴 1.13.0 finding 要引用：事故 2026-09-20 cron-ledger-platform-drift sol Q3 不簽無引用；陽性對照 llm-team.test.mjs「1.13.0 council：finding 要引用；parseVerdicts 標出無引用的不簽」。
 // 🔴 1.12.0 diff 不截斷（codex＋Gemini 兩輪一致選 B）：截斷的 diff 上「簽」不是整份簽核，一行警告修不了 overall=簽 的語意。
 //   超過 --diff-cap（預設 120000 字元＝完整送審上限）⇒ 在呼叫複審者【之前】停：members.json 寫 []、input.json 記 diff_over_cap、回 6。
 //   下一步是拆票，或確認後 --diff-cap N 重跑（N 入帳：input.json capOverridden、summary、收貨摘要都印）。
@@ -14,7 +15,8 @@
 //   · codex 扣得快：每票最多 2 輪 ＋ 1 次釐清；超過回統整者。
 // 🔴 複審者都是【唯讀】：agy `--mode plan`、codex `--sandbox read-only`。它們的回覆不構成授權。
 // 🔴 M1 8 GB：預設並行但可 --sequential。
-// 🔴 agy 無頭：提示以 NO_EXEC_HEADER 開頭（否則它想跑指令 ⇒ 自動拒絕 ⇒ 零輸出）；codex 讀得到檔，不加。
+// 🔴 agy 無頭：提示以 NO_EXEC_HEADER 開頭（否則它想跑指令 ⇒ 自動拒絕 ⇒ 零輸出）；codex 讀得到檔，不加；
+//   gemini 1.19.0 起也不加（plan 模式唯讀、讀檔工具可用）。這件事由各 harness 自己的 review.args 預設決定，council 不傳。
 // 🔴 提示第一行是哨兵（REVIEW_PROMPT_SENTINEL／PLAN_PROMPT_SENTINEL）：codex 從 cwd 讀得到 AGENTS.md，薄索引靠它判「我是複審者」。
 // 🔴 輸出除了 <成員>.txt，還有 members.json（實際跑的成員身分三元組＋結果）——ticket run／publish 只認它（2026-09-14 codex 複審 Q5）。
 
@@ -24,16 +26,17 @@ import {
   loadConfig,
   modelsFrom,
   memberFileName,
-  NO_EXEC_HEADER,
+  // 1.19.0：NO_EXEC_HEADER 不再從這裡引用（runOne 不傳 noExecHeader，各 harness 用自己的預設）；常數本身仍在 lib.mjs 給 agy 用。
   REVIEW_PROMPT_SENTINEL,
   PLAN_PROMPT_SENTINEL,
-  runAgyAsync,
-  runCodexAsync,
   git,
   ledgerAppend,
   parseArgs,
   isDirectRun,
+  REVIEW_TIERS,
+  TIER_LIST_KEY,
 } from './lib.mjs'
+import { getHarness } from './harnesses/index.mjs'
 
 export function buildReviewQuestions(riskDomains = []) {
   const tail = '若 diff【新增】了會變紅的閘門：有沒有引用本 repo 真實事故＋可重現的陽性對照＋停止條件？沒有 ⇒ 不簽。'
@@ -43,7 +46,7 @@ export function buildReviewQuestions(riskDomains = []) {
       : `Q4 ${tail}`
 
   return [
-    '【請逐項判，每題一行「Qn：簽／不簽｜一句理由｜要改什麼」，最後一行「整份：簽／不簽」。不要寫別的。】',
+    '【請逐項判，每題一行「Qn：簽／不簽｜一句理由｜要改什麼｜引用」。不簽、或指出任何問題（finding）時「引用」必填：diff 裡的 檔名:行號（工作樹行號，可多個），或你跑過的指令與輸出摘要（receipt）。沒有引用的 finding 統整者不納入結論。簽的題「引用」可留空。最後一行「整份：簽／不簽」。不要寫別的。】',
     'Q1 diff 是否只做 brief 要求的事？有沒有 brief 外的改動（順手重構、改到別的檔、改守門）？',
     'Q2 有沒有 fail-open：錯誤被吞、預設放行、空集合恆真的斷言、toBeGreaterThan 這類下界斷言？',
     'Q3 測試量的是不是「這次的變更」？有沒有陽性對照（把修法拿掉會不會紅、紅在哪一條）？',
@@ -53,11 +56,23 @@ export function buildReviewQuestions(riskDomains = []) {
   ].join('\n')
 }
 
+export const REFUTE_SENTENCE = '你沒寫這份改動，也看不到統整者怎麼想；你的任務是設法推翻它——找出哪個輸入、哪個狀態轉移會讓它錯。推翻不了才簽。'
+
 export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, riskDomains = [], roundStart, cumulative, writerReport, reviewOnly = false }) {
   if (!writerModel) throw new Error('buildReviewPrompt 需要 writerModel（來自 config.writer.model）')
+  let roleSentence
+  if (tier === 'postreview') {
+    roleSentence = `你是本 repo 的複審者（事後批次複審）。這些改動已經合進 main，你沒有作者的對話脈絡，只看下面的 brief 與 diff。本輪的產出用途是找出該開修正票或該 revert 的缺陷，不會退回原票重做。Q3 的要求與 review-only 同性質，只判 diff 裡的測試是否量到這次變更、陽性對照的設計對不對，不得以「作者沒交陽性對照證據」當不簽理由。`
+  } else {
+    roleSentence = `你是本 repo 的複審者（${tier === 'block' ? 'block 級' : '一般票'}）。作者是另一個模型（${writerModel}），你沒有它的對話脈絡，只看下面的 brief 與 diff。`
+  }
+  // 🔴 1.22.0 隔離上下文（借自 cloudflare/security-audit-skill 的驗證者）：任務是【推翻】，不是確認。
+  //   複審者可能跟統整者是同一個模型——獨立性來自它看不到統整者的對話與傾向，所以要明說：預設立場是找錯，
+  //   「不簽」只認具體的檔名:行號或指令輸出（下面判準本來就要求引用）。陽性對照 llm-team.test.mjs「1.22.0 prompt 含推翻句」。
+  roleSentence += REFUTE_SENTENCE
   const sections = [
     REVIEW_PROMPT_SENTINEL,
-    `你是本 repo 的複審者（${tier === 'block' ? 'block 級' : '一般票'}）。作者是另一個模型（${writerModel}），你沒有它的對話脈絡，只看下面的 brief 與 diff。`,
+    roleSentence,
     '',
     '【brief（作者拿到的原文）】',
     brief,
@@ -107,25 +122,40 @@ export function buildReviewPrompt({ brief, diff, tier, diffStat, writerModel, ri
 }
 
 /**
- * 跑一位成員。依 member.harness 派：agy ⇒ runAgyAsync（plan 模式、加 NO_EXEC_HEADER）、codex ⇒ runCodexAsync（effort 用 member.effort）。
- * `claude` harness 不在此派（它只准當 coordinator，validateProfiles 已擋）；漏網 ⇒ throw。
+ * 跑一位成員。派工只查 registry：`getHarness(member.harness).review.run(...)`——各 harness 自己決定唯讀姿態
+ * （agy `--mode plan`＋NO_EXEC_HEADER、codex `--sandbox read-only`＋effort、gemini `--approval-mode plan`、1.19.0 起不加 NO_EXEC_HEADER）
+ * 與回覆正文的取法（統一形狀的 `text`）。canReview:false 的 harness（registry 裡沒有 review 介面）⇒ throw。
+ * 1.22.0 起 claude 也有 review 介面（全新無頭行程＝隔離上下文，見 harnesses/claude.mjs 檔頭）。
+ * deps.getHarness 是測試接縫（注入假 harness）；deps.env／deps.spawn／deps.resolveGeminiApiKey 原封轉傳給 review.run。
  * 輸出檔名用 memberFileName（agy/gemini ⇒ agy-gemini.txt）。
  */
 async function runOne(member, prompt, cwd, outDir, timeoutMs, deps = {}) {
   const started = Date.now()
-  const runCodexFn = deps.runCodexAsync || runCodexAsync
-  const runAgyFn = deps.runAgyAsync || runAgyAsync
+  const getHarnessFn = deps.getHarness || getHarness
   const { name, model, harness } = member
-  let r
-  if (harness === 'codex') {
-    r = await runCodexFn({ model, prompt, cwd, timeoutMs, effort: member.effort || 'high', env: deps.env, spawn: deps.spawn })
-  } else if (harness === 'agy') {
-    r = await runAgyFn({ model, mode: 'plan', prompt: NO_EXEC_HEADER + prompt, cwd, timeoutMs, env: deps.env, spawn: deps.spawn })
-  } else {
-    throw new Error(`council 不派 harness=${harness}（成員 ${name}）：claude 只准當 coordinator`)
+  const h = getHarnessFn(harness)
+  if (!h.canReview) {
+    throw new Error(`council 不派 harness=${harness}（成員 ${name}）：${harness} 沒有 review 介面（canReview:false）`)
   }
+  // 🔴 r3：resolveKey 一併轉傳（deps.resolveGeminiApiKey 是測試接縫；undefined 時 harness 走自己的預設值）。
+  // 🔴 1.19.0：`noExecHeader` 這裡【不傳】——唯讀姿態由各 harness 自己決定，council 不替它們決定：
+  //   · agy：自己的預設就是 NO_EXEC_HEADER（`harnesses/agy.mjs`；2026-09-13 實測，無頭模式工具被拒 ⇒ stdout 空、exit 仍 0）。
+  //   · gemini：1.19.0 起預設是空字串（`harnesses/gemini.mjs`；`--approval-mode plan` 本來就唯讀、讀檔工具可用，
+  //     2026-09-23 真跑對照：不加那句才答得出 `docs/WBS.md` 934 行、`## 1.8` 段 30 列）。
+  //   · codex：不收這個參數（從 cwd 讀得到 AGENTS.md，本來就不加）。
+  //   從前這裡無條件傳 NO_EXEC_HEADER，等於蓋掉每個 harness 的預設——gemini 改了預設也沒用（no-op）。
+  const r = await h.review.run({
+    model,
+    prompt,
+    cwd,
+    timeoutMs,
+    effort: member.effort,
+    env: deps.env,
+    spawn: deps.spawn,
+    resolveKey: deps.resolveGeminiApiKey,
+  })
   const timedOut = r.timedOut === true
-  const text = timedOut ? '' : (harness === 'codex' ? r.stdout : (r.result && r.result.response) || '')
+  const text = timedOut ? '' : r.text || ''
   const file = memberFileName(name)
   fs.writeFileSync(path.join(outDir, `${file}.txt`), text)
   fs.writeFileSync(path.join(outDir, `${file}.stderr.txt`), r.stderr || '')
@@ -141,21 +171,31 @@ async function runOne(member, prompt, cwd, outDir, timeoutMs, deps = {}) {
     ms: Date.now() - started,
     empty,
     denied: r.denied || [],
+    // 1.16.0：統一形狀的 failure 原樣帶出（codex 額度用盡的 stderr 以前只顯示「零輸出」）；既有欄位字面不變。
+    failure: r.failure || null,
     text,
   }
 }
 
+export const CITATION_RE = /[^\s「」()（）]+\.[A-Za-z0-9]{1,6}:\d+|`[^`]*[^`\s][^`]*`/
+
 export function parseVerdicts(text) {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
   const q = {}
+  const uncited = []
   let overall = null
   for (const l of lines) {
     const m = l.match(/^(Q\d+|P\d+)[：:]\s*(簽|不簽)/)
-    if (m) q[m[1]] = m[2]
+    if (m) {
+      q[m[1]] = m[2]
+      if (m[2] === '不簽' && !CITATION_RE.test(l)) {
+        uncited.push(m[1])
+      }
+    }
     const o = l.match(/整份[：:]\s*\**\s*(簽|不簽)/)
     if (o) overall = o[1]
   }
-  return { q, overall }
+  return { q, overall, uncited }
 }
 
 export async function main(argv, deps = {}) {
@@ -200,8 +240,27 @@ export async function main(argv, deps = {}) {
   const timeoutMs = Number(a['timeout-ms'] || 8 * 60 * 1000)
   let prompt
   let cwd = process.cwd()
-  const tier = a.tier === 'block' ? 'block' : 'standard'
-  const members = tier === 'block' ? models.blockReviewers : models.reviewers
+
+  let tier = 'standard'
+  if (a.tier !== undefined) {
+    if (!REVIEW_TIERS.includes(a.tier)) {
+      console.error(`🔴 --tier "${a.tier}" 不支援，可用值：${REVIEW_TIERS.join('、')}`)
+      return 2
+    }
+    tier = a.tier
+  }
+
+  if (sub !== 'review' && tier === 'postreview') {
+    console.error(`🔴 --tier postreview 只准用在 review 子指令`)
+    return 2
+  }
+
+  if (tier === 'postreview' && a['review-only'] !== true) {
+    console.error(`🔴 --tier postreview 必須與 --review-only 一起使用（事後審沒有寫手、沒有回審迴圈）`)
+    return 2
+  }
+
+  const members = models[TIER_LIST_KEY[tier]]
 
   if (sub === 'plan') {
     if (!a.prompt) return usage()
@@ -283,7 +342,11 @@ export async function main(argv, deps = {}) {
   } else return usage()
 
   if (members.length === 0) {
-    console.error(`🔴 沒有任何複審者（profile ${models.coordinator.profile} 的 ${tier === 'block' ? 'blockReviewers' : 'reviewers'} 空）`)
+    let extraMsg = ''
+    if (tier === 'postreview') {
+      extraMsg = `（在 llm-team.config.json 的 profiles.${models.coordinator.profile} 加 postReviewers）`
+    }
+    console.error(`🔴 沒有任何複審者（profile ${models.coordinator.profile} 的 ${TIER_LIST_KEY[tier]} 空）${extraMsg}`)
     return 2
   }
 
@@ -344,9 +407,9 @@ export async function main(argv, deps = {}) {
     const isTimeout = r.timedOut === true
     const isAborted = !isTimeout && Boolean(r.signal)
     const v = isTimeout
-      ? { q: {}, overall: '不簽（timeout）' }
+      ? { q: {}, overall: '不簽（timeout）', uncited: [] }
       : (isAborted
-        ? { q: {}, overall: '不簽（被中止）' }
+        ? { q: {}, overall: '不簽（被中止）', uncited: [] }
         : parseVerdicts(r.text || ''))
     r.verdicts = v
     if (isTimeout || isAborted) {
@@ -384,12 +447,14 @@ export async function main(argv, deps = {}) {
       quotaBucket: m.quotaBucket,
       overall: r.verdicts.overall,
       q: r.verdicts.q,
+      uncited: r.empty === true || r.timedOut === true ? [] : (r.verdicts.uncited || []),
       empty: r.empty === true,
       timedOut: r.timedOut === true,
       invalid: r.empty !== true && r.verdicts.overall === null,
       exit: r.exit ?? null,
       signal: r.signal || null,
       ms: r.ms ?? null,
+      failure: r.failure || null,
     }
   })
   fs.writeFileSync(path.join(outDir, 'members.json'), JSON.stringify(membersOut, null, 2))

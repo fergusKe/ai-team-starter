@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `llm-team`（`write.mjs`／`council.mjs`／`ticket.mjs`／`setup.mjs`／`export.mjs`／`usage.mjs`／兩個 PreToolUse 轉接器）的測試。
+# `llm-team`（`write.mjs`／`council.mjs`／`ticket.mjs`／`setup.mjs`／`export.mjs`／`usage.mjs`／`harnesses/`／兩個 PreToolUse 轉接器）的測試。
 # 寫手 wrapper 與票流程不是閘門，但它們的 fail-closed 判定是尺，尺要有測試。
 set -euo pipefail
 
@@ -9,28 +9,52 @@ cd "$DIR"
 # 事故＝`--test` 子行程序列化通道被測試裡的裸 stdout 插壞、檔案級紅但斷言全綠、2026-09-15 撞到一次；
 # 陽性對照＝把任一步改回 `node --test` 並不會立刻紅——這是時序 flake，對照只能是『直接執行的檔有真斷言失敗時 test.sh 仍 exit 非 0』；
 # 停止條件＝Node runner 修掉這條（或改用 `--test-isolation=none` 經實測 100 輪全綠）時再改回 `--test` 取回並行。
-echo "── 1/9 agy-pretooluse.test.mjs ──"
+echo "── 1/10 agy-pretooluse.test.mjs ──"
 node agy-pretooluse.test.mjs
 
-echo "── 2/9 llm-team.test.mjs ──"
+echo "── 2/10 llm-team.test.mjs ──"
 node llm-team.test.mjs
 
-echo "── 3/9 ticket.test.mjs ──"
+# 事故＝2026-09-22 加 gemini 複審席動了 5 個檔（呼叫點各自認 harness 名字，council 回覆取法漏一種就整席零輸出）；
+# 1.15.0：harness registry 與各 harness 模組的契約／統一形狀／派工接縫（deps.getHarness）；
+# 陽性對照＝把 council.mjs／write.mjs／setup.mjs 任一處塞回 `harness === '` 字面 ⇒ ⑧ 靜態檢查紅；把 registry 少一列 ⇒ ② 紅；
+# 停止條件＝harness 物件改由型別／schema 在 CI 驗、呼叫點三個月沒再長出分支時，⑧ 可降為警告（本步保留）。
+echo "── 3/10 harnesses.test.mjs ──"
+# 1.16.0：gemini 寫手 parser 測試吃真跑 fixture；缺檔或 fixture 裡出現 key 前綴 ⇒ 先紅在這裡，不進 node 測試。
+# 事故＝2026-09-22 同一個 session 兩次 key 外洩：(1) `execFileSync` 失敗時 Node 把整條 argv（含 key）回印進錯誤訊息；
+#   (2) `key.md` 的鍵名被印到終端。fixture 是「真 API 跑出來的 stdout 原樣存檔、會進 git、會 export 到每個專案」——
+#   是這條鏈上最容易把 key 帶出去又最少人再看的地方，所以在 node 測試之前就掃一次 Google API key 前綴 `AIza`。
+# 陽性對照（sol Q4，2026-09-22 r2 已重放）：把假字串 `AIzaFAKE_NOT_A_KEY_0000` 塞進 gemini-write-stream.ndjson 尾端 ⇒
+#   3/10 印「🔴 fixture 含 API key 前綴」、exit 1；還原後全綠。缺檔（mv 走）⇒ 印「🔴 缺 fixture」、exit 1。
+# 停止條件＝fixture 目錄由 CI 的 secret-scan（gitleaks／trufflehog 一類）掃到時，本段撤、改信 CI。
+for f in harnesses/__fixtures__/gemini-write-stream.ndjson harnesses/__fixtures__/gemini-write-denied.ndjson; do
+  if [ ! -s "$f" ]; then
+    echo "🔴 缺 fixture：${f}（gemini 寫手 parser 測試需要；快照 export 要帶它）" >&2
+    exit 1
+  fi
+  if grep -q 'AIza' "$f"; then
+    echo "🔴 fixture 含 API key 前綴：$f" >&2
+    exit 1
+  fi
+done
+node harnesses.test.mjs
+
+echo "── 4/10 ticket.test.mjs ──"
 node ticket.test.mjs
 
-echo "── 4/9 batch.test.mjs ──"
+echo "── 5/10 batch.test.mjs ──"
 node batch.test.mjs
 
-echo "── 5/9 export.test.mjs ──"
+echo "── 6/10 export.test.mjs ──"
 node export.test.mjs
 
-echo "── 6/9 codex-pretooluse.test.mjs ──"
+echo "── 7/10 codex-pretooluse.test.mjs ──"
 node codex-pretooluse.test.mjs
 
 # 事故＝WAS `_handoff.md` 2026-09-15 第一段「rtk 省 token 宣稱 vs 實測 cache_read 折算後上限 0.19–0.38%」——沒有量測工具時省了多少全靠說；
 # 陽性對照＝把 `usage.mjs` 的 harness 判定拿掉 ⇒ `usage.test.mjs` 的 (a)／(h) 紅；
 # 停止條件＝各 harness 都有 transcript 可量（`measurable:false` 不再出現）時，把 harness 判定段拆掉、本步保留。
-echo "── 7/9 usage.test.mjs ──"
+echo "── 8/10 usage.test.mjs ──"
 node usage.test.mjs
 
 # 🔴 事故：1.7.4 的 SKILL.md L73「config repo 現有 15 張 llm-team 工具票…grandfathered」、L88 postExport 舉例
@@ -62,7 +86,7 @@ node usage.test.mjs
 #   （export.test.mjs 對應有 `stripJsComments` 的 JS 版與同款陽性對照「1.8.0 ④ (Q5)」。）
 # 停止條件：targets.json 的 target metadata schema 有機器驗證（例如 setup.mjs --sync-check 逐 target 驗 nextSteps／
 #   postExport 形狀）且 export.test.mjs 對每個真實 target 都有對應斷言時，這道 literal gate 可以撤（改信 schema 驗證）。
-echo "── 8/9 共用快照不放單一專案操作事實（literal check） ──"
+echo "── 9/10 共用快照不放單一專案操作事實（literal check） ──"
 fail=0
 check_absent() {
   local pattern="$1" file="$2"
@@ -99,7 +123,7 @@ echo "  ✓ SKILL.md／export.mjs 沒有殘留單一專案操作事實"
 # 陽性對照：把 SKILL.md 的 accept 步驟砍掉、或把「兩回合」字面塞回去，這一步就會紅。
 # 停止條件：〈標準程序骨架〉改由 `ticket.mjs --help`（或等價的機器可讀說明）直接生成、SKILL.md 不再手寫這段流程時，
 #   這道 literal gate 可以撤。
-echo "── 9/9 標準程序骨架含 accept、不含次數宣稱（literal check） ──"
+echo "── 10/10 標準程序骨架含 accept、不含次數宣稱（literal check） ──"
 fail=0
 if ! grep -qF 'ticket.mjs accept' SKILL.md; then
   echo "🔴 SKILL.md〈標準程序骨架〉必須含 ticket.mjs accept 這一步" >&2
