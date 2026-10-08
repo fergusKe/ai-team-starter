@@ -28,6 +28,7 @@ import {
   attributeRecord,
   cohortReport,
   measureTicketLive,
+  landedMissingWarning,
   canonicalStringify,
   buildCohortPayload,
   writeCohortJson,
@@ -3769,4 +3770,31 @@ test('1.8.0 ③ (Q9-b) 陽性對照：走真的 --cohort production 路徑——
 
   assert.notEqual(after.recordsHash, before.recordsHash, '__proto__ 底下的值變了，recordsHash 應該跟著變（不是被當成原型 setter 吞掉）')
   assert.notEqual(after.inputHash, before.inputHash, 'inputHash 也應該跟著變')
+})
+
+test('1.24.0 landedMissingWarning：accepted 無 landed ⇒ 一行警示（含 tools/land.mjs）；有 landed、或沒 accepted ⇒ null；measureTicketLive 真的把它印到 stderr', async () => {
+  const acc = { at: '2026-10-04T01:00:00.000Z', event: 'accepted', ticket: 'tw' }
+  const run = { at: '2026-10-04T00:00:00.000Z', event: 'run-start', ticket: 'tw' }
+  const w = landedMissingWarning([run, acc], 'tw')
+  assert.match(w, /landed 事件從缺/)
+  assert.match(w, /tools\/land\.mjs/)
+  assert.equal(w.split('\n').length, 1)
+  assert.equal(landedMissingWarning([run, acc, { at: '2026-10-04T02:00:00.000Z', event: 'landed', ticket: 'tw' }], 'tw'), null)
+  assert.equal(landedMissingWarning([run], 'tw'), null)
+  assert.equal(landedMissingWarning(undefined), null)
+  // 真呼叫點：measureTicketLive 遇到 accepted 無 landed ⇒ stderr 有這行
+  const root = mkdtempSync(join(tmpdir(), 'usage-lm-'))
+  const localDir = join(root, '.local', 'llm-team')
+  mkdirSync(join(localDir, 'tw'), { recursive: true })
+  writeFileSync(join(localDir, 'tw', 'lifecycle.ndjson'), [run, acc].map((e) => JSON.stringify(e)).join('\n') + '\n')
+  const errs = []
+  const origErr = console.error
+  console.error = (m) => errs.push(String(m))
+  try {
+    await measureTicketLive('tw', localDir, {}, root, { projectsRoot: join(root, 'no-projects') }).catch(() => {})
+  } finally {
+    console.error = origErr
+    rmSync(root, { recursive: true, force: true })
+  }
+  assert.ok(errs.some((l) => /landed 事件從缺：票 tw/.test(l)), `stderr 應含警示，實際：${JSON.stringify(errs)}`)
 })

@@ -100,8 +100,8 @@ node .agents/skills/llm-team/ticket.mjs publish \
   --title "feat: handle denied permissions in runner"
 ```
 
-不開 PR、直接落地到 main 的專案用 `land` 代替 `publish`：`ticket.mjs land --name <n> --msg-file <commit 訊息檔>`
-（一樣要先 `accept`；複審後 worktree 又改過 ⇒ exit 7）。
+不開 PR、直接落地到 main 的專案走該專案的唯一合併入口（WAS：在 main 執行 `node tools/land.mjs --branch <分支> --name <n> --msg-file <commit 訊息檔>`；一樣要先 `accept`）。
+llm-team 1.24.0 起 `ticket.mjs land` 一律 exit 2、不再自行 merge。
 
 ---
 

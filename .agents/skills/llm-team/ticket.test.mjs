@@ -14,10 +14,10 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { CLEAN_GIT_ENV, buildSafeCommandRegex, writeTreeOf, git, MEASUREMENT_SCHEMA_VERSION } from './lib.mjs'
-import { main as ticketMain, runCli } from './ticket.mjs'
+import { memberFileName, CLEAN_GIT_ENV, buildSafeCommandRegex, writeTreeOf, git, MEASUREMENT_SCHEMA_VERSION } from './lib.mjs'
+import { main as ticketMain, runCli, backtickFence } from './ticket.mjs'
 import { main as setupMain } from './setup.mjs'
-import { parseVerdicts } from './council.mjs'
+import { parseVerdicts, main as councilMain } from './council.mjs'
 import { EXPORT_FILES } from './export.mjs'
 
 function tmpdir(prefix) {
@@ -127,7 +127,7 @@ function fakeCouncilOut(reviewOutDir, files, opts = {}) {
 /** publish fixture：summary.review.members（補上三元組）＋ review/members.json 寫同一份。members：[{ name, overall, q? }]。 */
 function reviewFixture(outDir, members) {
   const rows = members.map((m) => ({ ...(MEMBER_BY_NAME[m.name] || {}), ...m }))
-  const reviewDir = path.join(outDir, 'review')
+  const reviewDir = path.join(outDir, 'review-r1')
   fs.mkdirSync(reviewDir, { recursive: true })
   fs.writeFileSync(path.join(reviewDir, 'members.json'), JSON.stringify(rows, null, 2))
   return rows
@@ -154,7 +154,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 新增功能票\n實作細節')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't1')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't1', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't1', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -331,7 +331,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 零輸出票\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't3')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't3', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't3', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -383,7 +383,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 不簽票\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't4')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't4', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't4', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -712,18 +712,20 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errOutput, /用法：run/, `stderr 應包含用法，實際：${errOutput}`)
   })
 
-  test('T10 run 清舊複審：<outDir>/review/opus.txt 預先放「整份：不簽」殘留、councilMain 這輪產「整份：簽」⇒ summary 是「簽」（證明清過）', async () => {
+  test('T10 run 舊結構殘留：<outDir>/review/（1.26.0 前的當前輪）預先放「整份：不簽」殘留、councilMain 這輪產「整份：簽」⇒ 殘留改名 review-r1 保存、本輪寫 review-r2、summary 是「簽」（證明本輪沒讀到殘留）', async () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# 清舊複審票\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't10')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't10', 'review')
+    const staleDir = path.join(repo.dir, '.local', 'llm-team', 't10', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't10', 'review-r2')
 
-    // 預先在 <outDir>/review/ 放殘留的 opus.txt（不簽）
-    fs.mkdirSync(reviewOutDir, { recursive: true })
+    // 預先在 <outDir>/review/（舊結構）放殘留的 opus.txt（不簽）
+    fs.mkdirSync(staleDir, { recursive: true })
     const opusPath = path.join(reviewOutDir, 'agy-opus.txt')
-    fs.writeFileSync(opusPath, 'Q1：不簽｜殘留舊資料｜需修正\n整份：不簽\nQ6：舊殘留')
+    const staleOpus = path.join(staleDir, 'agy-opus.txt')
+    fs.writeFileSync(staleOpus, 'Q1：不簽｜殘留舊資料｜需修正\n整份：不簽\nQ6：舊殘留')
 
     let existsBeforeCouncilMain = null
 
@@ -768,7 +770,9 @@ describe('ticket.mjs 票流程測試', () => {
     }
 
     assert.equal(code, 0, `run exit 應為 0，實際為 ${code}`)
-    assert.equal(existsBeforeCouncilMain, false, '呼叫 council 前舊的 opus.txt 應已被清空')
+    assert.equal(existsBeforeCouncilMain, false, '呼叫 council 前本輪目錄（review-r2）沒有舊的 opus.txt')
+    assert.ok(fs.existsSync(path.join(repo.dir, '.local', 'llm-team', 't10', 'review-r1', 'agy-opus.txt')), '舊結構的 review/ 改名 review-r1 保存')
+    assert.equal(fs.existsSync(staleDir), false, '舊的 review/ 不再存在')
     const summaryFile = path.join(repo.dir, '.local', 'llm-team', 't10', 'summary.json')
     assert.ok(fs.existsSync(summaryFile), 'summary.json 應存在')
     const summary = JSON.parse(fs.readFileSync(summaryFile, 'utf8'))
@@ -784,7 +788,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile1, '# 涉及金流模組之修改\n包含金流交易處理')
 
     const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't11-escalate')
-    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't11-escalate', 'review')
+    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't11-escalate', 'review-r1')
 
     let receivedCouncilArgs1 = null
     const deps1 = {
@@ -845,7 +849,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile2, '# 涉及金流模組之修改\n包含金流交易處理')
 
     const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't11-standard')
-    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't11-standard', 'review')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't11-standard', 'review-r1')
 
     let receivedCouncilArgs2 = null
     const deps2 = {
@@ -1040,7 +1044,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T20\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't20')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't20', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't20', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -1093,7 +1097,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T21\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't21')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't21', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't21', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -1453,7 +1457,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T27\n內容')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't27')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't27', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't27', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -1761,7 +1765,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
     const outDir = path.join(repo.dir, '.local', 'llm-team', 'q5p')
     fs.mkdirSync(outDir, { recursive: true })
-    const membersFile = path.join(outDir, 'review', 'members.json')
+    const membersFile = path.join(outDir, 'review-r1', 'members.json')
     const baseSummary = () => ({
       schemaVersion: 2,
       coordinator: 'claude',
@@ -1902,7 +1906,7 @@ describe('ticket.mjs 票流程測試', () => {
       fs.writeFileSync(briefFile, '# Q5 run\n內容')
       const name = `q5r-${cases.indexOf(c)}`
       const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
-      const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+      const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review-r1')
       const deps = {
         repoRoot: repo.dir,
         assertSettings: () => true,
@@ -1948,7 +1952,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# Q5 ok\n內容')
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'q5ok')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'q5ok', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'q5ok', 'review-r1')
     const deps = {
       repoRoot: repo.dir,
       assertSettings: () => true,
@@ -1974,7 +1978,7 @@ describe('ticket.mjs 票流程測試', () => {
     const summary = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'q5ok', 'summary.json'), 'utf8'))
     assert.equal(summary.rosterMismatch, false)
     assert.equal(summary.rosterDiff, undefined)
-    assert.equal(summary.review.membersSource, 'review/members.json')
+    assert.equal(summary.review.membersSource, 'review-r1/members.json')
     assert.deepEqual(
       summary.review.members.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut })),
       [
@@ -2320,7 +2324,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile1 = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile1, '# T36 all\n內容')
     const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't36-all')
-    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't36-all', 'review')
+    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't36-all', 'review-r1')
 
     const deps1 = {
       repoRoot: repo1.dir,
@@ -2409,7 +2413,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile2 = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile2, '# T36 block\n內容')
     const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't36-block')
-    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't36-block', 'review')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't36-block', 'review-r1')
 
     const deps2 = {
       repoRoot: repo2.dir,
@@ -2511,7 +2515,7 @@ describe('ticket.mjs 票流程測試', () => {
     // 陽性對照：同一組 deps 但 writeMain 回 0 ⇒ council 與 runTest 都被呼叫
     const repo2 = makeRepo()
     const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 'p5b')
-    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 'p5b', 'review')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 'p5b', 'review-r1')
     const deps2 = {
       ...deps,
       repoRoot: repo2.dir,
@@ -2607,7 +2611,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // 明示 --coordinator agy
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'c1')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'c1', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'c1', 'review-r1')
     let councilArgs = null
     const deps2 = {
       ...deps,
@@ -2911,7 +2915,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 新增功能票\n實作細節')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't39')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't39', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't39', 'review-r1')
 
     const deps = {
       repoRoot: repo.dir,
@@ -3052,908 +3056,6 @@ describe('ticket.mjs 票流程測試', () => {
     assert.match(errs2[0].message, /councilMain 拋出例外/)
   })
 
-  function makeLandFixture({ name = 'tland', branch = 'feat/tland', changed = ['file.txt'] } = {}) {
-    const repo = makeRepo()
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
-    fs.mkdirSync(worktreePath, { recursive: true })
-    for (const f of changed) {
-      fs.mkdirSync(path.dirname(path.join(worktreePath, f)), { recursive: true })
-      fs.writeFileSync(path.join(worktreePath, f), 'content')
-    }
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', name)
-    fs.mkdirSync(outDir, { recursive: true })
-    fs.writeFileSync(path.join(outDir, 'brief.md'), `# Brief ${name}\n說明`)
-
-    const summary = {
-      schemaVersion: 2,
-      coordinator: 'claude',
-      reviewers: ROSTER_STANDARD,
-      project: 'test-proj',
-      ticket: name,
-      branch,
-      base: 'main',
-      roundStartSha: 'mock-round-start-sha',
-      mergeBase: 'mock-merge-base-sha',
-      targetTipSha: 'mock-target-tip-sha',
-      writeExit: 0,
-      rounds: 1,
-      changed,
-      verifyExit: 0,
-      review: {
-        tier: 'standard',
-        members: reviewFixture(outDir, [
-          { name: 'agy/opus', overall: '簽' },
-          { name: 'agy/gemini', overall: '簽' },
-        ]),
-        anyEmpty: false,
-        reviewedTree: writeTreeOf(worktreePath),
-      },
-      q6Receipt: 'verified',
-      coordinatorTurns: null,
-      startedAt: '2026-09-13T00:00:00Z',
-      finishedAt: '2026-09-13T00:05:00Z',
-    }
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, `feat: ${name}\n`)
-
-    return { repo, worktreePath, outDir, summary, msgFile }
-  }
-
-  test('T42 land (a)：主 checkout 不在 main ⇒ 2 且 git 沒有 add／merge', async () => {
-    const { repo, msgFile } = makeLandFixture({ name: 't42' })
-    const gitCalls = []
-    const deps = {
-      repoRoot: repo.dir,
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/other-branch'
-        }
-        return ''
-      },
-    }
-
-    const code = await ticketMain(['land', '--name', 't42', '--msg-file', msgFile], deps)
-    assert.equal(code, 2, `主 checkout 不在 main 時應回 2，實際為 ${code}`)
-    const hasAdd = gitCalls.some((c) => c.args[0] === 'add')
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasAdd, false, '不應呼叫 git add')
-    assert.equal(hasMerge, false, '不應呼叫 git merge')
-  })
-
-  test('T43 land (b)：worktree 分支 ≠ summary.branch ⇒ 4 且無 add／merge', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({ name: 't43', branch: 'feat/t43' })
-    const gitCalls = []
-    const deps = {
-      repoRoot: repo.dir,
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/mismatched'
-        }
-        return ''
-      },
-    }
-
-    const code = await ticketMain(['land', '--name', 't43', '--msg-file', msgFile], deps)
-    assert.equal(code, 4, `worktree 分支不符時應回 4，實際為 ${code}`)
-    const hasAdd = gitCalls.some((c) => c.args[0] === 'add')
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasAdd, false, '不應呼叫 git add')
-    assert.equal(hasMerge, false, '不應呼叫 git merge')
-  })
-
-  test('T44 land (c)：夾帶檔 ⇒ 4 且沒有 add', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({ name: 't44', branch: 'feat/t44', changed: ['file.txt'] })
-    const gitCalls = []
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt', 'decoy.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t44'
-        }
-        return ''
-      },
-    }
-
-    const code = await ticketMain(['land', '--name', 't44', '--msg-file', msgFile], deps)
-    assert.equal(code, 4, `有夾帶檔時應回 4，實際為 ${code}`)
-    const hasAdd = gitCalls.some((c) => c.args[0] === 'add')
-    assert.equal(hasAdd, false, '不應呼叫 git add')
-  })
-
-  test('T45 land (d)：正常路徑：add 逐檔 → commit -F → merge --ff-only → 回 0、stdout 最後一行 LANDED …、lifecycle 多一筆 landed', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({
-      name: 't45',
-      branch: 'feat/t45',
-      changed: ['file1.txt', 'file2.txt'],
-    })
-    const gitCalls = []
-    const outs = []
-    const origLog = console.log
-    console.log = (m) => outs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file1.txt', 'file2.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t45'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return 'file1.txt\nfile2.txt'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return 'new-main-sha-45'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'main') {
-          return 'mock-target-tip-sha'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't45', '--msg-file', msgFile], deps)
-    } finally {
-      console.log = origLog
-    }
-
-    assert.equal(code, 0, `正常落地應回 0，實際為 ${code}`)
-
-    // 斷言呼叫了哪些 git 引數、順序
-    const addCalls = gitCalls.filter((c) => c.args[0] === 'add')
-    assert.equal(addCalls.length, 2, '應逐檔呼叫 add')
-    assert.deepEqual(addCalls[0].args, ['add', '--', 'file1.txt'])
-    assert.deepEqual(addCalls[1].args, ['add', '--', 'file2.txt'])
-    assert.equal(addCalls[0].cwd, worktreePath)
-    assert.equal(addCalls[1].cwd, worktreePath)
-
-    const commitCall = gitCalls.find((c) => c.args[0] === 'commit')
-    assert.ok(commitCall, '應呼叫 commit')
-    assert.deepEqual(commitCall.args, ['commit', '-F', msgFile])
-    assert.equal(commitCall.cwd, worktreePath)
-
-    const mergeCall = gitCalls.find((c) => c.args[0] === 'merge')
-    assert.ok(mergeCall, '應呼叫 merge')
-    assert.deepEqual(mergeCall.args, ['merge', '--ff-only', 'feat/t45'])
-    assert.equal(mergeCall.cwd, repo.dir)
-
-    // 順序：add 逐檔在 commit 前，commit 在 merge 前
-    const addIdx0 = gitCalls.indexOf(addCalls[0])
-    const addIdx1 = gitCalls.indexOf(addCalls[1])
-    const commitIdx = gitCalls.indexOf(commitCall)
-    const mergeIdx = gitCalls.indexOf(mergeCall)
-    assert.ok(addIdx0 < addIdx1 && addIdx1 < commitIdx && commitIdx < mergeIdx, 'git 呼叫順序應為 add -> commit -> merge')
-
-    // 不准 push、不准刪 worktree／分支
-    assert.equal(gitCalls.some((c) => c.args[0] === 'push'), false, '不准 push')
-    assert.equal(gitCalls.some((c) => c.args[0] === 'branch' && c.args[1] === '-d'), false, '不准刪分支')
-    assert.equal(gitCalls.some((c) => c.args[0] === 'worktree' && c.args[1] === 'remove'), false, '不准 remove worktree')
-
-    // stdout 最後一行 LANDED …
-    const outText = outs.join('\n').trim()
-    const outLines = outText.split('\n')
-    assert.equal(outLines[outLines.length - 1], 'LANDED t45 feat/t45 new-main-sha-45')
-
-    // lifecycle 多一筆 landed
-    const lifecyclePath = path.join(outDir, 'lifecycle.ndjson')
-    assert.ok(fs.existsSync(lifecyclePath), 'lifecycle.ndjson 應存在')
-    const lines = fs.readFileSync(lifecyclePath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
-    const landedEntry = lines.find((e) => e.event === 'landed')
-    assert.ok(landedEntry, 'lifecycle 應有 landed 事件')
-    assert.equal(landedEntry.ticket, 't45')
-    assert.equal(landedEntry.branch, 'feat/t45')
-    assert.equal(landedEntry.sha, 'new-main-sha-45')
-  })
-
-  test('T46 land (e)：沒 staged 且 worktree HEAD＝main ⇒ 5、沒有 merge', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({ name: 't46', branch: 'feat/t46', changed: ['file.txt'] })
-    const gitCalls = []
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => [],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t46'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return ''
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return 'same-sha'
-        }
-        return ''
-      },
-    }
-
-    const code = await ticketMain(['land', '--name', 't46', '--msg-file', msgFile], deps)
-    assert.equal(code, 5, `沒 staged 且 worktree HEAD 等於 main HEAD 時應回 5，實際為 ${code}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, '不應呼叫 git merge')
-  })
-
-  test('T47 land (f)：沒 staged 但分支領先 ⇒ 不 commit、有 merge、回 0', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 't47', branch: 'feat/t47', changed: ['file.txt'] })
-    const gitCalls = []
-    const outs = []
-    const origLog = console.log
-    console.log = (m) => outs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => [],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t47'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return ''
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          if (cwd === worktreePath) return 'ahead-sha-47'
-          const hasMerged = gitCalls.some((c) => c.args[0] === 'merge')
-          return hasMerged ? 'ahead-sha-47' : 'behind-sha-47'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'main') {
-          return 'mock-target-tip-sha'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't47', '--msg-file', msgFile], deps)
-    } finally {
-      console.log = origLog
-    }
-
-    assert.equal(code, 0, `分支已領先時應回 0，實際為 ${code}`)
-    const hasCommit = gitCalls.some((c) => c.args[0] === 'commit')
-    assert.equal(hasCommit, false, '不應呼叫 git commit')
-    const mergeCall = gitCalls.find((c) => c.args[0] === 'merge')
-    assert.ok(mergeCall, '應呼叫 git merge')
-    assert.deepEqual(mergeCall.args, ['merge', '--ff-only', 'feat/t47'])
-
-    const outText = outs.join('\n').trim()
-    assert.ok(outText.includes('分支已領先 main，視為已 commit 過'))
-    assert.ok(outText.includes('LANDED t47 feat/t47 ahead-sha-47'))
-  })
-
-  test('T48 land (g)：ff-only 失敗 ⇒ 6 且訊息印 main 與 branch 的 sha', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({ name: 't48', branch: 'feat/t48', changed: ['file.txt'] })
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t48'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return 'file.txt'
-        }
-        if (args[0] === 'merge' && args[1] === '--ff-only') {
-          throw new Error('fatal: Not possible to fast-forward, aborting.')
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return 'main-diverged-sha'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'feat/t48') {
-          return 'branch-diverged-sha'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'main') {
-          return 'mock-target-tip-sha'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't48', '--msg-file', msgFile], deps)
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 6, `ff-only 失敗時應回 6，實際為 ${code}`)
-    const errText = errs.join('\n')
-    assert.ok(errText.includes('main-diverged-sha'), `錯誤訊息應含 main sha，實際：${errText}`)
-    assert.ok(errText.includes('branch-diverged-sha'), `錯誤訊息應含 branch sha，實際：${errText}`)
-  })
-
-  test('T49 land (h)：假 gitFn 對 diff --cached --name-only throw（訊息不含 fatal:，Error 無 status）⇒ main() reject 且無 commit／merge', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({
-      name: 't49',
-      branch: 'feat/t49',
-      changed: ['file.txt'],
-    })
-    const gitCalls = []
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t49'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          throw new Error('error: cannot lock index file (index.lock exists)')
-        }
-        return ''
-      },
-    }
-
-    await assert.rejects(
-      async () => {
-        await ticketMain(['land', '--name', 't49', '--msg-file', msgFile], deps)
-      },
-      (err) => {
-        // 只驗「炸出來的是 mock 那顆錯」；mock 自己有沒有 status／fatal: 是 fixture 規格，不是契約（Gemini 第 2 輪 Q5）
-        assert.match(err.message, /index\.lock/)
-        return true
-      }
-    )
-
-    const hasCommit = gitCalls.some((c) => c.args[0] === 'commit')
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasCommit, false, 'git 呼叫序列裡不應有 commit')
-    assert.equal(hasMerge, false, 'git 呼叫序列裡不應有 merge')
-  })
-
-  test('T50 land (i)：--name-only 回 空字串 且分支領先 ⇒ 不 commit、有 merge、回 0', async () => {
-    const { repo, worktreePath, msgFile } = makeLandFixture({ name: 't50', branch: 'feat/t50', changed: ['file.txt'] })
-    const gitCalls = []
-    const outs = []
-    const origLog = console.log
-    console.log = (m) => outs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => [],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t50'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return ''
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          if (cwd === worktreePath) return 'ahead-sha-50'
-          const hasMerged = gitCalls.some((c) => c.args[0] === 'merge')
-          return hasMerged ? 'ahead-sha-50' : 'behind-sha-50'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'main') {
-          return 'mock-target-tip-sha'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't50', '--msg-file', msgFile], deps)
-    } finally {
-      console.log = origLog
-    }
-
-    assert.equal(code, 0, `分支已領先時應回 0，實際為 ${code}`)
-    const hasCommit = gitCalls.some((c) => c.args[0] === 'commit')
-    assert.equal(hasCommit, false, '不應呼叫 git commit')
-    const mergeCall = gitCalls.find((c) => c.args[0] === 'merge')
-    assert.ok(mergeCall, '應呼叫 git merge')
-    assert.deepEqual(mergeCall.args, ['merge', '--ff-only', 'feat/t50'])
-  })
-
-  test('T57 land (j)：reviewedTree 缺（summary.review = null）⇒ 7、無 add／merge、stderr 含 reviewedTree', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 't57', branch: 'feat/t57', changed: ['file.txt'] })
-    const summaryPath = path.join(outDir, 'summary.json')
-    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-    summary.review = null
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t57'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't57', '--msg-file', msgFile], deps)
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 7, `reviewedTree 缺時應回 7，實際為 ${code}`)
-    const hasAdd = gitCalls.some((c) => c.args[0] === 'add')
-    assert.equal(hasAdd, false, `不應呼叫 git add，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'add'))}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, `不應呼叫 git merge，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'merge'))}`)
-    const errText = errs.join('\n')
-    assert.ok(errText.includes('reviewedTree'), `stderr 應含 reviewedTree，實際為: ${errText}`)
-  })
-
-  test('T58 land (k)：reviewedTree 不符（summary 寫假 40 hex）⇒ 7、無 merge、stderr 含兩個 tree sha', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 't58', branch: 'feat/t58', changed: ['file.txt'] })
-    const fakeTreeSha = '0123456789abcdef0123456789abcdef01234567'
-    const summaryPath = path.join(outDir, 'summary.json')
-    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-    summary.review.reviewedTree = fakeTreeSha
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const actualTree = writeTreeOf(worktreePath)
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t58'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't58', '--msg-file', msgFile], deps)
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 7, `reviewedTree 不符時應回 7，實際為 ${code}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, `不應呼叫 git merge，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'merge'))}`)
-    const errText = errs.join('\n')
-    assert.ok(errText.includes(fakeTreeSha), `stderr 應含假 tree sha (${fakeTreeSha})，實際為: ${errText}`)
-    assert.ok(errText.includes(actualTree), `stderr 應含真實 tree sha (${actualTree})，實際為: ${errText}`)
-  })
-
-  test('T59 land (l)：target 前進且不相交 ⇒ 自動 rebase、回 0、LANDED、main HEAD 的父是前進後的 main、git diff --binary 含 bin.dat 與 new mode 100755、summary/lifecycle 記 landedAfterRebase、diff 逐字相等', async () => {
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    fs.writeFileSync(path.join(repo.dir, 'run.sh'), '#!/bin/sh\necho hi\n')
-    fs.chmodSync(path.join(repo.dir, 'run.sh'), 0o644)
-    repo.g('add', 'a.txt', 'run.sh')
-    repo.g('commit', '-m', 'init files')
-
-    const targetTipSha = repo.g('rev-parse', 'main').trim()
-    const mergeBase = targetTipSha
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't59')
-    repo.g('worktree', 'add', '-b', 'feat/t59', worktreePath, 'main')
-
-    fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ticket a content\n')
-    fs.writeFileSync(path.join(worktreePath, 'bin.dat'), Buffer.from([0x00, 0x41, 0x42, 0x00, 0xff]))
-    fs.chmodSync(path.join(worktreePath, 'run.sh'), 0o755)
-
-    const changed = ['a.txt', 'bin.dat', 'run.sh']
-    const reviewedTree = writeTreeOf(worktreePath)
-
-    fs.writeFileSync(path.join(repo.dir, 'ledger.json'), '{"seen": 1}\n')
-    repo.g('add', 'ledger.json')
-    repo.g('commit', '-m', 'advance main: update ledger.json')
-    const currentTarget = repo.g('rev-parse', 'main').trim()
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't59')
-    fs.mkdirSync(outDir, { recursive: true })
-    fs.writeFileSync(path.join(outDir, 'brief.md'), '# Brief t59\n')
-
-    const summary = {
-      schemaVersion: 2,
-      coordinator: 'claude',
-      reviewers: ROSTER_STANDARD,
-      project: 'test-proj',
-      ticket: 't59',
-      branch: 'feat/t59',
-      base: 'main',
-      roundStartSha: targetTipSha,
-      mergeBase,
-      targetTipSha,
-      writeExit: 0,
-      rounds: 1,
-      changed,
-      verifyExit: 0,
-      review: {
-        tier: 'standard',
-        members: reviewFixture(outDir, [
-          { name: 'agy/opus', overall: '簽' },
-          { name: 'agy/gemini', overall: '簽' },
-        ]),
-        anyEmpty: false,
-        reviewedTree,
-      },
-      q6Receipt: 'verified',
-      coordinatorTurns: null,
-      startedAt: '2026-09-13T00:00:00Z',
-      finishedAt: '2026-09-13T00:05:00Z',
-    }
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t59\n')
-
-    const outs = []
-    const errs = []
-    const origLog = console.log
-    const origErr = console.error
-    console.log = (m) => outs.push(String(m))
-    console.error = (m) => errs.push(String(m))
-
-    let diffBeforeRebase = null
-    let diffAfterRebase = null
-    const deps = {
-      repoRoot: repo.dir,
-      git: (cwd, args) => {
-        if (args[0] === 'rebase' && !args.includes('--abort')) {
-          diffBeforeRebase = execFileSync(
-            'git',
-            ['-C', cwd, 'diff', '--binary', '--full-index', '--no-renames', targetTipSha, 'HEAD'],
-            { env: CLEAN_GIT_ENV, encoding: 'utf8' }
-          ).trim()
-        }
-        const res = git(cwd, args)
-        if (args[0] === 'rebase' && !args.includes('--abort')) {
-          diffAfterRebase = execFileSync(
-            'git',
-            ['-C', cwd, 'diff', '--binary', '--full-index', '--no-renames', currentTarget, 'HEAD'],
-            { env: CLEAN_GIT_ENV, encoding: 'utf8' }
-          ).trim()
-        }
-        return res
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't59', '--msg-file', msgFile], deps)
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(code, 0, `target 前進且不相交時應回 0，實際為 ${code}`)
-    assert.ok(diffBeforeRebase !== null, `diffBeforeRebase 應有值，實際為 ${diffBeforeRebase}`)
-    assert.ok(diffAfterRebase !== null, `diffAfterRebase 應有值，實際為 ${diffAfterRebase}`)
-    assert.equal(diffBeforeRebase, diffAfterRebase, `rebase 前後 diff 應逐字相等，實際長度: ${diffBeforeRebase.length} vs ${diffAfterRebase.length}`)
-
-    const outText = outs.join('\n')
-    assert.ok(outText.includes('LANDED t59 feat/t59'), `stdout 應含 LANDED，實際為: ${outText}`)
-    assert.ok(
-      outText.includes(`↻ target 前進（不相交）：已 rebase ${targetTipSha}→${currentTarget}，變更逐 byte 相同`),
-      `stdout 應含 rebase 成功行，實際為: ${outText}`
-    )
-
-    const mainParent = repo.g('rev-parse', 'main~1').trim()
-    assert.equal(mainParent, currentTarget, `main HEAD 的父應是前進後的 main (${currentTarget})，實際為 ${mainParent}`)
-
-    const finalDiff = repo.g('diff', '--binary', 'main~1', 'main')
-    assert.ok(finalDiff.includes('bin.dat'), `git diff --binary main~1 main 應含 bin.dat，實際為: ${finalDiff}`)
-    assert.ok(finalDiff.includes('new mode 100755'), `git diff --binary main~1 main 應含 new mode 100755，實際為: ${finalDiff}`)
-
-    const diskSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    assert.equal(
-      diskSummary.landedAfterRebase.targetTipAtRun,
-      mergeBase,
-      `landedAfterRebase.targetTipAtRun 應等於 mergeBase (${mergeBase})，實際為: ${diskSummary.landedAfterRebase?.targetTipAtRun}`
-    )
-    assert.deepEqual(
-      diskSummary.landedAfterRebase,
-      { from: targetTipSha, to: currentTarget, advancedFiles: ['ledger.json'], targetTipAtRun: mergeBase },
-      `summary.json landedAfterRebase 應正確，實際為: ${JSON.stringify(diskSummary.landedAfterRebase)}`
-    )
-
-    const lifecycleLines = fs
-      .readFileSync(path.join(outDir, 'lifecycle.ndjson'), 'utf8')
-      .trim()
-      .split('\n')
-      .map((l) => JSON.parse(l))
-    const landedEvent = lifecycleLines.find((e) => e.event === 'landed')
-    assert.ok(landedEvent, `lifecycle 應有 landed 事件，實際事件列表: ${JSON.stringify(lifecycleLines.map((e) => e.event))}`)
-    assert.deepEqual(
-      landedEvent.landedAfterRebase,
-      { from: targetTipSha, to: currentTarget, advancedFiles: ['ledger.json'], targetTipAtRun: mergeBase },
-      `lifecycle landed 事件應含 landedAfterRebase，實際為: ${JSON.stringify(landedEvent.landedAfterRebase)}`
-    )
-  })
-
-  test('T60 land (m)：target 前進且相交（main 也改 a.txt）⇒ 8、worktree HEAD 不變（沒 rebase）、無 merge、stderr 含三個 sha、含 a.txt、含 rebase', async () => {
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    repo.g('add', 'a.txt')
-    repo.g('commit', '-m', 'init a.txt')
-
-    const targetTipSha = repo.g('rev-parse', 'main').trim()
-    const mergeBase = targetTipSha
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't60')
-    repo.g('worktree', 'add', '-b', 'feat/t60', worktreePath, 'main')
-
-    fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ticket changed a\n')
-    const reviewedTree = writeTreeOf(worktreePath)
-
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'main changed a\n')
-    repo.g('add', 'a.txt')
-    repo.g('commit', '-m', 'main changed a')
-    const currentTarget = repo.g('rev-parse', 'main').trim()
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't60')
-    fs.mkdirSync(outDir, { recursive: true })
-    fs.writeFileSync(path.join(outDir, 'brief.md'), '# Brief t60\n')
-
-    const summary = {
-      schemaVersion: 2,
-      coordinator: 'claude',
-      reviewers: ROSTER_STANDARD,
-      project: 'test-proj',
-      ticket: 't60',
-      branch: 'feat/t60',
-      base: 'main',
-      roundStartSha: targetTipSha,
-      mergeBase,
-      targetTipSha,
-      writeExit: 0,
-      rounds: 1,
-      changed: ['a.txt'],
-      verifyExit: 0,
-      review: {
-        tier: 'standard',
-        members: reviewFixture(outDir, [
-          { name: 'agy/opus', overall: '簽' },
-          { name: 'agy/gemini', overall: '簽' },
-        ]),
-        anyEmpty: false,
-        reviewedTree,
-      },
-      q6Receipt: 'verified',
-      coordinatorTurns: null,
-      startedAt: '2026-09-13T00:00:00Z',
-      finishedAt: '2026-09-13T00:05:00Z',
-    }
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t60\n')
-
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't60', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 8, `相交時應回 8，實際為 ${code}`)
-
-    const mainHeadAfter = repo.g('rev-parse', 'main').trim()
-    assert.equal(mainHeadAfter, currentTarget, `main HEAD 不應被 merge，仍應為 ${currentTarget}，實際為 ${mainHeadAfter}`)
-
-    const wtHead = execFileSync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { env: CLEAN_GIT_ENV, encoding: 'utf8' }).trim()
-    const wtParent = execFileSync('git', ['-C', worktreePath, 'rev-parse', 'HEAD~1'], { env: CLEAN_GIT_ENV, encoding: 'utf8' }).trim()
-    assert.equal(wtParent, targetTipSha, `worktree commit 的父仍應為 targetTipSha (${targetTipSha})，實際為 ${wtParent}`)
-
-    const errText = errs.join('\n')
-    assert.ok(errText.includes(targetTipSha), `stderr 應含 targetTipSha (${targetTipSha})，實際為: ${errText}`)
-    assert.ok(errText.includes(currentTarget), `stderr 應含 currentTarget (${currentTarget})，實際為: ${errText}`)
-    assert.ok(errText.includes(wtHead), `stderr 應含 ticket HEAD (${wtHead})，實際為: ${errText}`)
-    assert.ok(errText.includes('a.txt'), `stderr 應含 a.txt，實際為: ${errText}`)
-    assert.ok(errText.includes('rebase'), `stderr 應含 rebase，實際為: ${errText}`)
-  })
-
-  test('T61 land (n)：假 gitFn：讓 rebase 後的 diff --binary 回不同字串 ⇒ 8、無 merge、stderr 含 逐 byte', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({
-      name: 't61',
-      branch: 'feat/t61',
-      changed: ['a.txt'],
-    })
-    const targetTipSha = 'mock-target-tip-61'
-    const currentTargetSha = 'mock-current-target-61'
-    const mergeBase = 'mock-merge-base-61'
-    const summaryPath = path.join(outDir, 'summary.json')
-    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-    summary.targetTipSha = targetTipSha
-    summary.mergeBase = mergeBase
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['a.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t61'
-        }
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === 'main') {
-          return currentTargetSha
-        }
-        if (cwd === repo.dir && args[0] === 'diff' && args[1] === '--name-only') {
-          return 'ledger.json'
-        }
-        if (cwd === worktreePath && args[0] === 'diff' && args[1] === '--name-only') {
-          return 'a.txt'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return 'a.txt'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return 'ticket-head-61'
-        }
-        if (args[0] === 'rebase') {
-          return ''
-        }
-        if (args[0] === 'diff' && args[1] === '--binary') {
-          if (args[4] === targetTipSha) return 'binary-diff-before'
-          if (args[4] === currentTargetSha) return 'binary-diff-after-MUTATED'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't61', '--msg-file', msgFile], deps)
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 8, `diff 不逐 byte 相等時應回 8，實際為 ${code}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, `不應呼叫 git merge，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'merge'))}`)
-    const errText = errs.join('\n')
-    assert.ok(errText.includes('逐 byte'), `stderr 應含「逐 byte」，實際為: ${errText}`)
-  })
-
-  test('T62 land (o)：summary.json 寫回 landedAfterRebase 失敗 ⇒ 回 8、無 merge（main HEAD 不變）、stderr 含 寫回 landedAfterRebase 失敗', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({
-      name: 't62',
-      branch: 'feat/t62',
-      changed: ['a.txt'],
-    })
-    const mainHeadBefore = repo.g('rev-parse', 'main').trim()
-    const targetTipSha = 'mock-target-tip-62'
-    const currentTargetSha = 'mock-current-target-62'
-    const mergeBase = 'mock-merge-base-62'
-    const summaryPath = path.join(outDir, 'summary.json')
-    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-    summary.targetTipSha = targetTipSha
-    summary.mergeBase = mergeBase
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['a.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t62'
-        }
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === 'main') {
-          return currentTargetSha
-        }
-        if (cwd === repo.dir && args[0] === 'diff' && args[1] === '--name-only') {
-          return 'ledger.json'
-        }
-        if (cwd === worktreePath && args[0] === 'diff' && args[1] === '--name-only') {
-          return 'a.txt'
-        }
-        if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') {
-          return 'a.txt'
-        }
-        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
-          return 'ticket-head-62'
-        }
-        if (args[0] === 'rebase') {
-          return ''
-        }
-        if (args[0] === 'diff' && args[1] === '--binary') {
-          return 'binary-diff-identical'
-        }
-        return ''
-      },
-    }
-
-    fs.chmodSync(summaryPath, 0o444)
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't62', '--msg-file', msgFile], deps)
-    } finally {
-      try {
-        fs.chmodSync(summaryPath, 0o644)
-      } catch {}
-      console.error = origErr
-    }
-
-    assert.equal(code, 8, `寫回失敗應回 8，實際為 ${code}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, `不應呼叫 git merge，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'merge'))}`)
-    const mainHeadAfter = repo.g('rev-parse', 'main').trim()
-    assert.equal(mainHeadAfter, mainHeadBefore, `main HEAD 不應前進，仍應為 ${mainHeadBefore}`)
-    const errText = errs.join('\n')
-    assert.ok(errText.includes('寫回 landedAfterRebase 失敗'), `stderr 應含「寫回 landedAfterRebase 失敗」，實際為: ${errText}`)
-  })
-
   test('T63 publish（review: null）：publish 對 review: null 的 summary 回 2 且 stderr 不含 reviewedTree，證明 review 缺的判定沒有洩進 publish', async () => {
     const repo = makeRepo()
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't63')
@@ -4011,51 +3113,6 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(ghCalled, false, 'gh 不應被呼叫')
     const errText = errs.join('\n')
     assert.equal(errText.includes('reviewedTree'), false, `stderr 不應含 reviewedTree，實際為: ${errText}`)
-  })
-
-  test('T64 land (p)：review 缺（summary.review = null）⇒ 7 且 stderr 只出現一次 reviewedTree，無 add／merge、不印 helper 法定人數訊息', async () => {
-    const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 't64', branch: 'feat/t64', changed: ['file.txt'] })
-    const summaryPath = path.join(outDir, 'summary.json')
-    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-    summary.review = null
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const gitCalls = []
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-
-    const deps = {
-      repoRoot: repo.dir,
-      changedFiles: () => ['file.txt'],
-      git: (cwd, args) => {
-        gitCalls.push({ cwd, args })
-        if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'main'
-        }
-        if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') {
-          return 'feat/t64'
-        }
-        return ''
-      },
-    }
-
-    let code
-    try {
-      code = await ticketMain(['land', '--name', 't64', '--msg-file', msgFile], deps)
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(code, 7, `review 為 null 時應回 7，實際為 ${code}`)
-    const hasAdd = gitCalls.some((c) => c.args[0] === 'add')
-    assert.equal(hasAdd, false, `不應呼叫 git add，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'add'))}`)
-    const hasMerge = gitCalls.some((c) => c.args[0] === 'merge')
-    assert.equal(hasMerge, false, `不應呼叫 git merge，實際呼叫了: ${JSON.stringify(gitCalls.filter((c) => c.args[0] === 'merge'))}`)
-    const errText = errs.join('\n')
-    const occurrences = (errText.match(/reviewedTree/g) || []).length
-    assert.equal(occurrences, 1, `stderr 應恰出現一次 reviewedTree，實際出現 ${occurrences} 次: ${errText}`)
-    assert.equal(errText.includes('複審成員或名單為空'), false, `stderr 不應含 helper 法定人數訊息，實際為: ${errText}`)
   })
 
   test('T65 run 後 OUTDIR/verify.txt 存在且內容＝假 runTest 回的 out、summary.verifyLog 為 verify.txt', async () => {
@@ -4213,369 +3270,6 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(interceptedCouncilArgsNoReport.includes('--writer-report'), false, '沒有 response 檔時 councilArgs 不應含 --writer-report')
   })
 
-  test('T67 land：多輪票事故重現（main 在 run 之前前進）⇒ 閘 B 依 mergeBase 判定 target 前進並自動 rebase、回 0、LANDED、main HEAD 的父是前進後的 main、landedAfterRebase 正確', async () => {
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    repo.g('add', 'a.txt')
-    repo.g('commit', '-m', 'init a')
-    const mergeBase = repo.g('rev-parse', 'main').trim()
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't67')
-    repo.g('worktree', 'add', '-b', 'feat/t67', worktreePath, 'main')
-
-    // main 先前進（commit ledger.json）
-    fs.writeFileSync(path.join(repo.dir, 'ledger.json'), '{"seen": 1}\n')
-    repo.g('add', 'ledger.json')
-    repo.g('commit', '-m', 'advance main: update ledger.json')
-    const advancedMain = repo.g('rev-parse', 'main').trim()
-
-    // 然後才跑 run
-    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
-    fs.writeFileSync(briefFile, '# Brief t67\n`grep -e "a" a.txt`\n')
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't67')
-    const reviewOutDir = path.join(outDir, 'review')
-    const deps = {
-      repoRoot: repo.dir,
-      assertSettings: () => true,
-      writeMain: () => {
-        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ticket a content\n')
-        return 0
-      },
-      runTest: () => ({ exit: 0, out: 'ok' }),
-      councilMain: () => {
-        fakeCouncilOut(reviewOutDir, {
-          'agy-opus': '整份：簽\n',
-          'agy-gemini': '整份：簽\n',
-        })
-        return 0
-      },
-    }
-
-    const origLog = console.log
-    const origErr = console.error
-    const outs = []
-    const errs = []
-    console.log = (m) => outs.push(String(m))
-    console.error = (m) => errs.push(String(m))
-
-    let runCode
-    try {
-      runCode = await ticketMain(
-        [
-          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
-          '--name',
-          't67',
-          '--brief',
-          briefFile,
-          '--branch',
-          'feat/t67',
-          '--allow',
-          'a.txt',
-          '--test',
-          'node --test',
-        ],
-        deps
-      )
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(runCode, 0, `run 應成功回 0，實際為 ${runCode}`)
-
-    const runSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    assert.equal(runSummary.targetTipSha, advancedMain, `summary.targetTipSha 應為現在的 main (${advancedMain})`)
-    assert.equal(runSummary.mergeBase, mergeBase, `summary.mergeBase 應為舊 main (${mergeBase})`)
-    assert.ok(runSummary.review?.reviewedTree, 'summary 應有 review.reviewedTree')
-    runSummary.q6Receipt = 'verified'
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(runSummary, null, 2))
-
-    // 接著 land
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t67\n')
-
-    outs.length = 0
-    errs.length = 0
-    console.log = (m) => outs.push(String(m))
-    console.error = (m) => errs.push(String(m))
-
-    let landCode
-    try {
-      landCode = await ticketMain(['land', '--name', 't67', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(landCode, 0, `land 應回 0，實際為 ${landCode}`)
-    const outText = outs.join('\n')
-    assert.ok(outText.includes('LANDED t67 feat/t67'), `stdout 應含 LANDED，實際為: ${outText}`)
-
-    const mainParent = repo.g('rev-parse', 'main~1').trim()
-    assert.equal(mainParent, advancedMain, `main HEAD 的父應是前進後的 main (${advancedMain})，實際為 ${mainParent}`)
-
-    const diskSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    assert.equal(diskSummary.landedAfterRebase.from, mergeBase, `landedAfterRebase.from 應等於 mergeBase (${mergeBase})`)
-    assert.equal(diskSummary.landedAfterRebase.to, advancedMain, `landedAfterRebase.to 應等於前進後的 main (${advancedMain})`)
-    assert.equal(
-      diskSummary.landedAfterRebase.targetTipAtRun,
-      advancedMain,
-      `landedAfterRebase.targetTipAtRun 應等於 run 當時的 main (${advancedMain})`
-    )
-    assert.ok(
-      diskSummary.landedAfterRebase.advancedFiles.includes('ledger.json'),
-      `advancedFiles 應含 ledger.json，實際為: ${JSON.stringify(diskSummary.landedAfterRebase.advancedFiles)}`
-    )
-  })
-
-  test('T68 land：同 T67 但 main 前進的 commit 也改 a.txt ⇒ 8、無 merge、stderr 含 a.txt 與 merge-base 的 sha', async () => {
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    repo.g('add', 'a.txt')
-    repo.g('commit', '-m', 'init a')
-    const mergeBase = repo.g('rev-parse', 'main').trim()
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't68')
-    repo.g('worktree', 'add', '-b', 'feat/t68', worktreePath, 'main')
-
-    // main 前進的 commit 也改 a.txt
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'main conflict in a\n')
-    repo.g('add', 'a.txt')
-    repo.g('commit', '-m', 'advance main: conflict in a.txt')
-    const advancedMain = repo.g('rev-parse', 'main').trim()
-
-    // 然後才跑 run
-    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
-    fs.writeFileSync(briefFile, '# Brief t68\n`grep -e "a" a.txt`\n')
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't68')
-    const reviewOutDir = path.join(outDir, 'review')
-    const deps = {
-      repoRoot: repo.dir,
-      assertSettings: () => true,
-      writeMain: () => {
-        fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'ticket a content\n')
-        return 0
-      },
-      runTest: () => ({ exit: 0, out: 'ok' }),
-      councilMain: () => {
-        fakeCouncilOut(reviewOutDir, {
-          'agy-opus': '整份：簽\n',
-          'agy-gemini': '整份：簽\n',
-        })
-        return 0
-      },
-    }
-
-    const origLog = console.log
-    const origErr = console.error
-    console.log = () => {}
-    console.error = () => {}
-
-    let runCode
-    try {
-      runCode = await ticketMain(
-        [
-          'run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）',
-          '--name',
-          't68',
-          '--brief',
-          briefFile,
-          '--branch',
-          'feat/t68',
-          '--allow',
-          'a.txt',
-          '--test',
-          'node --test',
-        ],
-        deps
-      )
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(runCode, 0, `run 應成功回 0，實際為 ${runCode}`)
-
-    const runSummary68 = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    runSummary68.q6Receipt = 'verified'
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(runSummary68, null, 2))
-
-    // 接著 land
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t68\n')
-
-    const errs = []
-    console.error = (m) => errs.push(String(m))
-
-    let landCode
-    try {
-      landCode = await ticketMain(['land', '--name', 't68', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(landCode, 8, `相交時 land 應回 8，實際為 ${landCode}`)
-
-    const mainHeadAfter = repo.g('rev-parse', 'main').trim()
-    assert.equal(mainHeadAfter, advancedMain, `main HEAD 不應被 merge，仍應為 ${advancedMain}，實際為 ${mainHeadAfter}`)
-
-    const errText = errs.join('\n')
-    assert.ok(errText.includes('a.txt'), `stderr 應含 a.txt，實際為: ${errText}`)
-    assert.ok(errText.includes(mergeBase), `stderr 應含 merge-base sha (${mergeBase})，實際為: ${errText}`)
-  })
-
-  test('1.8.0 ⑥ (a)(b) land 真 git：分支上已 commit 刪除一檔（review-only 多輪票事故重現）＋另一檔有未 commit 修改，兩者都在 summary.changed ⇒ land 走到 ff 成功，刪除檔跳過 add、修改檔仍被 add 進 commit', async () => {
-    // 🔴 事故重現：2026-09-17 WAS review-only 多輪票，寫手已經在分支上 commit 刪除整個目錄
-    //   （scripts/__tests__/spec-lint-corpus.test.mjs 連同 scripts/__tests__/ 一起消失），summary.changed 仍列著它
-    //   （因為它是 mergeBase..HEAD diff 的一部分）；land 對它無條件 `git add -- f` ⇒ `fatal: pathspec … did not
-    //   match any files`，land 永遠卡在 exit 4，走不到「分支已領先 main，視為已 commit 過」。
-    //   陽性對照：把 ticket.mjs 這次的修法整段拿掉（恢復無條件 `git add -- f`），本測試應改回 exit 4。
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    fs.writeFileSync(path.join(repo.dir, 'b.txt'), 'init b\n')
-    repo.g('add', 'a.txt', 'b.txt')
-    repo.g('commit', '-m', 'init a+b')
-    const mergeBase = repo.g('rev-parse', 'main').trim()
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't-del')
-    repo.g('worktree', 'add', '-b', 'feat/t-del', worktreePath, 'main')
-
-    // 模擬 review-only 多輪票：寫手已經在分支上「commit 刪除」b.txt（整個檔案消失，不是待 add 的 pending 刪除）
-    execFileSync('git', ['-C', worktreePath, 'rm', 'b.txt'], { env: CLEAN_GIT_ENV })
-    execFileSync('git', ['-C', worktreePath, 'commit', '-m', 'chore: remove b.txt'], { env: CLEAN_GIT_ENV })
-
-    // (b) a.txt 有未 commit 的修改（真正待 add 的檔，不該被本次修法連帶跳過）
-    fs.writeFileSync(path.join(worktreePath, 'a.txt'), 'modified a\n')
-
-    const reviewedTree = writeTreeOf(worktreePath)
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-del')
-    fs.mkdirSync(outDir, { recursive: true })
-    const summary = {
-      schemaVersion: 2,
-      coordinator: 'claude',
-      reviewers: ROSTER_STANDARD,
-      project: 'test-proj',
-      ticket: 't-del',
-      branch: 'feat/t-del',
-      base: 'main',
-      mergeBase,
-      targetTipSha: mergeBase,
-      writeExit: 0,
-      rounds: 1,
-      changed: ['b.txt', 'a.txt'],
-      verifyExit: 0,
-      review: {
-        tier: 'standard',
-        members: reviewFixture(outDir, [
-          { name: 'agy/opus', overall: '簽' },
-          { name: 'agy/gemini', overall: '簽' },
-        ]),
-        anyEmpty: false,
-        reviewedTree,
-      },
-      q6Receipt: 'verified',
-    }
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t-del\n')
-
-    const outs = []
-    const errs = []
-    const origLog = console.log
-    const origErr = console.error
-    console.log = (m) => outs.push(String(m))
-    console.error = (m) => errs.push(String(m))
-    let landCode
-    try {
-      landCode = await ticketMain(['land', '--name', 't-del', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(landCode, 0, `land 應成功回 0（陽性對照：拿掉本次修法會回 4），實際為 ${landCode}，stderr：${errs.join('\n')}`)
-    assert.ok(outs.join('\n').includes('LANDED t-del feat/t-del'), `stdout 應含 LANDED，實際：${outs.join('\n')}`)
-
-    // main 併入後：(a) b.txt 真的不見了（刪除檔跳過 add 沒有卡住整個流程）；
-    //             (b) a.txt 是修改後內容（修改檔確實仍被 add 進最後一次 commit，不是被本次修法連帶吞掉）
-    assert.equal(fs.existsSync(path.join(repo.dir, 'b.txt')), false, 'main 上 b.txt 應已刪除')
-    assert.equal(
-      fs.readFileSync(path.join(repo.dir, 'a.txt'), 'utf8'),
-      'modified a\n',
-      'main 上 a.txt 應是修改後內容（證明它真的被 add 進最後一次 commit）'
-    )
-  })
-
-  test('1.8.0 ⑥ (c) 陽性對照：add 真失敗（檔案仍在但被 .gitignore 擋）⇒ 仍回 4，不被本次修法吞掉', async () => {
-    const repo = makeRepo()
-    fs.writeFileSync(path.join(repo.dir, 'a.txt'), 'init a\n')
-    // .gitignore 在 main 上先 commit 好（不能算「run 之後才出現的檔」，否則會撞另一道閘而不是本次要測的路徑）
-    fs.writeFileSync(path.join(repo.dir, '.gitignore'), 'ignored.txt\n')
-    repo.g('add', 'a.txt', '.gitignore')
-    repo.g('commit', '-m', 'init a + gitignore')
-    const mergeBase = repo.g('rev-parse', 'main').trim()
-
-    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't-ignored')
-    repo.g('worktree', 'add', '-b', 'feat/t-ignored', worktreePath, 'main')
-
-    // ignored.txt 真的存在於工作樹，但被（繼承自 main 的）.gitignore 擋——git status 預設不會列出被忽略的檔，
-    // 所以它不會被判成「run 之後才出現的檔」；真正卡關的是 add 本身會失敗（不是「沒東西可 add」）。
-    fs.writeFileSync(path.join(worktreePath, 'ignored.txt'), 'should not be added\n')
-
-    const reviewedTree = writeTreeOf(worktreePath)
-
-    const outDir = path.join(repo.dir, '.local', 'llm-team', 't-ignored')
-    fs.mkdirSync(outDir, { recursive: true })
-    const summary = {
-      schemaVersion: 2,
-      coordinator: 'claude',
-      reviewers: ROSTER_STANDARD,
-      project: 'test-proj',
-      ticket: 't-ignored',
-      branch: 'feat/t-ignored',
-      base: 'main',
-      mergeBase,
-      targetTipSha: mergeBase,
-      writeExit: 0,
-      rounds: 1,
-      changed: ['ignored.txt'],
-      verifyExit: 0,
-      review: {
-        tier: 'standard',
-        members: reviewFixture(outDir, [
-          { name: 'agy/opus', overall: '簽' },
-          { name: 'agy/gemini', overall: '簽' },
-        ]),
-        anyEmpty: false,
-        reviewedTree,
-      },
-      q6Receipt: 'verified',
-    }
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t-ignored\n')
-
-    const errs = []
-    const origErr = console.error
-    console.error = (m) => errs.push(String(m))
-    let landCode
-    try {
-      landCode = await ticketMain(['land', '--name', 't-ignored', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.error = origErr
-    }
-
-    assert.equal(landCode, 4, `add 真失敗時仍應回 4，實際為 ${landCode}`)
-    assert.match(errs.join('\n'), /git add 失敗（ignored\.txt）/, `stderr 應指名是 ignored.txt 的 add 失敗，實際：${errs.join('\n')}`)
-    const mainHeadAfter = repo.g('rev-parse', 'main').trim()
-    assert.equal(mainHeadAfter, mergeBase, 'main 不應被 merge（add 失敗要在 commit 之前就擋下）')
-  })
-
   test('T69 run --review-only happy path：worktree 存在且領先 merge-base ⇒ 回 0、writeMain 0 次、councilMain 1 次且 --round-start 為 merge-base、summary 與 lifecycle 符合 review-only', async () => {
     const repo = makeRepo()
     const mergeBaseSha = repo.g('rev-parse', 'main').trim()
@@ -4590,7 +3284,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T69\n`grep -e "hello" feature.txt`\n')
 
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't69')
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = path.join(outDir, 'review-r1')
 
     let writeCount = 0
     let councilCount = 0
@@ -4951,7 +3645,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T73\n`grep -e "feature" feature.txt`\n')
 
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = path.join(outDir, 'review-r1')
     let writeCount = 0
     let councilCount = 0
     const deps = {
@@ -5110,7 +3804,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't75')
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't75')
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = path.join(outDir, 'review-r1')
 
     let run1Out = null
     const deps1 = {
@@ -5244,7 +3938,7 @@ describe('ticket.mjs 票流程測試', () => {
         return 0
       },
       councilMain: async () => {
-        const reviewOutDir = path.join(outDir, 'review')
+        const reviewOutDir = path.join(outDir, 'review-r1')
         fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
@@ -5300,7 +3994,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T77 測試票\n`grep -e "a" a.txt`\n')
 
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't77')
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = path.join(outDir, 'review-r1')
 
     // 第一次 run（一般 run，K=1）
     const deps1 = {
@@ -5335,9 +4029,8 @@ describe('ticket.mjs 票流程測試', () => {
     }
     assert.equal(code1, 0, `第一次 run 應回 0，實際為 ${code1}`)
 
-    // commit 讓 worktree 變乾淨且推進 HEAD
-    execFileSync('git', ['-C', worktreePath, 'add', 'a.txt'], { env: CLEAN_GIT_ENV })
-    execFileSync('git', ['-C', worktreePath, 'commit', '-m', 'feat: commit after run 1'], { env: CLEAN_GIT_ENV })
+    // 1.26.0：第一次 run 已在送審前 commit（工作樹乾淨、HEAD 已推進），不必再手動 commit。
+    assert.equal(execFileSync('git', ['-C', worktreePath, 'status', '--porcelain'], { env: CLEAN_GIT_ENV, encoding: 'utf8' }), '', '第一次 run 後工作樹乾淨')
 
     // 第二次 run（run --review-only）
     let writeCalls2 = 0
@@ -5348,8 +4041,8 @@ describe('ticket.mjs 票流程測試', () => {
         writeCalls2++
         return 0
       },
-      councilMain: async () => {
-        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
+      councilMain: async (args) => {
+        fakeCouncilOut(args[args.indexOf('--out') + 1], { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n' })
         return 0
       },
       runTest: () => ({ exit: 0, out: 'ok' }),
@@ -5383,7 +4076,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(fs.existsSync(writeRun2Dir), false, `write/run-2 目錄不應存在，實際存在於: ${writeRun2Dir}`)
   })
 
-  test('T78 run --review-only 改動檔自 merge-base..HEAD 計算：commit 兩檔 run --review-only 回 0、summary.changed 含兩檔且 reviewOnly 為 true，接續 land 回 0 且 main HEAD 樹含該兩檔', async () => {
+  test('T78 run --review-only 改動檔自 merge-base..HEAD 計算：commit 兩檔 run --review-only 回 0、summary.changed 含兩檔且 reviewOnly 為 true', async () => {
     const repo = makeRepo()
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't78')
@@ -5398,7 +4091,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T78\n`grep -e "hello" a.txt`\n')
 
     const outDir = path.join(repo.dir, '.local', 'llm-team', 't78')
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = path.join(outDir, 'review-r1')
 
     let writeCount = 0
     let councilCount = 0
@@ -5466,34 +4159,6 @@ describe('ticket.mjs 票流程測試', () => {
       ['a.txt', 'sub/b.txt'],
       `summary.changed 應為 [a.txt, sub/b.txt]，實際為 ${JSON.stringify(summary.changed)}`
     )
-
-    // 接著比照 T67 對這份 summary 跑 land
-    summary.q6Receipt = 'verified'
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
-
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: t78\n')
-
-    outs.length = 0
-    errs.length = 0
-    console.log = (m) => outs.push(String(m))
-    console.error = (m) => errs.push(String(m))
-
-    let landCode
-    try {
-      landCode = await ticketMain(['land', '--name', 't78', '--msg-file', msgFile], { repoRoot: repo.dir })
-    } finally {
-      console.log = origLog
-      console.error = origErr
-    }
-
-    assert.equal(landCode, 0, `land 應回 0，實際為 ${landCode}`)
-    const outText = outs.join('\n')
-    assert.ok(outText.includes('LANDED'), `stdout 應含 LANDED，實際為: ${outText}`)
-
-    const mainHeadFiles = repo.g('ls-tree', '-r', '--name-only', 'HEAD').split('\n').map((s) => s.trim()).filter(Boolean)
-    assert.ok(mainHeadFiles.includes('a.txt'), `main HEAD 樹應含 a.txt，實際為: ${JSON.stringify(mainHeadFiles)}`)
-    assert.ok(mainHeadFiles.includes('sub/b.txt'), `main HEAD 樹應含 sub/b.txt，實際為: ${JSON.stringify(mainHeadFiles)}`)
   })
 
   test('T79 run --review-only councilMain args 含 --review-only 且不含 --writer-report；一般 run 不含 --review-only', async () => {
@@ -5508,7 +4173,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# T79\n`grep -e "hello" feature.txt`\n')
 
     const outDirRO = path.join(repo.dir, '.local', 'llm-team', 't78-ro')
-    const reviewOutDirRO = path.join(outDirRO, 'review')
+    const reviewOutDirRO = path.join(outDirRO, 'review-r1')
 
     let interceptedROArgs = null
     const depsRO = {
@@ -5566,7 +4231,7 @@ describe('ticket.mjs 票流程測試', () => {
     // 一般 run（T1 形狀）
     const worktreePathStd = path.join(repo.dir, '.claude', 'worktrees', 't78-std')
     const outDirStd = path.join(repo.dir, '.local', 'llm-team', 't78-std')
-    const reviewOutDirStd = path.join(outDirStd, 'review')
+    const reviewOutDirStd = path.join(outDirStd, 'review-r1')
     let interceptedStdArgs = null
     const depsStd = {
       repoRoot: repo.dir,
@@ -5619,7 +4284,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T80\n實作\n')
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't80')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't80', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't80', 'review-r1')
 
     let interceptedArgs = null
     const deps = {
@@ -5679,7 +4344,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // CLI 沒給，config 有給
     const worktreePath1 = path.join(repo.dir, '.claude', 'worktrees', 't81-cfg')
-    const reviewOutDir1 = path.join(repo.dir, '.local', 'llm-team', 't81-cfg', 'review')
+    const reviewOutDir1 = path.join(repo.dir, '.local', 'llm-team', 't81-cfg', 'review-r1')
     let interceptedArgs1 = null
     const deps1 = {
       repoRoot: repo.dir,
@@ -5732,7 +4397,7 @@ describe('ticket.mjs 票流程測試', () => {
 
     // CLI 給 30000 且 config 給 45000 ⇒ 30000
     const worktreePath2 = path.join(repo.dir, '.claude', 'worktrees', 't81-override')
-    const reviewOutDir2 = path.join(repo.dir, '.local', 'llm-team', 't81-override', 'review')
+    const reviewOutDir2 = path.join(repo.dir, '.local', 'llm-team', 't81-override', 'review-r1')
     let interceptedArgs2 = null
     const deps2 = {
       repoRoot: repo.dir,
@@ -5788,7 +4453,7 @@ describe('ticket.mjs 票流程測試', () => {
     const briefFile = path.join(tmpdir('brief-'), 'brief.md')
     fs.writeFileSync(briefFile, '# T82\n實作\n')
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't82')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't82', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't82', 'review-r1')
 
     let interceptedArgs = null
     const deps = {
@@ -6089,7 +4754,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 功能票\n內容\n')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't54')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't54', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't54', 'review-r1')
 
     let interceptedCouncilArgs = null
     const deps = {
@@ -6209,7 +4874,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile, '# 二次 run\n內容\n')
 
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 't56')
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't56', 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 't56', 'review-r1')
 
     // 第一次 run：建立 worktree 並成功結束
     const deps = {
@@ -6254,9 +4919,7 @@ describe('ticket.mjs 票流程測試', () => {
     }
     assert.equal(code, 0)
 
-    // 在 worktree commit 一筆（讓 worktree 變乾淨且推進 HEAD）
-    execFileSync('git', ['-C', worktreePath, 'add', 'a.txt'], { env: CLEAN_GIT_ENV })
-    execFileSync('git', ['-C', worktreePath, 'commit', '-m', 'round 1 commit'], { env: CLEAN_GIT_ENV })
+    // 1.26.0：第一次 run 已在送審前 commit（worktree 乾淨、HEAD 已推進）
     const worktreeNewHead = execFileSync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { env: CLEAN_GIT_ENV, encoding: 'utf8' }).trim()
 
     // main 再前進一筆 foreign
@@ -6276,7 +4939,7 @@ describe('ticket.mjs 票流程測試', () => {
       },
       councilMain: (args) => {
         interceptedArgs2 = args
-        fakeCouncilOut(reviewOutDir, {
+        fakeCouncilOut(args[args.indexOf('--out') + 1], {
           'agy-opus': '整份：簽\nQ6：確認 a.txt',
           'agy-gemini': '整份：簽\nQ6：確認編碼',
         })
@@ -6325,7 +4988,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile1, '# T84 有 sessionId\n內容')
 
     const worktreePath1 = path.join(repo1.dir, '.claude', 'worktrees', 't84-with-sess')
-    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't84-with-sess', 'review')
+    const reviewOutDir1 = path.join(repo1.dir, '.local', 'llm-team', 't84-with-sess', 'review-r1')
 
     const deps1 = {
       repoRoot: repo1.dir,
@@ -6392,7 +5055,7 @@ describe('ticket.mjs 票流程測試', () => {
     fs.writeFileSync(briefFile2, '# T84 無 sessionId\n內容')
 
     const worktreePath2 = path.join(repo2.dir, '.claude', 'worktrees', 't84-no-sess')
-    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't84-no-sess', 'review')
+    const reviewOutDir2 = path.join(repo2.dir, '.local', 'llm-team', 't84-no-sess', 'review-r1')
 
     const deps2 = {
       repoRoot: repo2.dir,
@@ -6504,7 +5167,7 @@ describe('ticket.mjs 票流程測試', () => {
     assert.equal(sAfterOk.caliber, 'tool')
   })
 
-  test('(h3) 1.8.0 停止條件：usage.mode=off 時 accept（不帶 --caliber）→ publish／land 都不因缺 caliber／usage 產物失敗', async () => {
+  test('(h3) 1.8.0 停止條件：usage.mode=off 時 accept（不帶 --caliber）→ publish 不因缺 caliber／usage 產物失敗（1.24.0 起 ticket land 已停用）', async () => {
     // publish 分支（沿用 T25 的 fake gh 手法）
     {
       const repo = makeRepo()
@@ -6570,32 +5233,6 @@ describe('ticket.mjs 票流程測試', () => {
       const publishCode = await ticketMain(['publish', '--name', 'tu1'], deps2)
       assert.equal(publishCode, 0, `publish 不應因缺 caliber／usage 產物失敗，實際：${publishCode}`)
       assert.equal(ghCalled, true, 'gh 應被呼叫（未被 caliber／usage 檢查擋下）')
-    }
-
-    // land 分支（沿用 makeLandFixture，但拿掉 q6Receipt，改走 accept 補上）
-    {
-      const { repo, worktreePath, outDir, msgFile } = makeLandFixture({ name: 'tu2', branch: 'feat/tu2' })
-      const preSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-      delete preSummary.q6Receipt
-      fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(preSummary, null, 2))
-
-      const acceptCode = await ticketMain(['accept', '--name', 'tu2', '--q6', '親自坐實'], { repoRoot: repo.dir })
-      assert.equal(acceptCode, 0, `usage.mode=off 缺 --caliber 時 accept 應回 0，實際：${acceptCode}`)
-
-      const deps = {
-        repoRoot: repo.dir,
-        changedFiles: () => ['file.txt'],
-        git: (cwd, args) => {
-          if (cwd === repo.dir && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') return 'main'
-          if (cwd === worktreePath && args[0] === 'rev-parse' && args[1] === '--abbrev-ref' && args[2] === 'HEAD') return 'feat/tu2'
-          if (args[0] === 'diff' && args[1] === '--cached' && args[2] === '--name-only') return 'file.txt'
-          if (args[0] === 'rev-parse' && args[1] === 'HEAD') return 'new-main-sha-tu2'
-          if (args[0] === 'rev-parse' && args[1] === 'main') return 'mock-target-tip-sha'
-          return ''
-        },
-      }
-      const code = await ticketMain(['land', '--name', 'tu2', '--msg-file', msgFile], deps)
-      assert.equal(code, 0, `land 不應因缺 caliber／usage 產物失敗，實際：${code}`)
     }
   })
 
@@ -6979,7 +5616,7 @@ describe('1.12.0 ticket：複審者到底看了什麼要印在收貨摘要', () 
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md'); fs.writeFileSync(briefFile, '# 票\n內容')
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review-r1')
     let councilArgs = null
     const deps = {
       repoRoot: repo.dir,
@@ -7040,7 +5677,7 @@ describe('1.13.0 ticket：無引用的不簽在收貨摘要印 ⚠', () => {
     const repo = makeRepo()
     const briefFile = path.join(tmpdir('brief-'), 'brief.md'); fs.writeFileSync(briefFile, '# 票\n內容')
     const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
-    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', name, 'review-r1')
     let councilArgs = null
     const deps = {
       repoRoot: repo.dir,
@@ -7285,7 +5922,7 @@ describe('1.16.0 寫手鏈：ticket run', () => {
         getHarness: (n) => (n === 'gemini' ? fake : getHarness(n)),
         councilMain: () => {
           councilCalls++
-          fakeCouncilOut(path.join(outDir, 'review'), { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt' })
+          fakeCouncilOut(path.join(outDir, 'review-r1'), { 'agy-opus': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt', 'agy-gemini': 'Q1：簽｜ok｜無\n整份：簽\nQ6：看 hello.txt' })
           return 0
         },
         runTest: () => ({ exit: 0, out: 'ok' }),
@@ -7311,7 +5948,8 @@ describe('1.16.0 寫手鏈：ticket run', () => {
     const i = r.spawnCalls[0].args.indexOf('--policy')
     assert.equal(r.spawnCalls[0].args[i + 1], policy, '寫手用 --policy 載入 outDir 那份')
     assert.equal(r.spawnCalls[0].cwd, r.worktree)
-    assert.deepEqual(r.status.map((l) => l.replace(/^\S+\s+/, '')), ['hello.txt'], 'worktree 只多 allow 內的檔（乾淨到可以 land）')
+    assert.deepEqual(r.status, [], '1.26.0：送審前已 commit allow 內的檔，工作樹乾淨（可以 land）')
+    assert.equal(execFileSync('git', ['-C', r.worktree, 'show', '--name-only', '--format=', 'HEAD'], { env: CLEAN_GIT_ENV, encoding: 'utf8' }).trim(), 'hello.txt', '那個 commit 只含 allow 內的 hello.txt')
     assert.equal(fs.existsSync(path.join(r.worktree, '.gemini')), false)
     assert.ok(!JSON.stringify(r.summary).includes('.gemini'), 'summary 任何欄位都不含 .gemini 路徑')
     assert.ok(!r.status.some((l) => l.includes('.gemini')), 'git status 不含 .gemini 路徑')
@@ -7494,7 +6132,7 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     assert.equal(r.summary, null, '拒開不該留下 summary.json')
   })
 
-  test('summary.json 與 lifecycle（run-start／landed）都帶 wbsIds；--wbs-exempt 情形 wbsIds:[] 且帶 wbsExempt', async () => {
+  test('summary.json 與 lifecycle（run-start）都帶 wbsIds；--wbs-exempt 情形 wbsIds:[] 且帶 wbsExempt', async () => {
     const capture1 = {}
     const r1 = await runWbs({
       name: 'wbs-lifecycle-1',
@@ -7511,20 +6149,6 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     const runStart1 = lifecycle1.find((e) => e.event === 'run-start')
     assert.deepEqual(runStart1.wbsIds, ['1.13.2'])
 
-    // land：landed 事件也帶 wbsIds
-    r1.summary.q6Receipt = 'verified'
-    fs.writeFileSync(path.join(r1.outDir, 'summary.json'), JSON.stringify(r1.summary, null, 2))
-    const msgFile = path.join(r1.repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: wbs-lifecycle-1\n')
-    const landCode = await ticketMain(['land', '--name', 'wbs-lifecycle-1', '--msg-file', msgFile], { repoRoot: r1.repo.dir })
-    assert.equal(landCode, 0)
-    const lifecycle1b = fs
-      .readFileSync(path.join(r1.outDir, 'lifecycle.ndjson'), 'utf8')
-      .trim()
-      .split('\n')
-      .map((l) => JSON.parse(l))
-    const landed1 = lifecycle1b.find((e) => e.event === 'landed')
-    assert.deepEqual(landed1.wbsIds, ['1.13.2'])
 
     // --wbs-exempt：wbsIds:[]、summary.wbsExempt 為理由
     const capture2 = {}
@@ -7538,7 +6162,7 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     assert.equal(r2.summary.wbsExempt, '守門修補（非 WBS）')
   })
 
-  test('product-wbs.mjs --status：專案根沒有 tools/product-wbs.mjs ⇒ summary.wbsStatusAtRun／wbsStatusAtLand 都是 {error}，run／land 仍成功（觀測不擋票）', async () => {
+  test('product-wbs.mjs --status：專案根沒有 tools/product-wbs.mjs ⇒ summary.wbsStatusAtRun 是 {error}，run 仍成功（觀測不擋票）', async () => {
     const capture = {}
     const r = await runWbs({
       name: 'wbs-status-missing',
@@ -7549,14 +6173,6 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     assert.equal(typeof r.summary.wbsStatusAtRun.error, 'string')
     assert.match(r.summary.wbsStatusAtRun.error, /product-wbs\.mjs 不存在/)
 
-    r.summary.q6Receipt = 'verified'
-    fs.writeFileSync(path.join(r.outDir, 'summary.json'), JSON.stringify(r.summary, null, 2))
-    const msgFile = path.join(r.repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: wbs-status-missing\n')
-    const landCode = await ticketMain(['land', '--name', 'wbs-status-missing', '--msg-file', msgFile], { repoRoot: r.repo.dir })
-    assert.equal(landCode, 0)
-    const landedSummary = JSON.parse(fs.readFileSync(path.join(r.outDir, 'summary.json'), 'utf8'))
-    assert.equal(typeof landedSummary.wbsStatusAtLand.error, 'string')
   })
 
   test('CONTEXT.md 找不到時完全不附加：effective brief 等於原 brief', async () => {
@@ -7824,7 +6440,8 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
         {
           repoRoot: repo.dir,
           assertSettings: () => true,
-          writeMain: wbsWriter({ changeFiles: ['a.txt'] }),
+          // 1.26.0：這張票的 --allow 全是絕對／逃逸路徑，寫手不可能有 allow 內的改動（寫了 a.txt 會被越界判定擋下、不送審）；本測試只量 CONTEXT.md 注入，所以寫手不改檔。
+          writeMain: wbsWriter({ changeFiles: [] }),
           councilMain: wbsCouncil(capture),
           runTest: () => ({ exit: 0, out: 'ok' }),
         }
@@ -7894,7 +6511,7 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     assert.deepEqual(summary2.wbsStatusAtRun, { error: '--status 輸出非物件' })
   })
 
-  test('happy path（Q3 對照 + product-wbs 有真內容）：假 tools/product-wbs.mjs --status --json 印合法物件 JSON ⇒ run 與 land 的 wbsStatusAtRun／wbsStatusAtLand 都帶正確的 counts／generated_at／head_sha', async () => {
+  test('happy path（Q3 對照 + product-wbs 有真內容）：假 tools/product-wbs.mjs --status --json 印合法物件 JSON ⇒ run 的 wbsStatusAtRun 帶正確的 counts／generated_at／head_sha', async () => {
     const repo = makeRepo()
     fs.mkdirSync(path.join(repo.dir, 'tools'), { recursive: true })
     const fakeStatusJson = JSON.stringify({
@@ -7946,19 +6563,6 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     const outDir = path.join(repo.dir, '.local', 'llm-team', 'wbs-status-happy')
     let summary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
     assert.deepEqual(summary.wbsStatusAtRun, {
-      generated_at: '2026-09-28T00:00:00Z',
-      head_sha: 'a'.repeat(40),
-      counts: { delivered: 2, todo: 1 },
-    })
-
-    summary.q6Receipt = 'verified'
-    fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
-    const msgFile = path.join(repo.dir, 'commit.msg')
-    fs.writeFileSync(msgFile, 'feat: wbs-status-happy\n')
-    const landCode = await ticketMain(['land', '--name', 'wbs-status-happy', '--msg-file', msgFile], { repoRoot: repo.dir })
-    assert.equal(landCode, 0)
-    const landedSummary = JSON.parse(fs.readFileSync(path.join(outDir, 'summary.json'), 'utf8'))
-    assert.deepEqual(landedSummary.wbsStatusAtLand, {
       generated_at: '2026-09-28T00:00:00Z',
       head_sha: 'a'.repeat(40),
       counts: { delivered: 2, todo: 1 },
@@ -8020,5 +6624,1107 @@ describe('4.7.20 WBS 必填 + product-wbs --status 觀測 + CONTEXT.md 注入', 
     assert.match(fenceMatch[2], /### 這是 CONTEXT\.md 內文自己的標題/, '內文自己的 ### 標題應原樣保留在 fence 內')
     // 外層區塊標題字串不變
     assert.match(effective, /【區塊環境說明（自動附加；③驗收指令為統整者 --test 用，非寫手白名單，寫手不准跑）】/)
+  })
+})
+
+describe('1.23.0 ticket 連跑兩輪：前輪 review 改名保存並以 --prior-out 傳給 council（4.7.29d r3）', () => {
+  // 事故＝ticket.mjs 每輪 rmSync <ticket>/review 後重用同路徑，council 從 -r<N> 命名推導不到前輪 ⇒ 正式流程第二輪「brief 不得內嵌前輪推理」預設放行。
+  const FIX = '改成先過濾空值再合併兩份清單，並補一條涵蓋空輸入的斷言到 foo.test.mjs'
+  async function twoRounds(brief2Body, { dropPriorOut = false } = {}) {
+    const repo = makeRepo()
+    const dir1 = tmpdir('brief-')
+    const brief1 = path.join(dir1, 'brief1.md'); fs.writeFileSync(brief1, '# 第一輪\n內容')
+    const brief2 = path.join(dir1, 'brief2.md'); fs.writeFileSync(brief2, brief2Body)
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'tp')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'tp')
+    let round = 1
+    let runOneCalls = 0
+    const councilArgsSeen = []
+    const councilExits = []
+    const councilStub = async (args, d) => {
+      councilArgsSeen.push(args)
+      const a = dropPriorOut
+        ? args.filter((x, i) => x !== '--prior-out' && args[i - 1] !== '--prior-out')
+        : args
+      const code = await councilMain(a, {
+        ...d,
+        runOne: (name, model, _prompt, _cwd, outD) => {
+          runOneCalls++
+          const text = round === 1
+            ? `Q3：不簽｜先跑 A | B | C 會漏資料｜${FIX}｜foo.test.mjs:42\n整份：不簽`
+            : 'Q1：簽｜ok｜無\n整份：簽'
+          fs.writeFileSync(path.join(outD, `${memberFileName(name)}.txt`), text) // 真 runOne 會寫檔；測試接縫不會，這裡補上
+          return { name, model, exit: 0, ms: 1, empty: false, denied: [], text }
+        },
+      })
+      councilExits.push(code)
+      return code
+    }
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => { fs.writeFileSync(path.join(worktreePath, 'file.txt'), `r${round}`); return 0 },
+      councilMain: councilStub,
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const argv = (b) => ['run', '--wbs-exempt', '既有測試（1.21.0 前無 WBS 概念）', '--name', 'tp', '--brief', b, '--branch', 'feat/tp--slice', '--allow', 'file.txt', '--test', 'true']
+    const origLog = console.log; const origErr = console.error; const errs = []
+    console.log = () => {}; console.error = (m) => errs.push(String(m))
+    try {
+      await ticketMain(argv(brief1), deps)
+      const callsAfter1 = runOneCalls
+      // 1.26.0：第一輪的寫手改動已由 ticket 在送審前 commit，第二輪前不必再手動 commit。
+      round = 2
+      await ticketMain(argv(brief2), deps)
+      return { outDir, councilArgsSeen, councilExits, callsAfter1, runOneCalls, errs: errs.join('\n') }
+    } finally { console.log = origLog; console.error = origErr }
+  }
+
+  test('(a) 第二輪 brief 原樣引用第一輪不簽行的修法 ⇒ council exit 2、第二輪複審者呼叫 0；review-r1 保存、--prior-out 指向它', async () => {
+    const r = await twoRounds(`# 第二輪\n${FIX}\n\nthis_round_delta: 本輪只改測試斷言\n`)
+    assert.equal(r.councilExits[0], 0)
+    assert.equal(r.councilExits[1], 2, `第二輪 council 應 exit 2，實際 ${r.councilExits[1]}；errs=${r.errs}`)
+    assert.equal(r.runOneCalls - r.callsAfter1, 0, '第二輪複審者呼叫數應為 0')
+    assert.ok(fs.readdirSync(path.join(r.outDir, 'review-r1')).some((f) => f.endsWith('.txt')), '第一輪輸出要被保存')
+    assert.ok(r.councilArgsSeen[1].includes(path.join(r.outDir, 'review-r1')), '--prior-out 指向 review-r1')
+  })
+
+  test('(b) 第二輪 brief 只放 ID＋path:line ⇒ 通過；council 收到 --prior-out 指向 review-r1（第一輪沒有）', async () => {
+    const r = await twoRounds('# 第二輪\nF1 foo.test.mjs:42 預期檢查：node foo.test.mjs 退出碼 0\nthis_round_delta: 本輪只改測試斷言\n')
+    assert.deepEqual(r.councilExits, [0, 0])
+    assert.ok(!r.councilArgsSeen[0].includes('--prior-out'), '第一輪沒有前輪目錄')
+    const i = r.councilArgsSeen[1].indexOf('--prior-out')
+    assert.notEqual(i, -1)
+    assert.equal(r.councilArgsSeen[1][i + 1], path.join(r.outDir, 'review-r1'))
+    assert.ok(r.runOneCalls - r.callsAfter1 > 0)
+  })
+
+  test('(c) 1.26.0 輪次目錄一律 review-r<N>：就算 council 沒收到 --prior-out，council 自己的命名推導（去掉 -r<N> 尾碼找同前綴的其他輪目錄）也找得到 review-r1 ⇒ 引用修法的第二輪仍被擋（exit 2）；舊命名（當前輪叫 review）時這條推導找不到前輪，第二輪曾被放行', async () => {
+    const r = await twoRounds(`# 第二輪\n${FIX}\n\nthis_round_delta: 本輪只改測試斷言\n`, { dropPriorOut: true })
+    assert.equal(r.councilExits[1], 2, `命名對齊後推導找得到前輪；實際 ${r.councilExits[1]}；errs=${r.errs}`)
+  })
+})
+
+
+// ═══════════════════ 1.24.0（WBS 4.7.31 B3）：riskPaths 升 block／--review-timeout-ms／換席名單比對與跨家族降級／land 停用 ═══════════════════
+describe('1.24.0 ticket：riskPaths 升 block、--review-timeout-ms、換席、land 停用', () => {
+  const CLAUDE_OPUS = { harness: 'claude', model: 'claude-opus-5-5', quotaBucket: 'anthropic' }
+  const WAS_RISK_PATHS = ['.agents/skills/llm-team/**', 'tools/*receipt*', 'tools/land*', 'tools/env-allowlist*', '.githooks/**']
+
+  /**
+   * 跑一次 ticket run（假寫手寫 files、假 council 記下 args 並寫 members.json）。
+   * councilFn(reviewOutDir, args) 自行寫 council 輸出；預設照 tier 寫 agy-opus／agy-gemini（block 再加 codex）全簽。
+   */
+  async function run124({ name, configOverride = {}, files = ['hello.txt'], allow, councilFn, extraArgs = [], tierArg, seedFiles, writeFn } = {}) {
+    const repo = makeRepo(configOverride)
+    if (seedFiles) {
+      for (const [f, c] of Object.entries(seedFiles)) {
+        fs.mkdirSync(path.dirname(path.join(repo.dir, f)), { recursive: true })
+        fs.writeFileSync(path.join(repo.dir, f), c)
+      }
+      repo.g('add', '-A')
+      repo.g('commit', '-qm', 'seed')
+    }
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 一張普通票\n實作細節')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', name)
+    const outDir = path.join(repo.dir, '.local', 'llm-team', name)
+    const reviewOutDir = path.join(outDir, 'review-r1')
+    let writeCalls = 0
+    let councilArgs = null
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        writeCalls++
+        if (writeFn) {
+          writeFn(worktreePath)
+          return 0
+        }
+        for (const f of files) {
+          fs.mkdirSync(path.dirname(path.join(worktreePath, f)), { recursive: true })
+          fs.writeFileSync(path.join(worktreePath, f), 'x\n')
+        }
+        return 0
+      },
+      councilMain: (args) => {
+        councilArgs = args
+        if (councilFn) return councilFn(reviewOutDir, args)
+        const tier = args[args.indexOf('--tier') + 1]
+        fakeCouncilOut(reviewOutDir, {
+          'agy-opus': '整份：簽\n',
+          'agy-gemini': '整份：簽\n',
+          ...(tier === 'block' ? { 'codex-gpt-5-6-sol': '整份：簽\n' } : {}),
+        })
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        ['run', '--wbs-exempt', '1.24.0 測試', '--name', name, '--brief', briefFile, '--branch', `feat/${name}`, ...(allow || [files[0]]).flatMap((al) => ['--allow', al]), '--test', 'true', ...(tierArg ? ['--tier', tierArg] : []), ...extraArgs],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const sf = path.join(outDir, 'summary.json')
+    const summary = fs.existsSync(sf) ? JSON.parse(fs.readFileSync(sf, 'utf8')) : null
+    return { code, repo, outDir, outs: outs.join('\n'), errs: errs.join('\n'), councilArgs, writeCalls, summary }
+  }
+  const tierOf = (args) => args[args.indexOf('--tier') + 1]
+
+  test('(riskPaths-1) diff 命中 riskPaths ⇒ 票升 block：council 收到 --tier block、summary.review.tier=block、reviewers 是 block 名單、tierEscalatedByPaths 記檔案與命中的 glob', async () => {
+    const r = await run124({ name: 'rp1', configOverride: { riskPaths: WAS_RISK_PATHS }, files: ['tools/ticket-receipt-lib.mjs'] })
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(tierOf(r.councilArgs), 'block')
+    assert.equal(r.summary.review.tier, 'block')
+    assert.equal(r.summary.reviewers.length, 3, '預期名單已改用 blockReviewers（3 席）')
+    assert.deepEqual(r.summary.tierEscalatedByPaths, [{ file: 'tools/ticket-receipt-lib.mjs', glob: 'tools/*receipt*' }])
+    assert.match(r.outs, /tierEscalatedByPaths: tools\/ticket-receipt-lib\.mjs/)
+  })
+
+  test('(riskPaths-2) 對照：沒命中 ⇒ 仍 standard、無 tierEscalatedByPaths；riskPaths: [] ⇒ 命中樣式的檔也不升級；--tier block 本來就 block 不重複記帳', async () => {
+    const r1 = await run124({ name: 'rp2a', configOverride: { riskPaths: WAS_RISK_PATHS }, files: ['docs/note.md'] })
+    assert.equal(r1.code, 0, r1.errs)
+    assert.equal(tierOf(r1.councilArgs), 'standard')
+    assert.equal(r1.summary.tierEscalatedByPaths, undefined)
+    const r2 = await run124({ name: 'rp2b', configOverride: { riskPaths: [] }, files: ['tools/land.mjs'] })
+    assert.equal(tierOf(r2.councilArgs), 'standard')
+    assert.equal(r2.code, 0, r2.errs)
+    assert.equal(r2.summary.tierEscalatedByPaths, undefined)
+    const r3 = await run124({ name: 'rp2c', configOverride: { riskPaths: WAS_RISK_PATHS }, files: ['.githooks/pre-commit'], tierArg: 'block' })
+    assert.equal(r3.code, 0, r3.errs)
+    assert.equal(tierOf(r3.councilArgs), 'block')
+    assert.equal(r3.summary.review.tier, 'block')
+    // 已是 block 的票，命中仍照實記帳（稽核要看得到哪個檔命中 trust-root），tier 不變
+    assert.deepEqual(r3.summary.tierEscalatedByPaths, [{ file: '.githooks/pre-commit', glob: '.githooks/**' }])
+  })
+
+  test('(riskPaths-3) 同一張票 riskDomains 關鍵字與 riskPaths 並存：兩者都記帳', async () => {
+    const repo = makeRepo({ riskDomains: ['金流'], riskPaths: ['tools/land*'] })
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 金流相關\n')
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'rp3')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'rp3', 'review-r1')
+    let args0 = null
+    let code3 = null
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        fs.mkdirSync(path.join(worktreePath, 'tools'), { recursive: true })
+        fs.writeFileSync(path.join(worktreePath, 'tools', 'land.mjs'), 'x\n')
+        return 0
+      },
+      councilMain: (args) => {
+        args0 = args
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n', 'codex-gpt-5-6-sol': '整份：簽\n' })
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      code3 = await ticketMain(['run', '--wbs-exempt', 't', '--name', 'rp3', '--brief', briefFile, '--branch', 'feat/rp3', '--allow', 'tools/land.mjs', '--test', 'true'], deps)
+    } finally {
+      console.log = origLog
+    }
+    const s = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'rp3', 'summary.json'), 'utf8'))
+    assert.equal(code3, 0)
+    assert.deepEqual(s.tierEscalatedBy, ['金流'])
+    assert.equal(s.tierEscalatedByPaths[0].file, 'tools/land.mjs')
+    assert.equal(tierOf(args0), 'block')
+  })
+
+  test('(review-timeout) --review-timeout-ms：abc／0／-5／1.5／裸旗標 ⇒ run 回 2、writeMain 0 次；合法值 ⇒ council 收到 --timeout-ms；沒給 ⇒ 不傳', async () => {
+    for (const bad of ['abc', '0', '-5', '1.5']) {
+      const r = await run124({ name: 'rt-bad', extraArgs: ['--review-timeout-ms', bad] })
+      assert.equal(r.code, 2, `${bad} 應被拒`)
+      assert.match(r.errs, /--review-timeout-ms 必須是正整數/)
+      assert.equal(r.writeCalls, 0, '開跑前就擋，寫手 0 次')
+      assert.equal(r.councilArgs, null)
+    }
+    const bare = await run124({ name: 'rt-bare', extraArgs: ['--review-timeout-ms'] })
+    assert.equal(bare.code, 2)
+    assert.equal(bare.writeCalls, 0)
+    const ok = await run124({ name: 'rt-ok', extraArgs: ['--review-timeout-ms', '900000'] })
+    assert.equal(ok.code, 0, ok.errs)
+    const i = ok.councilArgs.indexOf('--timeout-ms')
+    assert.notEqual(i, -1, 'council args 要有 --timeout-ms')
+    assert.equal(ok.councilArgs[i + 1], '900000')
+    const none = await run124({ name: 'rt-none' })
+    assert.equal(none.councilArgs.includes('--timeout-ms'), false)
+  })
+
+  // ─── 換席：名單比對與跨家族降級 ───
+  const BLOCK_ROSTER_PROFILE = {
+    reviewers: [{ ...CLAUDE_OPUS, fallbacks: [M.codexSol] }],
+    blockReviewers: [{ ...CLAUDE_OPUS, fallbacks: [M.codexSol] }, { ...M.codexSol, fallbacks: [CLAUDE_OPUS] }],
+  }
+  const T3 = (m) => ({ harness: m.harness, model: m.model, quotaBucket: m.quotaBucket })
+  const claudeEntry = (name = 'claude/opus') => ({ name, ...T3(CLAUDE_OPUS), overall: '簽', q: {}, uncited: [], empty: false, timedOut: false, invalid: false, exit: 0, signal: null, ms: 1, failure: null })
+  const codexEntry = (name = 'codex/gpt-5-6-sol') => ({ name, ...T3(M.codexSol), overall: '簽', q: {}, uncited: [], empty: false, timedOut: false, invalid: false, exit: 0, signal: null, ms: 1, failure: null })
+  /** 寫 members.json＋對應 .txt（ticket 讀 <memberFileName(name)>.txt）。 */
+  const writeCouncil = (reviewOutDir, entries) => {
+    const files = Object.fromEntries(entries.map((e) => [memberFileName(e.name), '整份：簽\n']))
+    fakeCouncilOut(reviewOutDir, files, { members: entries })
+    return 0
+  }
+  const overrideBlock = { profiles: v2Profiles({ claude: BLOCK_ROSTER_PROFILE }) }
+
+  test('(crossFamily-1) block 票：codex（openai，跨家族）quota ⇒ 宣告過的 fallback claude/opus（anthropic＝統整者同家族）代跑 ⇒ 名單算到齊、summary.review.crossFamily=degraded、postReviewPending、收貨摘要印「待事後審」', async () => {
+    const r = await run124({
+      name: 'cf1',
+      configOverride: overrideBlock,
+      tierArg: 'block',
+      councilFn: (dir) =>
+        writeCouncil(dir, [
+          claudeEntry('claude/opus'),
+          { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.codexSol), substituteReason: 'quota', attempts: [{ ...T3(M.codexSol), kind: 'quota', code: '429' }] },
+        ]),
+    })
+    assert.equal(r.code, 0, r.errs + r.outs)
+    assert.equal(r.summary.rosterMismatch, false, '宣告過的換席不算 rosterMismatch')
+    assert.equal(r.summary.review.crossFamily, 'degraded')
+    assert.equal(r.summary.review.postReviewPending, true)
+    assert.equal(r.summary.review.duplicateModel, true, '替補 claude/opus 與同名單另一席 claude/opus 是同一個模型')
+    assert.match(r.outs, /duplicateModel/)
+    assert.equal(r.summary.review.crossFamilyDegraded[0].seat.harness, 'codex')
+    const sub = r.summary.review.members.find((m) => m.substitutedFor)
+    assert.equal(sub.substituteReason, 'quota')
+    assert.match(r.outs, /crossFamily: degraded/)
+    assert.match(r.outs, /待事後審/)
+    assert.match(r.outs, /換席：原席 codex\/gpt-5\.6-sol/)
+    // summary.reviewers 帶 fallbacks（publish 比對靠它）
+    assert.equal(r.summary.reviewers.find((x) => x.harness === 'codex').fallbacks[0].harness, 'claude')
+  })
+
+  test('(crossFamily-2) 對照：沒有換席 ⇒ crossFamily=ok、無 postReviewPending；standard 票不寫 crossFamily 欄', async () => {
+    const r = await run124({ name: 'cf2', configOverride: overrideBlock, tierArg: 'block', councilFn: (dir) => writeCouncil(dir, [claudeEntry(), codexEntry()]) })
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(r.summary.review.crossFamily, 'ok')
+    assert.equal(r.summary.review.postReviewPending, undefined)
+    assert.doesNotMatch(r.outs, /待事後審/)
+    const std = await run124({ name: 'cf2s', configOverride: overrideBlock, councilFn: (dir) => writeCouncil(dir, [claudeEntry()]) })
+    assert.equal(std.code, 0, std.errs)
+    assert.equal(std.summary.review.crossFamily, undefined)
+  })
+
+  test('(crossFamily-3) 未宣告的換席（替補不在該席 fallbacks／原席三元組不對）⇒ rosterMismatch、run 回 3（換席不能成為繞過名單的後門）', async () => {
+    const r = await run124({
+      name: 'cf3',
+      configOverride: overrideBlock,
+      tierArg: 'block',
+      councilFn: (dir) =>
+        writeCouncil(dir, [
+          claudeEntry(),
+          { name: 'agy/gemini', ...T3(M.agyGemini), overall: '簽', q: {}, uncited: [], empty: false, timedOut: false, invalid: false, exit: 0, signal: null, ms: 1, failure: null, substitutedFor: T3(M.codexSol), substituteReason: 'quota' },
+        ]),
+    })
+    assert.equal(r.code, 3)
+    assert.equal(r.summary.rosterMismatch, true)
+    assert.match(r.outs, /rosterMismatch/)
+  })
+
+  test('(crossFamily-4) 一般票（reviewers）某席 quota 換席也算到齊（summary.reviewers 帶 fallbacks）', async () => {
+    const r = await run124({
+      name: 'cf4',
+      configOverride: overrideBlock,
+      councilFn: (dir) => writeCouncil(dir, [{ ...codexEntry('codex/gpt-5-6-sol'), substitutedFor: T3(CLAUDE_OPUS), substituteReason: 'auth' }]),
+    })
+    assert.equal(r.code, 0, r.errs + r.outs)
+    assert.equal(r.summary.rosterMismatch, false)
+    assert.equal(r.summary.review.members[0].substituteReason, 'auth')
+  })
+
+  test('(publish) 換席成員在 publish 名單比對也過（走到 gh）；替補不在宣告的 fallbacks 內 ⇒ publish 擋（回 2）', async () => {
+    const repo = makeRepo()
+    const worktreePath = path.join(repo.dir, '.claude', 'worktrees', 'pubx')
+    fs.mkdirSync(worktreePath, { recursive: true })
+    fs.writeFileSync(path.join(worktreePath, 'file.txt'), 'content')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'pubx')
+    fs.mkdirSync(outDir, { recursive: true })
+    const roster = [
+      { name: 'claude/opus', ...T3(CLAUDE_OPUS), fallbacks: [T3(M.codexSol)] },
+      { name: 'codex/gpt-5-6-sol', ...T3(M.codexSol), fallbacks: [T3(CLAUDE_OPUS)] },
+    ]
+    const substituted = { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.codexSol), substituteReason: 'quota' }
+    const summaryFor = (members) => ({
+      schemaVersion: 2, coordinator: 'claude', reviewers: roster, project: 'p', ticket: 'pubx', branch: 'feat/pubx', base: 'main',
+      writeExit: 0, rounds: 1, changed: ['file.txt'], verifyExit: 0, rosterMismatch: false,
+      review: { tier: 'block', members, anyEmpty: false }, q6Receipt: 'verified ok',
+    })
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir,
+      changedFiles: () => ['file.txt'],
+      git: () => '',
+      spawn: (cmd, args) => {
+        if (cmd === 'gh') {
+          ghCalled = true
+          return { status: 0, stdout: args[0] === '--version' ? 'gh' : 'https://x/pr/1' }
+        }
+        return { status: 0, stdout: '' }
+      },
+    }
+    const publish = async (members) => {
+      fs.mkdirSync(path.join(outDir, 'review-r1'), { recursive: true })
+      fs.writeFileSync(path.join(outDir, 'review-r1', 'members.json'), JSON.stringify(members, null, 2))
+      fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summaryFor(members), null, 2))
+      const errs = []
+      const origErr = console.error
+      const origLog = console.log
+      console.error = (m) => errs.push(String(m))
+      console.log = () => {}
+      let code
+      try {
+        code = await ticketMain(['publish', '--name', 'pubx'], deps)
+      } finally {
+        console.error = origErr
+        console.log = origLog
+      }
+      return { code, errs: errs.join('\n') }
+    }
+    let r = await publish([claudeEntry(), substituted])
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(ghCalled, true, '名單比對通過才走到 gh')
+    ghCalled = false
+    // 替補是 fallbacks 之外的成員（agy/gemini 冒充 codex 席的替補）
+    r = await publish([claudeEntry(), { ...substituted, name: 'agy/gemini', ...T3(M.agyGemini) }])
+    assert.equal(r.code, 2, r.errs)
+    assert.match(r.errs, /複審名單未全員到齊/)
+    assert.equal(ghCalled, false)
+  })
+
+  // ─── R1：riskPaths 遇 rename 要比舊路徑 ───
+  test('(riskPaths-rename 寫手路徑) 風險路徑檔 git mv 到安全路徑 ⇒ 仍升 block，tierEscalatedByPaths 含舊路徑；安全→安全 rename 不升', async () => {
+    const mv = (from, to) => (wt) => {
+      fs.mkdirSync(path.join(wt, path.dirname(to)), { recursive: true })
+      execFileSync('git', ['-C', wt, 'mv', from, to], { env: CLEAN_GIT_ENV })
+    }
+    const r = await run124({ name: 'rn1', configOverride: { riskPaths: WAS_RISK_PATHS }, files: ['docs/moved.md'], allow: ['docs/moved.md', 'tools/land.mjs'], seedFiles: { 'tools/land.mjs': 'x\n' }, writeFn: mv('tools/land.mjs', 'docs/moved.md') })
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(tierOf(r.councilArgs), 'block')
+    assert.ok(r.summary.tierEscalatedByPaths.some((h) => h.file === 'tools/land.mjs' && h.glob === 'tools/land*'), JSON.stringify(r.summary.tierEscalatedByPaths))
+    const safe = await run124({ name: 'rn1s', configOverride: { riskPaths: WAS_RISK_PATHS }, files: ['docs/b.md'], allow: ['docs/b.md', 'docs/a.md'], seedFiles: { 'docs/a.md': 'x\n' }, writeFn: mv('docs/a.md', 'docs/b.md') })
+    assert.equal(tierOf(safe.councilArgs), 'standard')
+    assert.equal(safe.summary.tierEscalatedByPaths, undefined)
+  })
+
+  test('(riskPaths-rename review-only) 已 commit 的 rename（merge-base..HEAD，風險路徑→安全路徑）⇒ 仍升 block', async () => {
+    const repo = makeRepo({ riskPaths: WAS_RISK_PATHS })
+    fs.mkdirSync(path.join(repo.dir, 'tools'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, 'tools', 'land.mjs'), 'x\n')
+    repo.g('add', '-A')
+    repo.g('commit', '-qm', 'seed')
+    const wt = path.join(repo.dir, '.claude', 'worktrees', 'rn2')
+    repo.g('worktree', 'add', '-b', 'feat/rn2', wt, 'main')
+    fs.mkdirSync(path.join(wt, 'docs'), { recursive: true })
+    execFileSync('git', ['-C', wt, 'mv', 'tools/land.mjs', 'docs/moved.md'], { env: CLEAN_GIT_ENV })
+    execFileSync('git', ['-C', wt, '-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'rename'], { env: CLEAN_GIT_ENV })
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, '# 純文字\n')
+    const reviewOutDir = path.join(repo.dir, '.local', 'llm-team', 'rn2', 'review-r1')
+    let args0 = null
+    let code2 = null
+    const deps = {
+      repoRoot: repo.dir,
+      assertSettings: () => true,
+      writeMain: () => 0,
+      councilMain: (args) => {
+        args0 = args
+        fakeCouncilOut(reviewOutDir, { 'agy-opus': '整份：簽\n', 'agy-gemini': '整份：簽\n', 'codex-gpt-5-6-sol': '整份：簽\n' })
+        return 0
+      },
+      runTest: () => ({ exit: 0, out: 'ok' }),
+    }
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      code2 = await ticketMain(['run', '--wbs-exempt', 't', '--name', 'rn2', '--brief', briefFile, '--branch', 'feat/rn2', '--allow', 'docs/moved.md', '--test', 'true', '--review-only'], deps)
+    } finally {
+      console.log = origLog
+    }
+    const s = JSON.parse(fs.readFileSync(path.join(repo.dir, '.local', 'llm-team', 'rn2', 'summary.json'), 'utf8'))
+    assert.equal(code2, 0)
+    assert.equal(tierOf(args0), 'block')
+    assert.ok(s.tierEscalatedByPaths.some((h) => h.file === 'tools/land.mjs'), JSON.stringify(s.tierEscalatedByPaths))
+  })
+
+  // ─── R2：substituteReason 只准 quota／auth ───
+  test('(R2 run) 換席成員 substituteReason 缺或為 timeout ⇒ rosterMismatch、run 回 3；quota／auth 仍過', async () => {
+    for (const [i, reason] of [[0, 'timeout'], [1, undefined], [2, 'process']]) {
+      const sub = { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.codexSol) }
+      if (reason !== undefined) sub.substituteReason = reason
+      const r = await run124({ name: `r2run${i}`, configOverride: overrideBlock, tierArg: 'block', councilFn: (dir) => writeCouncil(dir, [claudeEntry(), sub]) })
+      assert.equal(r.code, 3, `reason=${reason}`)
+      assert.equal(r.summary.rosterMismatch, true)
+    }
+    const ok = await run124({ name: 'r2run-ok', configOverride: overrideBlock, tierArg: 'block', councilFn: (dir) => writeCouncil(dir, [claudeEntry(), { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.codexSol), substituteReason: 'auth' }]) })
+    assert.equal(ok.code, 0, ok.errs)
+  })
+
+  test('(R2 publish) members.json 的換席成員 substituteReason 為 timeout／缺 ⇒ publish 拒絕（回 2、gh 0 次）', async () => {
+    const repo = makeRepo()
+    fs.mkdirSync(path.join(repo.dir, '.claude', 'worktrees', 'r2pub'), { recursive: true })
+    fs.writeFileSync(path.join(repo.dir, '.claude', 'worktrees', 'r2pub', 'file.txt'), 'content')
+    const outDir = path.join(repo.dir, '.local', 'llm-team', 'r2pub')
+    fs.mkdirSync(path.join(outDir, 'review-r1'), { recursive: true })
+    const roster = [
+      { name: 'claude/opus', ...T3(CLAUDE_OPUS), fallbacks: [T3(M.codexSol)] },
+      { name: 'codex/gpt-5-6-sol', ...T3(M.codexSol), fallbacks: [T3(CLAUDE_OPUS)] },
+    ]
+    let ghCalled = false
+    const deps = {
+      repoRoot: repo.dir, changedFiles: () => ['file.txt'], git: () => '',
+      spawn: (cmd) => { if (cmd === 'gh') ghCalled = true; return { status: 0, stdout: 'x' } },
+    }
+    const publish = async (members) => {
+      fs.writeFileSync(path.join(outDir, 'review-r1', 'members.json'), JSON.stringify(members))
+      fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify({
+        schemaVersion: 2, coordinator: 'claude', reviewers: roster, project: 'p', ticket: 'r2pub', branch: 'feat/r2pub', base: 'main',
+        writeExit: 0, rounds: 1, changed: ['file.txt'], verifyExit: 0, rosterMismatch: false,
+        review: { tier: 'block', members, anyEmpty: false }, q6Receipt: 'ok',
+      }))
+      const errs = []
+      const oe = console.error; const ol = console.log
+      console.error = (m) => errs.push(String(m)); console.log = () => {}
+      let code
+      try { code = await ticketMain(['publish', '--name', 'r2pub'], deps) } finally { console.error = oe; console.log = ol }
+      return { code, errs: errs.join('\n') }
+    }
+    const base = { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.codexSol) }
+    let r = await publish([claudeEntry(), { ...base, substituteReason: 'timeout' }])
+    assert.equal(r.code, 2, r.errs)
+    assert.match(r.errs, /複審名單未全員到齊/)
+    r = await publish([claudeEntry(), base])
+    assert.equal(r.code, 2, r.errs)
+    assert.equal(ghCalled, false)
+    r = await publish([claudeEntry(), { ...base, substituteReason: 'quota' }])
+    assert.equal(r.code, 0, r.errs)
+  })
+
+  // ─── R3：crossFamily 對照補實際 fixture ───
+  test('(crossFamily-2b) 跨家族席（codex/openai）換成另一個跨家族成員（gemini/gemini-api，非統整者同家族）⇒ 名單到齊、crossFamily=ok、無「待事後審」', async () => {
+    const GEM = { harness: 'gemini', model: 'gemini-2.5-pro', quotaBucket: 'gemini-api' }
+    const profile = { reviewers: [{ ...CLAUDE_OPUS }], blockReviewers: [{ ...CLAUDE_OPUS }, { ...M.codexSol, fallbacks: [GEM] }] }
+    const r = await run124({
+      name: 'cf2b', configOverride: { profiles: v2Profiles({ claude: profile }) }, tierArg: 'block',
+      councilFn: (dir) => writeCouncil(dir, [claudeEntry(), { ...claudeEntry('gemini/gemini'), ...T3(GEM), substitutedFor: T3(M.codexSol), substituteReason: 'quota' }]),
+    })
+    assert.equal(r.code, 0, r.errs + r.outs)
+    assert.equal(r.summary.rosterMismatch, false)
+    assert.equal(r.summary.review.crossFamily, 'ok')
+    assert.equal(r.summary.review.postReviewPending, undefined)
+    assert.equal(r.summary.review.duplicateModel, undefined)
+    assert.doesNotMatch(r.outs, /待事後審/)
+  })
+
+  test('(crossFamily-3b) 換席成員宣告的原席三元組錯（替補本身在 fallbacks 內，但 substitutedFor 不是名單上的席）⇒ rosterMismatch、run 回 3', async () => {
+    const r = await run124({
+      name: 'cf3b', configOverride: overrideBlock, tierArg: 'block',
+      councilFn: (dir) => writeCouncil(dir, [claudeEntry(), { ...claudeEntry('claude/opus-2'), substitutedFor: T3(M.agyGemini), substituteReason: 'quota' }]),
+    })
+    assert.equal(r.code, 3)
+    assert.equal(r.summary.rosterMismatch, true)
+  })
+
+  // ─── land 停用 ───
+  test('(land) ticket land ⇒ exit 2、訊息指向 tools/land.mjs、不碰任何 git（main HEAD 不動、gitFn 0 次）', async () => {
+    const repo = makeRepo()
+    const msgFile = path.join(repo.dir, 'commit.msg')
+    fs.writeFileSync(msgFile, 'feat: x\n')
+    const before = repo.g('rev-parse', 'HEAD').trim()
+    const gitCalls = []
+    const errs = []
+    const origErr = console.error
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['land', '--name', 'whatever', '--msg-file', msgFile], { repoRoot: repo.dir, git: (...a) => { gitCalls.push(a); return '' } })
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.match(errs.join('\n'), /node tools\/land\.mjs --branch/)
+    assert.match(errs.join('\n'), /--msg-file/)
+    assert.equal(repo.g('rev-parse', 'HEAD').trim(), before, 'main HEAD 不動')
+    assert.equal(repo.g('log', '--oneline').trim().split('\n').length, 1)
+    assert.equal(gitCalls.length, 0, 'land 不碰任何 git')
+    // 就算 summary 與 worktree 都齊全（舊流程會真的合併），也一樣 exit 2、不合併
+    const wt = path.join(repo.dir, '.claude', 'worktrees', 'lnd')
+    repo.g('worktree', 'add', '-b', 'feat/lnd', wt, 'main')
+    fs.writeFileSync(path.join(wt, 'f.txt'), 'x\n')
+    execFileSync('git', ['-C', wt, 'add', 'f.txt'], { env: CLEAN_GIT_ENV })
+    execFileSync('git', ['-C', wt, '-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'ticket'], { env: CLEAN_GIT_ENV })
+    console.error = () => {}
+    try {
+      code = await ticketMain(['land', '--name', 'lnd', '--msg-file', msgFile], { repoRoot: repo.dir })
+    } finally {
+      console.error = origErr
+    }
+    assert.equal(code, 2)
+    assert.equal(repo.g('rev-parse', 'main').trim(), before, '分支領先也不會被 ticket land 合進 main')
+  })
+})
+
+
+// ═══════════════════ 1.26.0（WBS 4.7.31 A2 T2b）：送審前 commit／council --require-clean／輪次目錄 review-r<N>／land 指令 ═══════════════════
+// 事故：2026-10-04 p4733sa2fp 用 ticket 的 review 目錄跑 tools/land.mjs ⇒ exit 2（[binding]／[dirty]／[diff-sha]）。
+//   ticket 對【未提交的工作樹】送審，land 只收 dirty=false、untracked=[]、範圍正好是 mergeBase..branchHead 的輪次；輪次目錄也對不上
+//   （land-core roundOfDir 只認 -r<N> 結尾，當前輪放在 review/ 會被當第 1 輪、與 review-r1 撞號）。
+// 陽性對照（逐條重放見收貨）：拿掉送審前 commit ⇒ (a) 紅；拿掉越界判定 ⇒ (b) 紅；拿掉 verify 紅的閘 ⇒ (f) 紅；拿掉 add -f ⇒ (g) 紅；
+//   當前輪改回寫 review/ ⇒ (c) 紅；latestReviewDir 不認舊結構 ⇒ (d) 紅；拿掉 landCommandLine ⇒ (e) 紅；publish 不認 summary.commits ⇒ (i) 紅。
+// 停止條件：council 自己對 commit 重審（不信任 ticket 的 commit）、或 land 改收未提交工作樹的證據時，本段可拆。
+describe('1.26.0 ticket：送審前 commit、council --require-clean、輪次目錄 review-r<N>、land 指令', () => {
+  const SIGNED = 'Q1：簽｜ok｜無｜\n整份：簽'
+  const roundOf = (dir) => {
+    // 與 WAS tools/land-core.mjs roundOfDir 同一條 regex（測試檔不能 import WAS；WAS 端另用真 roundOfDir 驗過同樣的名字）
+    const m = path.basename(String(dir).replace(/\/+$/, '')).match(/-r(\d+)(?=$|-)/)
+    return m ? Number(m[1]) : 1
+  }
+
+  /** 真 council（假 runOne 回「簽」）＋記錄 args／呼叫次數／council 被叫起來那一刻 worktree 的 git 狀態。 */
+  function makeCouncil(state, worktree, text = SIGNED) {
+    return async (args, d) => {
+      state.councilArgs.push(args)
+      state.gitAtCouncil.push({
+        head: git(worktree, ['rev-parse', 'HEAD']),
+        porcelain: git(worktree, ['status', '--porcelain', '--untracked-files=all']),
+      })
+      const code = await councilMain(args, {
+        ...d,
+        runOne: (name, model, _prompt, _cwd, outD) => {
+          state.runOneCalls++
+          fs.writeFileSync(path.join(outD, `${memberFileName(name)}.txt`), text)
+          return { name, model, exit: 0, ms: 1, empty: false, denied: [], text }
+        },
+      })
+      state.councilExits.push(code)
+      return code
+    }
+  }
+
+  function newTicket(name, { configOverride = {}, seed } = {}) {
+    const repo = makeRepo(configOverride)
+    if (seed) {
+      for (const [f, c] of Object.entries(seed)) {
+        fs.mkdirSync(path.dirname(path.join(repo.dir, f)), { recursive: true })
+        fs.writeFileSync(path.join(repo.dir, f), c)
+      }
+      repo.g('add', '-A')
+      repo.g('commit', '-qm', 'seed')
+    }
+    const worktree = path.join(repo.dir, '.claude', 'worktrees', name)
+    const outDir = path.join(repo.dir, '.local', 'llm-team', name)
+    const state = { councilArgs: [], gitAtCouncil: [], councilExits: [], runOneCalls: 0, councilCalls: 0 }
+    const wg = (...x) => git(worktree, x)
+    return { repo, name, worktree, outDir, state, wg, branch: `feat/${name}--slice` }
+  }
+
+  /** 跑一次 ticket run。writeFn(worktree, round) 假寫手；councilMainOverride 取代真 council。 */
+  async function go(t, { files = ['a.txt', 'b.txt'], allow, writeFn, testExit = 0, extra = [], briefText = '# 新增兩個檔\n內容', councilMainOverride, round = 1, depsOverride = {} } = {}) {
+    const briefFile = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(briefFile, briefText)
+    const deps = {
+      repoRoot: t.repo.dir,
+      assertSettings: () => true,
+      writeMain: () => {
+        if (writeFn) writeFn(t.worktree, round)
+        else for (const f of files) {
+          fs.mkdirSync(path.dirname(path.join(t.worktree, f)), { recursive: true })
+          fs.writeFileSync(path.join(t.worktree, f), `${f} r${round}\n`)
+        }
+        return 0
+      },
+      councilMain: councilMainOverride || makeCouncil(t.state, t.worktree),
+      runTest: () => ({ exit: testExit, out: testExit === 0 ? 'ok' : 'red' }),
+      ...depsOverride,
+    }
+    const outs = []
+    const errs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(
+        ['run', '--wbs-exempt', '1.26.0 測試', '--name', t.name, '--brief', briefFile, '--branch', t.branch, ...(allow || files).flatMap((al) => ['--allow', al]), '--test', 'true', ...extra],
+        deps
+      )
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const sf = path.join(t.outDir, 'summary.json')
+    const summary = fs.existsSync(sf) ? JSON.parse(fs.readFileSync(sf, 'utf8')) : null
+    return { code, outs: outs.join('\n'), errs: errs.join('\n'), summary, deps }
+  }
+  const readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8'))
+
+  test('(a) 寫手改兩個 allow 檔 ⇒ 送審前已 commit：council 被叫起來時 HEAD 已是該 commit、工作樹乾淨；input.json dirty=false／untracked=[]／head＝commit；--require-clean、--base＝merge-base；commit 訊息格式', async () => {
+    const t = newTicket('c126a')
+    const r = await go(t)
+    assert.equal(r.code, 0, `run 應回 0；errs=${r.errs}`)
+    assert.equal(t.state.councilArgs.length, 1)
+    const args = t.state.councilArgs[0]
+    assert.ok(args.includes('--require-clean'), 'council 一律帶 --require-clean')
+    assert.equal(args[args.indexOf('--base') + 1], r.summary.mergeBase, '--base 是 merge-base 的完整 sha（不是分支名 main）')
+    assert.match(r.summary.mergeBase, /^[0-9a-f]{40}$/)
+    assert.equal(r.summary.commits.length, 1)
+    const sha = r.summary.commits[0].sha
+    assert.equal(r.summary.commits[0].round, 1)
+    assert.equal(t.state.gitAtCouncil[0].head, sha, 'council 被叫起來時 HEAD 已是 ticket 的 commit')
+    assert.notEqual(sha, r.summary.roundStartSha, 'commit 之後 HEAD 前進，不等於本輪起點')
+    assert.equal(t.state.gitAtCouncil[0].porcelain, '', 'council 被叫起來時工作樹乾淨（tracked 與 untracked 都空）')
+    assert.equal(t.wg('rev-parse', 'HEAD'), sha)
+    assert.deepEqual(t.wg('show', '--name-only', '--format=', 'HEAD').split('\n').sort(), ['a.txt', 'b.txt'])
+    assert.equal(t.wg('log', '-1', '--format=%s'), 'c126a r1: 新增兩個檔（agy/gemini-3.8-flash-high 寫）')
+    const input = readJson(path.join(t.outDir, 'review-r1', 'input.json'))
+    assert.equal(input.schema, 2)
+    assert.equal(input.dirty, false)
+    assert.deepEqual(input.untracked, [])
+    assert.equal(input.head, sha)
+    assert.equal(input.base, r.summary.mergeBase)
+    assert.equal(input.roundStartSha, r.summary.roundStartSha)
+    assert.deepEqual(input.changedFiles.slice().sort(), ['a.txt', 'b.txt'])
+    assert.equal(r.summary.review.membersSource, 'review-r1/members.json')
+    assert.deepEqual(r.summary.changed.slice().sort(), ['a.txt', 'b.txt'], 'summary.changed 仍是寫手本輪改動檔')
+  })
+
+  test('(b) allow 範圍外有改動／untracked ⇒ 不 commit、不送審：run 回 3、council 0 次、HEAD 沒動、allow 內的檔也沒被 commit、summary.outOfScope 指名、收貨摘要印原因', async () => {
+    const t = newTicket('c126b')
+    const r = await go(t, {
+      files: ['a.txt'],
+      writeFn: (wt) => {
+        fs.writeFileSync(path.join(wt, 'a.txt'), 'in allow\n')
+        fs.writeFileSync(path.join(wt, 'stray.txt'), 'out of allow\n')
+      },
+    })
+    assert.equal(r.code, 3, `越界 ⇒ run 回 3；errs=${r.errs}`)
+    assert.equal(t.state.councilArgs.length, 0, '越界時 council 不應被呼叫')
+    assert.equal(r.summary.review, null)
+    assert.deepEqual(r.summary.outOfScope, ['stray.txt'])
+    assert.deepEqual(r.summary.commits, [], '沒有任何 commit')
+    assert.equal(t.wg('rev-parse', 'HEAD'), r.summary.roundStartSha, 'HEAD 沒動')
+    const porcelain = t.wg('status', '--porcelain', '--untracked-files=all')
+    assert.match(porcelain, /a\.txt/, 'allow 內的檔也沒被 commit（整批不動）')
+    assert.match(porcelain, /stray\.txt/, '越界檔留在工作樹，回統整者')
+    assert.match(r.outs, /🔴 未複審（--allow 外有改動／untracked，不 commit、不送審：stray\.txt）/)
+    assert.doesNotMatch(r.outs, /^node tools\/land\.mjs/m, '沒複審就不印 land 指令')
+  })
+
+  test('(c) 第 2 輪：目錄是 review-r2、review-r1 保留、沒有 review/；輪次 1、2 與 land 的 roundOfDir 對得上；r2 起點＝r1 head；commits 帶前輪', async () => {
+    const t = newTicket('c126c')
+    const r1 = await go(t, { round: 1 })
+    assert.equal(r1.code, 0, r1.errs)
+    const r2 = await go(t, { round: 2, briefText: '# 第二輪\nF1 `a.txt:1` 預期檢查：node a.txt 退出碼 0\nthis_round_delta: 本輪只改測試斷言\n' })
+    assert.equal(r2.code, 0, `第 2 輪 run 應回 0；errs=${r2.errs}`)
+    const dirs = fs.readdirSync(t.outDir).filter((f) => f.startsWith('review')).sort()
+    assert.deepEqual(dirs, ['review-r1', 'review-r2'], '第 1 輪保留、第 2 輪是 review-r2、沒有 review/')
+    assert.deepEqual(dirs.map(roundOf), [1, 2])
+    assert.deepEqual(r2.summary.reviewDirs, ['.local/llm-team/c126c/review-r1', '.local/llm-team/c126c/review-r2'])
+    assert.ok(r2.summary.reviewDirs.length > 0)
+    assert.deepEqual(r2.summary.reviewDirs.map(roundOf), [1, 2], '輪次來自目錄名，與 land 的 roundOfDir 一致')
+    assert.equal(r2.summary.commits.length, 2)
+    assert.deepEqual(r2.summary.commits.map((c) => c.round), [1, 2])
+    assert.notEqual(r2.summary.commits[0].sha, r2.summary.commits[1].sha)
+    const in1 = readJson(path.join(t.outDir, 'review-r1', 'input.json'))
+    const in2 = readJson(path.join(t.outDir, 'review-r2', 'input.json'))
+    assert.equal(in1.head, r2.summary.commits[0].sha)
+    assert.equal(in2.roundStartSha, in1.head, 'r2 的起點是 r1 的 head（land 的輪次鏈）')
+    assert.equal(in2.head, r2.summary.commits[1].sha)
+    assert.equal(in1.dirty || in2.dirty, false)
+    const i = t.state.councilArgs[1].indexOf('--prior-out')
+    assert.notEqual(i, -1)
+    assert.equal(t.state.councilArgs[1][i + 1], path.join(t.outDir, 'review-r1'), '--prior-out 仍傳前面各輪')
+    assert.equal(t.wg('log', '-1', '--format=%s').startsWith('c126c r2: '), true)
+  })
+
+  test('(d) 舊結構（review/ ＋ review-r1，舊流程的當前輪在 review/）可以續輪：review/ 改名 review-r2 保存、review-r1 不動、本輪寫 review-r3、--prior-out 傳前兩輪；summary 子命令讀得到舊結構', async () => {
+    const t = newTicket('c126d')
+    assert.equal((await go(t, { round: 1 })).code, 0)
+    const r2 = await go(t, { round: 2, briefText: '# 第二輪\nF1 `a.txt:1` 預期檢查：node a.txt 退出碼 0\nthis_round_delta: 本輪只改測試斷言\n' })
+    assert.equal(r2.code, 0, r2.errs)
+    // 把 review-r2 倒回舊結構：當前輪叫 review/
+    fs.renameSync(path.join(t.outDir, 'review-r2'), path.join(t.outDir, 'review'))
+    assert.deepEqual(fs.readdirSync(t.outDir).filter((f) => f.startsWith('review')).sort(), ['review', 'review-r1'])
+    // 舊結構下 summary 子命令（讀 latest）：不 throw、印得出收貨摘要
+    const sumOuts = []
+    const origLog = console.log
+    console.log = (m) => sumOuts.push(String(m))
+    let sumCode
+    try {
+      sumCode = await ticketMain(['summary', '--name', t.name], { repoRoot: t.repo.dir })
+    } finally {
+      console.log = origLog
+    }
+    assert.equal(sumCode, 0)
+    assert.match(sumOuts.join('\n'), /=== 收貨摘要：c126d/)
+    // 續輪
+    const r3 = await go(t, { round: 3, briefText: '# 第三輪\nF2 `b.txt:1` 預期檢查：node b.txt 退出碼 0\nthis_round_delta: 本輪只改測試斷言\n' })
+    assert.equal(r3.code, 0, `舊結構續輪應回 0；errs=${r3.errs}`)
+    const dirs = fs.readdirSync(t.outDir).filter((f) => f.startsWith('review')).sort()
+    assert.deepEqual(dirs, ['review-r1', 'review-r2', 'review-r3'], '舊 review/ 改名保存為 review-r2，本輪是 review-r3，沒有 review/')
+    const prior = t.state.councilArgs[2].flatMap((x, i, arr) => (arr[i - 1] === '--prior-out' ? [x] : []))
+    assert.deepEqual(prior, [path.join(t.outDir, 'review-r1'), path.join(t.outDir, 'review-r2')], '--prior-out 傳舊結構轉出的前兩輪')
+    assert.equal(r3.summary.review.membersSource, 'review-r3/members.json')
+    assert.deepEqual(r3.summary.reviewDirs.map(roundOf), [1, 2, 3])
+  })
+
+  test('(d2) 舊結構的 summary 子命令讀得到 review/ 裡的文字：只有 review/（沒有 review-r<N>）時，不簽理由來自 review/<席>.txt', async () => {
+    const t = newTicket('c126d2')
+    fs.mkdirSync(path.join(t.outDir, 'review'), { recursive: true })
+    fs.writeFileSync(path.join(t.outDir, 'review', 'agy-opus.txt'), 'Q3：不簽｜舊結構裡才有的理由｜改它｜foo.mjs:9\n整份：不簽\n')
+    fs.writeFileSync(
+      path.join(t.outDir, 'summary.json'),
+      JSON.stringify({
+        schemaVersion: 2, ticket: 'c126d2', branch: 'feat/c126d2', coordinator: 'claude', writeExit: 0, rounds: 1, changed: ['a.txt'], verifyExit: 0,
+        review: { tier: 'standard', anyEmpty: false, members: [{ name: 'agy/opus', ...M.agyOpus, overall: '不簽', q: { Q3: '不簽' }, uncited: [], empty: false, timedOut: false }] },
+      })
+    )
+    const outs = []
+    const origLog = console.log
+    console.log = (m) => outs.push(String(m))
+    try {
+      assert.equal(await ticketMain(['summary', '--name', t.name], { repoRoot: t.repo.dir }), 0)
+    } finally {
+      console.log = origLog
+    }
+    assert.match(outs.join('\n'), /舊結構裡才有的理由/)
+  })
+
+  test('(e) 收貨摘要多印一行可複製的 land 指令：列出所有輪次目錄（相對 repo 根、逐輪各一個 --review）、branch／name／msg-file／coordinator 齊全，只印不執行，不含驗證宣稱字樣', async () => {
+    const t = newTicket('c126e')
+    await go(t, { round: 1 })
+    const r2 = await go(t, { round: 2, briefText: '# 第二輪\nF1 `a.txt:1` 預期檢查：node a.txt 退出碼 0\nthis_round_delta: 本輪只改測試斷言\n' })
+    assert.equal(r2.code, 0, r2.errs)
+    const lines = r2.outs.split('\n').filter((l) => l.startsWith('node tools/land.mjs'))
+    assert.equal(lines.length, 1, '收貨摘要恰好一行 land 指令')
+    const line = lines[0]
+    assert.equal(
+      line,
+      'node tools/land.mjs --branch feat/c126e--slice --name c126e --msg-file .local/llm-team/c126e/land-msg.txt --review .local/llm-team/c126e/review-r1 --review .local/llm-team/c126e/review-r2 --coordinator claude'
+    )
+    const reviewArgs = line.split(' ').flatMap((x, i, arr) => (arr[i - 1] === '--review' ? [x] : []))
+    assert.ok(reviewArgs.length > 0 && reviewArgs.length === r2.summary.reviewDirs.length, '每輪各一個 --review')
+    assert.ok(reviewArgs.every((d) => !path.isAbsolute(d)), '目錄是相對 repo 根的路徑')
+    assert.doesNotMatch(line, /全綠|全過|已驗證|通過|green|passed/i, 'land 指令行不含驗證宣稱字樣')
+    // 只印不執行：main 沒動、沒有 land 產物
+    assert.equal(t.repo.g('log', '--oneline', 'main').trim().split('\n').length, 1, 'main 沒有被動')
+    // 沒有複審的票（verify 紅）不印
+    const t2 = newTicket('c126e2')
+    const bad = await go(t2, { testExit: 1 })
+    assert.doesNotMatch(bad.outs, /^node tools\/land\.mjs/m)
+  })
+
+  test('(f) verify 紅 ⇒ 不 commit、不送審：run 回 3、council 0 次、HEAD 沒動、summary.review null、commits 空、收貨摘要印「verify 紅」', async () => {
+    const t = newTicket('c126f')
+    const r = await go(t, { testExit: 1 })
+    assert.equal(r.code, 3, r.errs)
+    assert.equal(t.state.councilArgs.length, 0, 'verify 紅時不送審（髒樹送審只會被 --require-clean 拒）')
+    assert.equal(r.summary.review, null)
+    assert.equal(r.summary.verifyExit, 1)
+    assert.deepEqual(r.summary.commits, [])
+    assert.equal(t.wg('rev-parse', 'HEAD'), r.summary.roundStartSha, 'HEAD 沒動、沒有紅 commit')
+    assert.match(r.outs, /🔴 未複審（verify 紅：未 commit、未送審）/)
+  })
+
+  test('(g) gitignored 的 allow 路徑：寫手實際寫了才用 add -f 一起 commit；寫手沒動的 ignored allow 檔不進 commit', async () => {
+    const t = newTicket('c126g', { seed: { '.gitignore': 'gen/\n', 'gen/keep.txt': 'pre-existing ignored\n' } })
+    // gen/keep.txt 是 seed 時就存在的 ignored 檔（被 add -A 略過、不在 HEAD）；allow 同時列 gen/out.txt（寫手會寫）與 gen/keep.txt（寫手不動）
+    const r = await go(t, {
+      files: ['a.txt', 'gen/out.txt', 'gen/keep.txt'],
+      writeFn: (wt) => {
+        fs.writeFileSync(path.join(wt, 'a.txt'), 'a\n')
+        fs.mkdirSync(path.join(wt, 'gen'), { recursive: true })
+        fs.writeFileSync(path.join(wt, 'gen', 'out.txt'), 'ignored but allowed\n')
+      },
+    })
+    assert.equal(r.code, 0, `run 應回 0；errs=${r.errs}`)
+    const committed = t.wg('show', '--name-only', '--format=', 'HEAD').split('\n').sort()
+    assert.deepEqual(committed, ['a.txt', 'gen/out.txt'], 'ignored 的 allow 檔（寫手寫了的）用 add -f 進同一個 commit；寫手沒動的 gen/keep.txt 不進')
+    assert.equal(t.state.gitAtCouncil[0].porcelain, '')
+  })
+
+  test('(h) commit 失敗（pre-commit hook 拒絕）⇒ 不送審、run 回 3、summary.commitFailure 有原因、收貨摘要印出；index 還原成 HEAD 不留半截 staged', async () => {
+    const t = newTicket('c126h')
+    const hooks = path.join(t.repo.dir, '.git', 'hooks')
+    fs.mkdirSync(hooks, { recursive: true })
+    fs.writeFileSync(path.join(hooks, 'pre-commit'), '#!/bin/sh\necho "hook says no" >&2\nexit 1\n', { mode: 0o755 })
+    const r = await go(t)
+    assert.equal(r.code, 3, r.errs)
+    assert.equal(t.state.councilArgs.length, 0)
+    assert.equal(r.summary.review, null)
+    assert.ok(typeof r.summary.commitFailure === 'string' && r.summary.commitFailure.length > 0)
+    assert.match(r.outs, /🔴 未複審（送審前 commit 失敗：/)
+    assert.deepEqual(r.summary.commits, [])
+    assert.equal(t.wg('diff', '--cached', '--name-only'), '', 'commit 失敗後 index 還原成 HEAD，不留半截 staged')
+    assert.match(t.wg('status', '--porcelain', '--untracked-files=all'), /a\.txt/, '寫手的改動仍在工作樹，統整者看得到')
+  })
+
+  test('(i) 送審前已 commit 的票走 publish：工作樹乾淨不算「無任何改動」，publish 不再 add／commit（HEAD 不變），push 與開 PR 照走', async () => {
+    const t = newTicket('c126i')
+    const r = await go(t)
+    assert.equal(r.code, 0, r.errs)
+    const sha = r.summary.commits[0].sha
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      assert.equal(await ticketMain(['accept', '--name', t.name, '--caliber', 'tool', '--q6', '親自坐實'], { repoRoot: t.repo.dir }), 0)
+    } finally {
+      console.log = origLog
+    }
+    const gitCalls = []
+    const ghCalls = []
+    const deps = {
+      repoRoot: t.repo.dir,
+      git: (cwd, a) => {
+        gitCalls.push(a[0])
+        return a[0] === 'push' ? '' : git(cwd, a)
+      },
+      spawn: (cmd, a) => {
+        ghCalls.push([cmd, a[0]])
+        return { status: 0, stdout: cmd === 'gh' && a[0] === 'pr' ? 'https://example.com/pr/1' : 'gh' }
+      },
+    }
+    const outs = []
+    const errs = []
+    const oe = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['publish', '--name', t.name], deps)
+    } finally {
+      console.log = origLog
+      console.error = oe
+    }
+    assert.equal(code, 0, `publish 應回 0；errs=${errs.join('\n')}`)
+    assert.ok(!gitCalls.includes('commit') && !gitCalls.includes('add'), `工作樹乾淨 ⇒ 不 add／commit；實際 git 呼叫：${gitCalls.join(',')}`)
+    assert.ok(gitCalls.includes('push'), 'push 照走')
+    assert.deepEqual(ghCalls.filter(([, x]) => x === 'pr').length, 1, '開 PR 照走')
+    assert.equal(t.wg('rev-parse', 'HEAD'), sha, 'HEAD 仍是 run 的 commit')
+  })
+  // ── r2：block 複審 r1 兩席不簽的三項修正（codex Q2/Q3/Q5/Q6、agy Q1） ──
+  // 陽性對照：拿掉 commit 後重驗 ⇒ R1 紅；publish 不綁 HEAD／input.json.head ⇒ R2 紅；publish 改回 currentFiles.length > 0 判斷 ⇒ R3 紅。
+  async function acceptAndPublish(t, { mutate, realPush = false, pushArgs = [], skipAccept = false } = {}) {
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      if (!skipAccept) assert.equal(await ticketMain(['accept', '--name', t.name, '--caliber', 'tool', '--q6', '親自坐實'], { repoRoot: t.repo.dir }), 0)
+    } finally {
+      console.log = origLog
+    }
+    if (mutate) mutate()
+    const gitCalls = []
+    const deps = {
+      repoRoot: t.repo.dir,
+      git: (cwd, a) => {
+        gitCalls.push(a[0])
+        if (a[0] === 'push') pushArgs.push(a)
+        return a[0] === 'push' && !realPush ? '' : git(cwd, a)
+      },
+      spawn: (cmd, a) => ({ status: 0, stdout: cmd === 'gh' && a[0] === 'pr' ? 'https://example.com/pr/1' : 'gh' }),
+    }
+    const errs = []
+    const oe = console.error
+    console.log = () => {}
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await ticketMain(['publish', '--name', t.name], deps)
+    } finally {
+      console.log = origLog
+      console.error = oe
+    }
+    return { code, gitCalls, errs: errs.join('\n') }
+  }
+
+  test('(R1) pre-commit hook（exit 0）在執行期間 stage 了 allow 外的檔 ⇒ 撤回 commit：run 回 3、HEAD 不變、council 零次、summary.outOfScope 指名、該檔不在任何 commit 裡', async () => {
+    const t = newTicket('c126r1')
+    const hooks = path.join(t.repo.dir, '.git', 'hooks')
+    fs.mkdirSync(hooks, { recursive: true })
+    fs.writeFileSync(path.join(hooks, 'pre-commit'), '#!/bin/sh\n[ -f hookfile.txt ] || echo injected > hookfile.txt\ngit add hookfile.txt\nexit 0\n', { mode: 0o755 })
+    const r = await go(t)
+    assert.equal(r.code, 3, `hook 塞檔 ⇒ run 回 3；errs=${r.errs}`)
+    assert.equal(t.state.councilArgs.length, 0, 'council 零次')
+    assert.equal(t.wg('rev-parse', 'HEAD'), r.summary.roundStartSha, 'HEAD 不前進')
+    assert.deepEqual(r.summary.outOfScope, ['hookfile.txt'])
+    assert.deepEqual(r.summary.commits, [])
+    assert.equal(r.summary.review, null)
+    assert.equal(t.wg('log', '--all', '--format=%H', '--', 'hookfile.txt'), '', 'hookfile.txt 不在任何 commit 裡')
+    assert.equal(t.wg('diff', '--cached', '--name-only'), '', 'index 還原成 HEAD')
+  })
+
+  test('(R2) publish 綁定受審 SHA：受審之後 commit --amend、或 reset 後再 commit ⇒ 拒絕（非 0、不 push）；沒動 ⇒ 照常 push', async () => {
+    const amended = newTicket('c126r2a')
+    assert.equal((await go(amended)).code, 0)
+    const ra = await acceptAndPublish(amended, { mutate: () => amended.wg('-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '--amend', '-qm', 'amended after review') })
+    assert.notEqual(ra.code, 0, `amend 後 publish 應拒絕；errs=${ra.errs}`)
+    assert.ok(!ra.gitCalls.includes('push'), '不得 push')
+    assert.match(ra.errs, /input\.json\.head/)
+
+    const reset = newTicket('c126r2b')
+    assert.equal((await go(reset)).code, 0)
+    const rb = await acceptAndPublish(reset, {
+      mutate: () => {
+        reset.wg('reset', '-q', '--hard', 'HEAD^')
+        fs.writeFileSync(path.join(reset.worktree, 'a.txt'), 'different content\n')
+        reset.wg('add', 'a.txt')
+        reset.wg('-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'recommit')
+      },
+    })
+    assert.notEqual(rb.code, 0, `reset 後再 commit 再 publish 應拒絕；errs=${rb.errs}`)
+    assert.ok(!rb.gitCalls.includes('push'))
+
+    const ok = newTicket('c126r2c')
+    assert.equal((await go(ok)).code, 0)
+    const rc = await acceptAndPublish(ok)
+    assert.equal(rc.code, 0, rc.errs)
+    assert.ok(rc.gitCalls.includes('push'))
+  })
+
+  test('(R3) 新流程 run 結束後把工作樹弄髒再 publish ⇒ 拒絕（不 commit、不 push、不崩潰），沒有新 commit', async () => {
+    const t = newTicket('c126r3')
+    const r = await go(t)
+    assert.equal(r.code, 0, r.errs)
+    const sha = r.summary.commits[0].sha
+    const out = await acceptAndPublish(t, { mutate: () => fs.writeFileSync(path.join(t.worktree, 'a.txt'), 'dirty after review\n') })
+    assert.notEqual(out.code, 0, `髒樹 publish 應拒絕；errs=${out.errs}`)
+    assert.ok(!out.gitCalls.includes('commit') && !out.gitCalls.includes('push'), `不得 commit／push：${out.gitCalls.join(',')}`)
+    assert.equal(t.wg('rev-parse', 'HEAD'), sha, 'HEAD 沒動、沒有新 commit')
+  })
+
+  // ── 1.26.1（T2b-v2）：publish 綁定【分支 ref】、推送用明確 refspec ──
+  // 陽性對照：拿掉分支 ref 核對 ⇒ 「分支指向 U、detached HEAD 在 R」那條紅（publish 仍往下走、push 了 HEAD）；
+  //          拿掉 HEAD:refs/heads/<branch> refspec（改回 `origin <branch>`）⇒ 正常情況的遠端等式仍綠，但 pushArgs 斷言紅。
+  function addBareRemote(t) {
+    const bare = tmpdir('bare-')
+    execFileSync('git', ['init', '-q', '--bare', bare], { env: CLEAN_GIT_ENV })
+    t.wg('remote', 'add', 'origin', bare)
+    return bare
+  }
+  const toPosixT = (p) => p.split(path.sep).join('/')
+  const remoteRefs = (bare) => git(bare, ['for-each-ref', '--format=%(refname) %(objectname)'])
+
+  test('(1.26.1 R2) bare remote 端到端：受審 commit R、受審後在分支上再 commit 未審的 U、detached HEAD 回 R ⇒ publish 拒絕、不 push，遠端沒有該分支（更沒有 U）', async () => {
+    const t = newTicket('c1261r2a')
+    const r = await go(t)
+    assert.equal(r.code, 0, r.errs)
+    const R = r.summary.commits[0].sha
+    const bare = addBareRemote(t)
+    const pushArgs = []
+    let U = null
+    const out = await acceptAndPublish(t, {
+      realPush: true,
+      pushArgs,
+      mutate: () => {
+        fs.writeFileSync(path.join(t.worktree, 'unreviewed.txt'), 'U\n')
+        t.wg('add', 'unreviewed.txt')
+        t.wg('-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'unreviewed U')
+        U = t.wg('rev-parse', 'HEAD')
+        t.wg('checkout', '-q', '--detach', R)
+      },
+    })
+    assert.notEqual(U, R, '前置：U 與 R 不同')
+    assert.equal(t.wg('rev-parse', 'HEAD'), R, '前置：HEAD 在受審的 R（舊的 HEAD 檢查會過）')
+    assert.equal(t.wg('rev-parse', `refs/heads/${t.branch}`), U, '前置：分支 ref 指向 U')
+    assert.notEqual(out.code, 0, `分支 ref≠受審 head ⇒ publish 應拒絕；errs=${out.errs}`)
+    assert.match(out.errs, /refs\/heads\//)
+    assert.ok(!out.gitCalls.includes('push'), '不得 push')
+    assert.equal(remoteRefs(bare), '', '遠端沒有任何 ref（不含 U）')
+  })
+
+  test('(1.26.1 R2) 正常情況：publish 推 HEAD:refs/heads/<branch>，遠端分支 sha ＝ 受審 head', async () => {
+    const t = newTicket('c1261r2b')
+    const r = await go(t)
+    assert.equal(r.code, 0, r.errs)
+    const R = r.summary.commits[0].sha
+    const bare = addBareRemote(t)
+    const pushArgs = []
+    const out = await acceptAndPublish(t, { realPush: true, pushArgs })
+    assert.equal(out.code, 0, out.errs)
+    assert.equal(pushArgs.length, 1, '分母：確實 push 了一次')
+    assert.deepEqual(pushArgs[0], ['push', '-u', 'origin', `HEAD:refs/heads/${t.branch}`])
+    assert.equal(git(bare, ['rev-parse', `refs/heads/${t.branch}`]), R, '遠端分支＝受審 head')
+  })
+
+  test('backtickFence：內容含 4 個連續反引號 ⇒ fence 長度 5；3 個 ⇒ 4；沒有或 1–2 個 ⇒ 3（1.26.1 改寫 regex 字面值，行為不變）', () => {
+    const bt = (n) => '`'.repeat(n)
+    assert.equal(backtickFence(`a ${bt(4)} b`), bt(5))
+    assert.equal(backtickFence(`a ${bt(3)} b ${bt(1)}`), bt(4))
+    assert.equal(backtickFence('沒有反引號'), bt(3))
+    assert.equal(backtickFence(`x ${bt(2)} y`), bt(3))
+    assert.equal(backtickFence(`${bt(1)}x${bt(7)}y${bt(2)}`), bt(8))
+  })
+
+  // ── 1.26.2（T2b-v2 r2）：summary／複審目錄／受審 head 同一代 ──
+  // 事故情境（codex r1 R1）：r1 已 accept；r2 已 commit、council 已寫出新的 input／members，但 summary 重寫前中斷（這裡注入 writeTreeOf throw）
+  //   ⇒ 磁碟上是 r1「已 accept」的 summary；HEAD＝分支 ref＝r2 input.json.head，所以 1.26.1 的 HEAD／ref 檢查全過，publish 會拿 r1 的 dispositions 當 r2 的裁決把新 commit 推出去。
+  // 陽性對照：拿掉 run 開頭的 invalidatePriorAcceptance ⇒ (i) 的「acceptance 已清」斷言紅；拿掉 publish 的 generation 綁定 ⇒ (ii)（手放回舊 summary）紅。
+  test('(1.26.2 R1) generation canary：r1 已 accept、r2 在 summary 重寫前中斷（writeTreeOf throw）⇒ 舊 acceptance 已被清掉；publish exit 2、零次 push、bare remote 沒有任何 ref；手放回舊輪已 accept 的 summary 也一樣被拒', async () => {
+    const UNSIGNED = 'Q1：不簽｜改動範圍過大｜需縮減\n整份：不簽'
+    const t = newTicket('c1262r1')
+    const r1 = await go(t, { councilMainOverride: makeCouncil(t.state, t.worktree, UNSIGNED) })
+    assert.equal(r1.code, 0, r1.errs)
+    const R1 = r1.summary.commits[0].sha
+    assert.equal(r1.summary.reviewDir, toPosixT(path.relative(t.repo.dir, path.join(t.outDir, 'review-r1'))))
+    assert.equal(r1.summary.reviewedHead, R1, 'summary 記錄 reviewedHead＝受審 commit')
+    const members = r1.summary.review.members.map((m) => m.name)
+    assert.ok(members.length > 0 && r1.summary.review.members.every((m) => m.overall === '不簽'), '分母：r1 全員不簽')
+    const origLog = console.log
+    console.log = () => {}
+    try {
+      const dispArgs = members.flatMap((n) => ['--disposition', `${n}:Q1=rejected:r1 裁決`, '--disposition', `${n}:overall=rejected:r1 裁決`])
+      assert.equal(await ticketMain(['accept', '--name', t.name, '--caliber', 'tool', '--q6', '親自坐實', ...dispArgs], { repoRoot: t.repo.dir }), 0)
+    } finally {
+      console.log = origLog
+    }
+    const summaryPath = path.join(t.outDir, 'summary.json')
+    const staleAccepted = fs.readFileSync(summaryPath, 'utf8')
+    assert.ok(JSON.parse(staleAccepted).acceptedAt, '前置：r1 已 accept')
+    const bare = addBareRemote(t)
+
+    // r2：council 寫出（不簽）input／members 之後，writeTreeOf 拋錯 ⇒ summary 重寫前中斷
+    let threw = null
+    try {
+      await go(t, { round: 2, briefText: '# 新增兩個檔\n內容\nthis_round_delta: 第二輪只改一處\n', councilMainOverride: makeCouncil(t.state, t.worktree, UNSIGNED), depsOverride: { writeTreeOf: () => { throw new Error('canary: writeTreeOf throw') } } })
+    } catch (e) {
+      threw = e
+    }
+    assert.match(String(threw?.message), /canary: writeTreeOf throw/, '前置：r2 真的在 summary 重寫前中斷')
+    const R2 = t.wg('rev-parse', 'HEAD')
+    assert.notEqual(R2, R1, '前置：r2 已 commit')
+    assert.ok(fs.existsSync(path.join(t.outDir, 'review-r2', 'input.json')), '前置：r2 的 input.json 已寫出')
+    const after = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+    for (const k of ['acceptedAt', 'q6Receipt', 'dispositions']) assert.ok(!(k in after), `(i) 舊 acceptance 的 ${k} 已被清掉`)
+    assert.equal(after.reviewDir, null)
+    assert.equal(after.reviewedHead, null)
+    assert.deepEqual(fs.readdirSync(t.outDir).filter((f) => f.endsWith('.tmp')), [], '原子寫入沒有留下暫存檔')
+
+    const p1 = await acceptAndPublish(t, { skipAccept: true, realPush: true })
+    assert.notEqual(p1.code, 0, `(i) 中斷後 publish 應拒絕；errs=${p1.errs}`)
+    assert.ok(!p1.gitCalls.includes('push'), '(i) 零次 push')
+    assert.equal(remoteRefs(bare), '', '(i) bare remote 沒有任何 ref')
+
+    // (ii) 即使舊輪「已 accept」的 summary 被放回磁碟（清除機制被繞過時的第二道）⇒ generation 綁定仍拒
+    fs.writeFileSync(summaryPath, staleAccepted)
+    const p2 = await acceptAndPublish(t, { skipAccept: true, realPush: true })
+    assert.notEqual(p2.code, 0, `(ii) 舊輪 summary publish 應拒絕；errs=${p2.errs}`)
+    assert.match(p2.errs, /同一代/)
+    assert.ok(!p2.gitCalls.includes('push'), '(ii) 零次 push')
+    assert.equal(remoteRefs(bare), '', '(ii) bare remote 沒有任何 ref')
   })
 })

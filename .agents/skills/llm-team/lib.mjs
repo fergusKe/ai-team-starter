@@ -88,8 +88,12 @@ export const USAGE_MODES = ['off', 'record', 'cohort']
  */
 export const MEASUREMENT_SCHEMA_VERSION = 1
 
-/** 成員物件基本形狀檢查；`where` 用來指名 profile 與欄位。 */
-function validateMember(m, where, targetFile) {
+/**
+ * 成員物件基本形狀檢查；`where` 用來指名 profile 與欄位。
+ * 1.24.0：`fallbacks`（有序成員陣列）只准出現在複審名單（reviewers／blockReviewers／postReviewers）的成員上（opts.allowFallbacks）；
+ *   每個 fallback 自己照一般成員驗，不准再巢狀 fallbacks，不准等於原席、不准同席內重複。
+ */
+function validateMember(m, where, targetFile, opts = {}) {
   if (!m || typeof m !== 'object' || Array.isArray(m)) {
     throw new Error(`config profiles 不合法（${targetFile}）：${where} 必須是成員物件 {harness, model, quotaBucket}`)
   }
@@ -104,6 +108,24 @@ function validateMember(m, where, targetFile) {
   }
   if (m.effort !== undefined && !MEMBER_EFFORTS.includes(m.effort)) {
     throw new Error(`config profiles 不合法（${targetFile}）：${where}.effort 只准 ${MEMBER_EFFORTS.join('|')}，得到 ${JSON.stringify(m.effort)}`)
+  }
+  if (m.fallbacks !== undefined) {
+    if (!opts.allowFallbacks) {
+      throw new Error(`config profiles 不合法（${targetFile}）：${where}.fallbacks 只准出現在 reviewers／blockReviewers／postReviewers 的成員（統整者、裁決者、寫手不換席）`)
+    }
+    if (!Array.isArray(m.fallbacks) || m.fallbacks.length === 0) {
+      throw new Error(`config profiles 不合法（${targetFile}）：${where}.fallbacks 必須是非空陣列（不想換席就不要寫這個欄）`)
+    }
+    m.fallbacks.forEach((f, i) => {
+      const fw = `${where}.fallbacks[${i}]`
+      validateMember(f, fw, targetFile)
+      if (sameMember(f, m)) {
+        throw new Error(`config profiles 不合法（${targetFile}）：${fw} 就是原席（${m.harness}/${m.model}），換席沒有意義`)
+      }
+      if (m.fallbacks.slice(0, i).some((prev) => sameMember(prev, f))) {
+        throw new Error(`config profiles 不合法（${targetFile}）：${fw} 在同一席的 fallbacks 重複（${f.harness}/${f.model}）`)
+      }
+    })
   }
 }
 
@@ -196,10 +218,15 @@ export function validateProfiles(config, targetFile = 'config') {
       }
       list.forEach((m, i) => {
         const where = `${at}.${listKey}[${i}]`
-        validateMember(m, where, targetFile)
+        validateMember(m, where, targetFile, { allowFallbacks: true })
         if (sameMember(m, coord)) {
           throw new Error(`config profiles 不合法（${targetFile}）：${where} 就是統整者本人（不變式：統整者不在自己票的複審名單）`)
         }
+        ;(m.fallbacks || []).forEach((f, fi) => {
+          if (sameMember(f, coord)) {
+            throw new Error(`config profiles 不合法（${targetFile}）：${where}.fallbacks[${fi}] 就是統整者本人（不變式：統整者不在自己票的複審名單）`)
+          }
+        })
         if (list.slice(0, i).some((prev) => sameMember(prev, m))) {
           throw new Error(`config profiles 不合法（${targetFile}）：${where} 在同一名單重複（${m.harness}/${m.model}）`)
         }
@@ -230,6 +257,45 @@ export function validateProfiles(config, targetFile = 'config') {
   return true
 }
 
+// ─────────────────── 1.24.0：riskPaths glob ───────────────────
+/** 極小 glob：`**` 跨目錄、`*` 不跨 `/`、`?` 單一非 `/` 字元；`dir/**` 涵蓋其下所有檔。其餘字元逐字比對。 */
+export function globToRegExp(glob) {
+  let re = ''
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        i++
+        if (glob[i + 1] === '/') {
+          i++
+          re += '(?:.*/)?'
+        } else {
+          re += '.*'
+        }
+      } else {
+        re += '[^/]*'
+      }
+    } else if (c === '?') {
+      re += '[^/]'
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+  }
+  return new RegExp('^' + re + '$')
+}
+
+/** files（repo 相對路徑）× globs ⇒ 命中清單 [{file, glob}]（每個檔只回第一個命中的 glob）。 */
+export function matchRiskPaths(files, globs) {
+  const compiled = (globs || []).map((g) => ({ g, re: globToRegExp(g) }))
+  const hits = []
+  for (const raw of files || []) {
+    const file = String(raw).replace(/^\.\//, '')
+    const h = compiled.find((c) => c.re.test(file))
+    if (h) hits.push({ file, glob: h.g })
+  }
+  return hits
+}
+
 /**
  * 載入專案的 llm-team config.json。
  * 缺檔或 schemaVersion !== 2 ⇒ fail-closed throw（收到 1 ⇒ 指名舊格式，不做自動轉換）。
@@ -246,6 +312,15 @@ export function loadConfig(repoRoot, configFile = null) {
   } catch (e) {
     throw new Error(`config 解析失敗（${targetFile}）：${e.message}`)
   }
+  return validateConfigObject(config, targetFile)
+}
+
+/**
+ * config 物件驗證（純函式；從 loadConfig 抽出，行為不變）：schemaVersion／writer／profiles／maxRounds／branchPrefixes／riskPaths／usage。
+ * 會就地補預設值（branchPrefixes／riskPaths／usage）並回傳同一個物件；不合法 ⇒ throw。
+ * tools/land.mjs 對 main 上的 config 用它驗（4.7.31 A2 T2 r2 R3），與 loadConfig 同一份判準。
+ */
+export function validateConfigObject(config, targetFile = 'config') {
   if (config && config.schemaVersion === 1) {
     throw new Error(`config schemaVersion 1 舊格式：models/codexTier 已廢，改成 profiles（見 SKILL.md）（${targetFile}）`)
   }
@@ -269,6 +344,12 @@ export function loadConfig(repoRoot, configFile = null) {
     throw new Error(`config branchPrefixes 不支援（${targetFile}）：預期全為字串的陣列，得到包含非字串型別 [${invalidTypes.join(', ')}]`)
   } else if (config.branchPrefixes.some((p) => p.trim() === '')) {
     throw new Error(`config branchPrefixes 不支援（${targetFile}）：空前綴等於不檢查，要停用請用 []`)
+  }
+  // 1.24.0：riskPaths（glob 陣列）。diff 檔案命中任一 ⇒ 票升 block（與 riskDomains 關鍵字並存）。預設 []＝不啟用。
+  if (config.riskPaths === undefined) {
+    config.riskPaths = []
+  } else if (!Array.isArray(config.riskPaths) || !config.riskPaths.every((g) => typeof g === 'string' && g.trim() !== '')) {
+    throw new Error(`config riskPaths 不合法（${targetFile}）：必須是非空字串（glob）的陣列，要停用請用 []`)
   }
   if (config.usage === undefined) {
     config.usage = { mode: 'off' }
@@ -399,10 +480,20 @@ export function rosterKey(m) {
 
 /** members.json 的每一項至少要有 name／harness／model／quotaBucket 四個非空字串。 */
 export function isRosterEntry(m) {
-  return Boolean(
+  const base = Boolean(
     m && typeof m === 'object' && !Array.isArray(m) &&
     ['name', 'harness', 'model', 'quotaBucket'].every((k) => typeof m[k] === 'string' && m[k].trim() !== '')
   )
+  if (!base) return false
+  // 1.24.0：換席成員帶 substitutedFor（原席三元組）；有這欄就要形狀完整，否則整份當「無法證明」。
+  if (m.substitutedFor !== undefined) {
+    const s = m.substitutedFor
+    return Boolean(
+      s && typeof s === 'object' && !Array.isArray(s) &&
+      ['harness', 'model', 'quotaBucket'].every((k) => typeof s[k] === 'string' && s[k].trim() !== '')
+    )
+  }
+  return true
 }
 
 /** 讀 council 寫的 members.json：缺檔／壞 JSON／不是陣列／任一項缺身分 ⇒ null（呼叫端一律當「無法證明」處理）。 */
@@ -421,32 +512,71 @@ export function readMembersJson(file) {
 /**
  * 多重集合比對（以 rosterKey 為鍵）：回 { missing: 預期有但實際沒有的成員, unexpected: 實際有但預期沒有的成員, mismatch }。
  * 同一三元組出現兩次也要兩次都到齊（nameMembers 的 -2 只是顯示名）。
+ * 🔴 1.24.0 換席：預期席可帶 `fallbacks`（成員陣列）；實際成員可帶 `substitutedFor`（原席三元組）。
+ *   · 第一輪只做精確比對，而且【只收沒有 substitutedFor 的實際成員】——換席成員不能冒充另一個原本就在名單上的席。
+ *   · 第二輪：還沒配到的預期席，找「substitutedFor ＝ 這一席」且「自己的三元組 ∈ 這一席的 fallbacks」且
+ *     「substituteReason ∈ FALLBACK_FAILURE_KINDS（quota／auth）」的實際成員（缺原因或其他值如 timeout ⇒ 不算換席，是 mismatch）。
+ *     config 沒宣告的換席（不在 fallbacks 內、或原席不對）⇒ 仍是 missing／unexpected。
+ *   陽性對照 llm-team.test.mjs「1.24.0 compareRoster：宣告過的換席算到齊；未宣告的換席／冒充別席 ⇒ mismatch」。
  */
 export function compareRoster(expected, actual) {
-  const count = (list) => {
-    const m = new Map()
-    for (const e of list || []) {
-      const k = rosterKey(e)
-      m.set(k, (m.get(k) || 0) + 1)
-    }
-    return m
-  }
-  const exp = count(expected)
-  const act = count(actual)
-  const missing = []
-  const unexpected = []
-  for (const e of expected || []) {
+  const exp = expected || []
+  const act = actual || []
+  const used = new Array(act.length).fill(false)
+  const matched = new Array(exp.length).fill(false)
+  exp.forEach((e, i) => {
     const k = rosterKey(e)
-    if ((act.get(k) || 0) > 0) act.set(k, act.get(k) - 1)
-    else missing.push(e)
-  }
-  const expLeft = new Map(exp)
-  for (const a of actual || []) {
-    const k = rosterKey(a)
-    if ((expLeft.get(k) || 0) > 0) expLeft.set(k, expLeft.get(k) - 1)
-    else unexpected.push(a)
-  }
+    const j = act.findIndex((a, jj) => !used[jj] && !a?.substitutedFor && rosterKey(a) === k)
+    if (j >= 0) {
+      used[j] = true
+      matched[i] = true
+    }
+  })
+  exp.forEach((e, i) => {
+    if (matched[i]) return
+    const fbKeys = (Array.isArray(e?.fallbacks) ? e.fallbacks : []).map(rosterKey)
+    if (fbKeys.length === 0) return
+    const k = rosterKey(e)
+    const j = act.findIndex(
+      (a, jj) =>
+        !used[jj] &&
+        a?.substitutedFor &&
+        FALLBACK_FAILURE_KINDS.includes(a.substituteReason) &&
+        rosterKey(a.substitutedFor) === k &&
+        fbKeys.includes(rosterKey(a))
+    )
+    if (j >= 0) {
+      used[j] = true
+      matched[i] = true
+    }
+  })
+  const missing = exp.filter((_, i) => !matched[i])
+  const unexpected = act.filter((_, j) => !used[j])
   return { missing, unexpected, mismatch: missing.length > 0 || unexpected.length > 0 }
+}
+
+/** 換席原因只認這兩種（額度用盡／憑證不可用）；逾時、被拒、格式錯都不換席——那些換人也不會好。 */
+export const FALLBACK_FAILURE_KINDS = ['quota', 'auth']
+
+/**
+ * block 跨家族席降級判定：原席與統整者不同 quotaBucket（跨家族）、換上的成員與統整者同 quotaBucket（同家族）⇒ degraded。
+ * members＝council members.json（帶 substitutedFor）；回 { status: 'ok'|'degraded', degraded: [{seat, substitute}] }。
+ */
+export function crossFamilyStatus(coordinatorBucket, members) {
+  const degraded = []
+  for (const m of members || []) {
+    const s = m?.substitutedFor
+    if (!s) continue
+    if (s.quotaBucket !== coordinatorBucket && m.quotaBucket === coordinatorBucket) {
+      degraded.push({ seat: s, substitute: { harness: m.harness, model: m.model, quotaBucket: m.quotaBucket, name: m.name } })
+    }
+  }
+  // 🔴 1.24.0 r2（R5）：替補成員與同名單另一席同 harness／model（例：block 的 codex 席換成 claude/opus，而 claude/opus 本來就是另一席）
+  //   ⇒ 兩席其實是同一個模型，盲點相關、等於少一個獨立複審者。只標記不擋：summary.review.duplicateModel＋收貨摘要警示。
+  const list = members || []
+  const keys = list.map(rosterKey)
+  const duplicateModel = list.some((m, i) => m?.substitutedFor && keys.some((k, j) => j !== i && k === keys[i]))
+  return { status: degraded.length > 0 ? 'degraded' : 'ok', degraded, duplicateModel }
 }
 
 /** 顯示用：`name〔harness/model/quotaBucket〕`。 */

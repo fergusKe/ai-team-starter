@@ -83,7 +83,7 @@ export async function runCodexAsync({
 // 🔴 2026-09-22 事故：codex 額度用完時 stderr 是「ERROR: You've hit your usage limit. … try again at 3:55 PM.」（沒有 429 字樣），
 //   1.15.0 council 顯示「零輸出」而非 quota（scratchpad/council-harness-registry/codex-gpt-5-6-sol.stderr.txt）。
 //   🔴 界線（統整者 r2 裁定，sol Q5 一半收）：
-//   · stderr 命中 `usage limit`／`rate limit` ⇒ 一律 `{kind:'quota', retryable:true}`，**不看 text 是否為空、不看 exit**——
+//   · （1.24.0 r2 收窄，見 normalizeReview）stderr 命中 `usage limit`／`rate limit` 且 stdout 無合法判定行且 exit≠0 ⇒ `{kind:'quota', retryable:true}`；以下為 1.16.0 原裁定：不看 text 是否為空、不看 exit——
 //     codex 印出這句就是額度事件，ChatGPT 額度到點會 reset，統整者可晚點重派同一席；
 //   · 裸 `429` 維持既有 classifyFailure（非零 exit 才 quota、retryable:false）——harnesses.test ⑨ 既有斷言不動。
 //   council 的「零輸出」判定不變，members.json 多帶 failure 讓統整者看得出是額度不是沒話說。
@@ -106,7 +106,11 @@ function normalizeReview(raw) {
   const timedOut = r.timedOut === true
   const exit = r.exit ?? null
   const text = r.stdout || ''
-  const quota = codexQuotaHit(r.stderr)
+  // 🔴 1.24.0 r2：quota 收窄為「stdout 沒有合法判定行（整份：簽／不簽）且 exit≠0 且 stderr 命中額度字樣」。
+  //   以前命中字樣就是 quota，不看 text／exit：複審者已經交出判定、stderr 只是附帶一句 rate limit 警告時，也被標 quota，
+  //   council 換席就可能把「不簽」洗掉。陽性對照 harnesses.test.mjs ⑫（合法判定＋rate limit stderr ⇒ 不判 quota）。
+  const hasVerdict = /整份[：:]\s*\**\s*(簽|不簽)/.test(text)
+  const quota = !hasVerdict && exit !== 0 && exit !== null ? codexQuotaHit(r.stderr) : null
   const failure = timedOut
     ? { kind: 'timeout', retryable: true }
     : quota

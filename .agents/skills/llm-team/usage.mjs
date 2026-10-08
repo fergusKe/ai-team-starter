@@ -115,6 +115,19 @@ export function findMainRepo(cwd = process.cwd(), config = {}) {
 // ── lifecycle 解析 ─────────────────────────────────────────────────────────
 
 /**
+ * 🔴 1.24.0 r2（R3）：`ticket land` 停用後沒人寫 `landed` 事件（寫入者移交 tools/land.mjs，WBS 4.7.31 A2）；
+ *   有 accepted 無 landed ⇒ 視窗終點無聲退成 accepted。回一行明確警示（呼叫端印 stderr）；沒有這個情形 ⇒ null。
+ *   陽性對照 usage.test.mjs「1.24.0 landedMissingWarning」（拿掉判斷／呼叫 ⇒ 紅）。
+ */
+export function landedMissingWarning(entries, ticket = '?') {
+  const list = Array.isArray(entries) ? entries : []
+  const accepted = list.some((e) => e?.event === 'accepted')
+  const landed = list.some((e) => e?.event === 'landed')
+  if (!accepted || landed) return null
+  return `⚠ landed 事件從缺：票 ${ticket} 有 accepted 無 landed——ticket land 已於 llm-team 1.24.0 停用，landed 寫入者應移交 tools/land.mjs（WBS 4.7.31 A2）；視窗終點退用 accepted`
+}
+
+/**
  * 解析 lifecycle 視窗（run-start → landed（或最後一筆 accepted、或 last-event））：
  *   - from 預設為第一筆 run-start 的 at（若無則第一筆的 at）
  *   - to 預設為 landed 的 at（windowEnd='landed'）；若無 landed 則最後一筆 accepted 的 at（windowEnd='accepted'）；若無 accepted 則最後一筆的 at（windowEnd='last-event'）
@@ -1014,6 +1027,8 @@ export async function measureTicketLive(ticket, localDir, config, repoRoot, deps
     return { measurable: false, reason: 'lifecycle-parse-error', usageWindow: null }
   }
 
+  const missingLanded = landedMissingWarning(entries, ticket)
+  if (missingLanded) console.error(missingLanded)
   const window = parseLifecycleWindow(entries, { noLastEventFallback: true })
   if (!window.from || !window.to) {
     return { measurable: false, reason: '視窗缺時間', usageWindow: null }
@@ -1688,6 +1703,10 @@ export async function main(argv, { cwd = process.cwd(), ...deps } = {}) {
     return 1
   }
 
+  {
+    const missingLanded = landedMissingWarning(lifecycleEntries, ticket)
+    if (missingLanded) console.error(missingLanded)
+  }
   const window = parseLifecycleWindow(lifecycleEntries, {
     from: flags['--from'],
     to: flags['--to'],

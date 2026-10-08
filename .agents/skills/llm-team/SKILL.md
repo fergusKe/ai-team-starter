@@ -19,8 +19,76 @@ description: 當統整者要把一張葉子票交給便宜模型寫、兩位以�
 3. **封閉格式**：每題「Qn：簽／不簽｜理由｜要改什麼｜引用」，不簽必附 檔名:行號 或指令輸出；格式由 `parseVerdicts` 程式判，不靠人讀。
 4. **模型只是設定值**：`claude` 也能當複審／裁決（`claude -p --model <m> --output-format json --no-session-persistence --setting-sources project --tools Read,Grep,Glob --permission-mode dontAsk`，prompt 走 stdin；不載使用者層 settings ⇒ 使用者層 hook 不會在複審者身上跑）。同桶也准。
 5. **分工審查要有最後一位評審**：多位審查者**各看一塊**（不是每位都看整份）時，最後派一位全新的覆蓋率評審，只問「哪一塊沒人負責、哪些『交給別人』其實沒人接」。council 的複審者每位都看整份 diff，不需要這步；它用在稽核、規格多面向審查這類扇出。
+6. **第二輪 brief 只放 finding ID＋證據 path:line＋預期的決定性檢查（1.23.0）**：block 第二輪（或任何再審）的 brief 由統整者寫，不得內嵌前一輪審查者的不簽理由、必要修改或建議修法——否則新行程拿到的是自己上一輪的框架，等於在驗自己的建議。格式固定為「F1 `path:line` 預期檢查：<指令與預期結果>」。`council.mjs review` 預設把 brief 與前輪輸出（`--prior-out <dir>` 可重複；沒給就找同 `--out` 父目錄、去掉 `-r<N>` 尾碼同前綴的其他輪目錄）比對：前輪不簽行第 2、3 欄（理由、必要修改）任一段連續 ≥30 字元出現在 brief ⇒ exit 2，訊息列命中片段與來源檔。`--allow-prior-quote` 可覆寫，但會寫進 input.json、ledger.ndjson、members.json（`allowPriorQuote`）。第二輪 prompt 本身只帶 diff 範圍資訊（`--round-start` 的本輪範圍＋累計 stat），不帶前輪任何 Q 行。
+   - 事故：2026-10-03 統整者給 4.7.29a／29b 第二輪寫的追加段，把 codex 第一輪的不簽理由與修法摘要後附在 brief 送審（定案：`docs/consultations/2026-10-03-llm-trust-architecture.md` §3 L2-7，fable C5／Q6）。
+   - 陽性對照：`llm-team.test.mjs`「1.23.0 brief 不得內嵌前輪推理」(a)——拿掉 `council.mjs` 的比對（`findPriorQuotes` 恆回空）⇒ (a) 紅；(b) 只含 ID 與 path:line 的 brief 仍過、(e) 短於 30 字元的共同片段（path:line、檔名）不誤擋。
+   - 停止條件：第二輪 brief 改由程式（只輸出 finding ID＋證據）產生、統整者不再手寫追加段時，本比對可撤。
 
 代價（照記，不是理由回頭）：同模型的盲點相關。補法是證據欄位（引用必填）、「待驗證」可以說出口、需要時多跑一位不同模型——config 裡放別家成員仍然准。
+
+## 額度換席、路徑升 block、複審 timeout、唯一合併口（1.24.0）
+
+🔴 **業主 2026-10-04**：「我們雖然有不同 LLM 溝通，可是這不夠結構化／如果某個 LLM 額度沒有了怎麼辦／這樣就不能做了，這不合理」。1.22.0 讓複審不綁廠商，但某一席額度用完時整份仍算不簽；fable 10-03 重判（a-①／k／N2）補下面五件。
+
+1. **額度換席**：reviewers／blockReviewers／postReviewers 的每個成員可帶有序 `fallbacks`（成員物件陣列，每個自己照一般成員驗；不准巢狀、不准等於原席、不准同席重複、不准是統整者本人；統整者／裁決者／寫手不能帶）。council 對某席失敗且 `failure.kind ∈ {quota, auth}` 時，依序各開一個**全新行程、同一份 prompt** 改跑 fallback；第一個不再是 quota／auth 失敗的成員就是該席的實際成員，`members.json` 記 `substitutedFor`（原席三元組）、`substituteReason`（原席 failure.kind）、`attempts`（失敗的嘗試）。**全部 fallback 都 quota／auth 失敗 ⇒ 該席失敗**（維持原席身分、empty ⇒ exit 3），不是靜默通過。逾時、被拒、格式錯、非零 exit 不換席。換席不放寬任何簽核規則：替補照樣要整份簽、逐題引用。
+   - 名單比對（`compareRoster`）：預期席帶 `fallbacks`，實際成員帶 `substitutedFor` 且自己的三元組 ∈ 該席 fallbacks 且 `substituteReason` ∈ {quota, auth} ⇒ 算到齊（缺原因或 timeout 等其他值 ⇒ mismatch）；config 沒宣告的換席、`substitutedFor` 指到名單外、換席成員冒充別席 ⇒ `rosterMismatch`（run 回 3、publish 擋）。`summary.reviewers` 帶 `fallbacks` 三元組，publish 靠它比對。
+   - `setup --check`：fallbacks 的 harness 也列入角色表，缺 binary／缺 key 在 --check 就紅。
+2. **block 跨家族席降級**：block 名單原有的跨家族席（與統整者不同 quotaBucket）若因 quota／auth 換成同家族成員 ⇒ `summary.review.crossFamily: 'degraded'`＋`postReviewPending: true`，收貨摘要與 council 都印「待事後審」。**本 repo 沒有事後審佇列檔**，所以不自創佇列：補審由統整者手動跑 `council review --tier postreview --review-only`（名單來自 profile 的 `postReviewers`）。不擋 publish——降級是額度事實，不是簽核失敗。
+3. **路徑命中升 block**：config `riskPaths`（glob 陣列；`**` 跨目錄、`*` 不跨 `/`、`?` 單字元）。ticket run 在寫手改完後（review-only 則是 merge-base..HEAD）比對**實際 diff 檔案**，命中任一 ⇒ 該票升 block，`summary.tierEscalatedByPaths` 記檔案與命中的 glob；與 `riskDomains`（只看 brief／--allow 文字）並存。預設 `[]`＝不啟用。rename 兩端都比：另跑 `git diff --name-only --no-renames <merge-base>` 與 changed 取聯集，風險路徑檔 rename 到安全路徑仍升 block；該 git 失敗 ⇒ fail-closed 升 block。
+4. **`ticket run --review-timeout-ms <ms>`**：passthrough 成 council 的 `--timeout-ms`（council 預設 8 分鐘）。正整數、fail-closed（`abc`／`0`／負數／小數／裸旗標 ⇒ exit 2、寫手 0 次）；council 自己也驗 `--timeout-ms`。
+5. **`ticket land` 停用**：一律 exit 2、不碰任何 git，訊息指向「合併唯一入口＝在 main 執行 `node tools/land.mjs --branch … --name … --msg-file …`」。以前 ticket land 與 WAS 的 `tools/land.mjs` 是兩條並存的合併路，繞過後者的檢查只要選這條。沒有 `tools/land.mjs` 的專案要合併請走自己的唯一入口，不是恢復 ticket land。
+
+6. **r2 補強（隔離 claude 審）**：① 已交出合法「整份：簽／不簽」判定的席**不換席**（換席只在 text 解不出 overall／零輸出時）；codex 的 quota 判定收窄為「stdout 無判定行且 exit≠0 且 stderr 命中 usage limit／rate limit」。② 換席成員的 `substituteReason` 必須是 quota／auth。③ block 名單換席後兩席同一模型 ⇒ `summary.review.duplicateModel`＋摘要警示（只標記不擋）。④ **landed 事件寫入者移交 `tools/land.mjs`（WBS 4.7.31 A2，另票）**：`ticket land` 停用後 llm-team 不再寫 lifecycle `landed`；`usage.mjs` 遇「有 accepted 無 landed」印一行警示（視窗終點退用 accepted），`tools/product-wbs.mjs --status` 同。
+   - 陽性對照：`llm-team.test.mjs`「1.24.0 council 額度換席」(a)–(e)、「1.24.0 config」；`ticket.test.mjs`「1.24.0 ticket」——拿掉 `isSubstitutable`／`crossFamilyStatus` 判定／`compareRoster` 的 fallbacks 檢查／riskPaths 升級／`--timeout-ms` passthrough 或驗證各自 ⇒ 對應測試紅（逐條重放見 WBS 4.7.31 B3 收貨）。
+   - 停止條件：riskPaths 改由 CODEOWNERS／ruleset 在合併點強制時，升級段可降為提示；出現事後審佇列檔後，crossFamily degraded 改寫入該佇列。
+
+## council 記錄審了哪一棵樹（1.25.0，WBS 4.7.31 A2 T0）
+
+🔴 **事故**：fable 10-03 重判 A2——合併前不驗複審證據，沒審過也能合。council 的 `input.json` 只記 diff 長度與上限，diff 又是 `git diff <base>` 對**工作樹**算的（含未提交與 untracked），事後無法證明複審者審的是哪個 commit。本版只做「記錄」，比對由後續 land 票做。
+
+1. **`review/input.json` v2**（`schema: 2`）：`head`、`tree`（`HEAD^{tree}`）、`base`（完整 sha）、`roundStart`（ISO 時間；本輪 diff 起點另記在 `roundStartSha`＝`--round-start` 經 `rev-parse --verify <ref>^{commit}` 解析後的完整 sha，解析不了 exit 2，非輪次審為 null）、`dirty`（tracked 有未提交改動；`--ignore-submodules=none`，子模組髒也算）、`untracked`（路徑；排除 gitignored 與 `.agy-write/`；`--out` 事先存在且含檔也算 untracked，council 不提前建 `--out`）、`diffSha256`（送審 diff 原文的 sha256，含 untracked 附加段、尾端空白已去）、`changedFiles`（`git diff --name-only <base>`）、`tier`、`coordinator`、`briefSha256`、`promptSha256`（diff 超上限、沒組 prompt 時為 null）、`segment`（`{index, of}` 或 null）。舊欄位（`schemaVersion: 1`、`diffLength`、`diffCap`…）原樣保留。
+2. **`--segment i/n`**：拆審第 i 段、共 n 段；`1 ≤ i ≤ n` 的整數，其餘（`0/3`、`4/3`、`x`、裸旗標）exit 2、不呼叫複審者。
+3. **`--require-clean`**（預設關）：tracked 有未提交改動或有 untracked ⇒ exit 2、複審者不被呼叫、不寫 `input.json`、不建 `--out`。land 只收 `dirty=false` 且 `untracked=[]` 的輪次；流程文件之後再改成預設開。
+4. **`members.json`** 每席補 `head`、`diffSha256`（與 input.json 同值），方便單檔比對。
+   - 陽性對照：`llm-team.test.mjs`「1.25.0 council input.json v2」(a)–(f)——拿掉 head／tree／diffSha256 計算、dirty 恆 false、untracked 恆空、拿掉 `--require-clean` 檢查、segment 不驗、刪舊欄位，各自 ⇒ 對應測試紅。
+   - 停止條件：land 改為自己對 commit 重新送審、不信任 council 的紀錄時，本紀錄降為提示。
+
+## 送審包盲化、第 2 輪 brief 查重（1.27.0，《Loop × Harness》課程整合票 1）
+
+- 依據：課程 p195（驗證者看到被驗證者的自述就被錨定）；GPT、Gemini 兩家諮詢各自獨立提出；fable 10-09 裁定（`docs/consultations/2026-10-09-loop-harness/ruling.md`「fable 裁定」第 5、3 點；TEMPLATES §6.1／§6.2）。
+- **盲化**：`council review` 預設不把 `--writer-report` 內容放進審查 prompt；檔案原文複製到 `<out>/writer-report.md` 給統整者 Q6；Q3 題文一律用 review-only 那句（沒交陽性對照證據不構成不簽理由）。逃生口 `--include-writer-report`（`input.json.includeWriterReport`／`writerReport.included`）。`ticket.mjs` 呼叫 council 預設不傳。
+- **r2 查重（只報告、不擋）**：`--out` 尾碼 `-r<N>`（N≥2）或明給 `--prior-out`（⇒ 至少第 2 輪；目錄名解析出 r0／r1 與之矛盾 ⇒ 記 `briefDedup.roundConflict`、以第 2 輪處理）時，brief 雜湊（原文或「統一換行＋去頭尾空白」後）與任一**前輪** `input.json` 的 `briefSha256`／`briefNormSha256` 相同 ⇒ stdout 警告＋`briefDedup.sameAs`；brief 沒有非空的 `this_round_delta` 欄位（只認行首欄位格式；內文句子提到不算；佔位字 無／TBD／同上／- 視為空）⇒ 警告＋`briefDedup.roundDeltaMissing`。exit 0、審查席照常呼叫；沒有 `--allow-same-brief`。只比跨輪：輪次（目錄名 `-r<N>`，或前輪 `input.json.round`）≥ 本輪者不比；輪次不明者照比（同 `segment.of` 不構成同輪證據）。1.27.0 前的前輪沒有 `briefNormSha256`／`round`，只能比原文雜湊。為什麼只報告：本 repo 無「重送同一份 brief」的真實事故，MAINTENANCE「寫不出事故就先只報告不擋」；**升級條件**：第一次真實重送事故後升為 exit 2（並補逃生旗標）。
+- **自述詞警告**：brief 含「寫手宣稱／寫手說／作者表示／寫手回報」⇒ 只印警告並記 `input.json.selfReportWarning`，不擋。
+- 陽性對照：`llm-team.test.mjs`「1.27.0」——拿掉盲化 ⇒ (a1) 紅；拿掉雜湊比對 ⇒ (b1)(b1b)(b3)(b4) 紅；拿掉 delta 記錄 ⇒ (b2)(b3)(b5) 紅；拿掉輪次過濾 ⇒ (c3) 紅。應放行：(a3)(c1)(c2)(c3)(c4)。
+- 停止條件：審查 brief 改由程式產生、或寫手自述改走 Q6 專用通道時，旗標與查重可撤。自述詞警告：出現事故（寫手自述造成誤簽）再議升級為擋，無事故前只報告。
+
+## summary／複審目錄／受審 head 同一代、publish 閘的停止條件（1.26.2，WBS 4.7.31 A2 T2b-v2 r2）
+
+- 事故（codex r1）：r1 已 accept；r2 已 commit、council 已寫出新的 input／members，但 summary 重寫前中斷 ⇒ 磁碟上是 r1「已 accept」的 summary；HEAD、分支 ref、最新 input.json.head 三者都等於 r2，1.26.1 的檢查全過，publish 會用 r1 的 dispositions／Q6 把 r2 的新 commit 推出去。
+- `ticket run` 要開新一輪（會有新 commit／新 `review-r<N>`）時，先在 commit 之前用「寫暫存檔再 rename」清掉上一份 summary 的 acceptance（`acceptedAt`／`q6Receipt`／`dispositions`／`caliber*`／`measurementSchemaVersion`，`invalidatePriorAcceptance`），`reviewDir`／`reviewedHead` 歸 null。
+- summary 新增 `reviewDir`（相對 repo 根）與 `reviewedHead`；publish（新流程）只接受「`summary.reviewDir`＝最新 `review-r<N>` 目錄，且 `summary.reviewedHead`＝該目錄 `input.json.head`＝HEAD＝`refs/heads/<branch>`」，任何不一致 ⇒ exit 2、零次 push。
+- 陽性對照：`ticket.test.mjs`「1.26.2 R1」（bare remote canary：拿掉 `invalidatePriorAcceptance` ⇒ (i)「acceptance 已清」紅；拿掉 generation 綁定 ⇒ (ii) 手放回舊 summary 紅）。WAS 端 `tools/llm-team-scannable.test.mjs` 斷言快照 `ticket.mjs` 的 `scanComments(...).uncertainFrom === null`。
+- **停止條件（分支 ref 閘＋generation 閘＋`invalidatePriorAcceptance`，1.26.1／1.26.2 一併）**：`land.mjs` 成為唯一推送入口、`ticket publish` 不再 push 時移除。**判定方式**：`ticket.mjs` 內 `gitFn(worktree, ['push'` 的呼叫數為 0（`grep -c "\['push'" .agents/skills/llm-team/ticket.mjs` 為 0），或 SKILL.md 已標 `ticket publish` 停用；成立時刪這三處與「1.26.1 R2」「1.26.2 R1」測試。另：council 改為自己對 commit 重審並把受審 head 綁進證據（land 不再信任 ticket 的 summary）時亦可拆。
+
+## publish 綁定分支 ref、mutation 掃描相容（1.26.1，WBS 4.7.31 A2 T2b-v2）
+
+- `ticket publish`（新流程）除了 HEAD＝最新一輪 input.json.head，還要求 `refs/heads/<branch>` 也等於它，任一不符 ⇒ 拒絕（exit 2、不 push）；推送改成 `git push -u origin HEAD:refs/heads/<branch>`。事故：受審後在分支上再 commit 未審的 U、detached checkout 回受審 R，HEAD 檢查會過、但推的是指向 U 的分支 ref。
+- `ticket.mjs` 不得含會讓 `tools/mutation-receipt-core.mjs` 的 `scanComments` 失同步的 regex 字面值（含引號或反引號者）：`backtickFence` 改用 `new RegExp('`+', 'g')`，掃描 `uncertainFrom` 必須是 null（否則 land 的 mutation receipt 對 ticket.mjs 全判 invalid）。
+- 陽性對照：`ticket.test.mjs`「1.26.1 R2」（bare remote 端到端：拿掉分支 ref 核對 ⇒ 分支指向 U 時仍 push；拿掉 refspec ⇒ pushArgs 斷言紅）、`backtickFence` 單元（4 個反引號 ⇒ fence 長度 5）。
+
+## 送審前先 commit、輪次目錄對齊 land（1.26.0，WBS 4.7.31 A2 T2b）
+
+🔴 **事故**：2026-10-04 p4733sa2fp 用 ticket 的複審目錄跑 `tools/land.mjs`，exit 2，三條 violation 是 `[binding]`、`[dirty]`、`[diff-sha]`。`ticket run` 以前寫手寫完、verify 過，就對**未提交的工作樹**送 council，統整者事後才 commit；land（A2 T2）只收 `dirty=false`、`untracked=[]`、審查範圍正好是 `mergeBase..branchHead` 的輪次，所以經 ticket 審過的分支一律過不了 land，只能手動再審一次。輪次目錄也對不上：land 的 `roundOfDir` 只認目錄名 `-r<N>` 結尾，ticket 把當前輪放在 `review/`，第 2 輪的 `review/` 會被當第 1 輪、與 `review-r1` 撞號。
+
+1. **verify 通過後、送 council 前先 commit**：只 add 寫手實際改動、且落在 `--allow` 內的檔（寫手跑之前先記下 `--allow` 內被 `.gitignore` 擋掉的單檔 sha，寫手動過的才 `add -f`；`--allow` 的目錄項不 `add -f`，免得整棵被忽略的東西進 commit）。commit 訊息 `<票名> r<N>: <brief 標題>（<寫手 harness/model> 寫）`（N 與複審目錄 `review-r<N>` 同號）。commit 後工作樹必須乾淨，否則不送審；commit 後還用 `git diff --name-status --no-renames <commit 前 HEAD> HEAD` 重驗 commit 實際範圍（rename 兩端都看），有檔在 `--allow` 外（例如 pre-commit hook 執行期間 stage 了別的檔）⇒ `reset --soft` 撤回該 commit（HEAD 不前進）、`summary.outOfScope` 指名、不送審、run 回 3。
+   - **`--allow` 外有改動或 untracked** ⇒ 不 commit、不送審、run 回 3、`summary.outOfScope` 指名（沿用 write.mjs G4 越界規則：不修、不還原、回統整者）。staged 區含 `--allow` 外的檔（例如 `git mv` 把 allow 外的舊路徑刪掉）也算越界；rename 兩端都要列進 `--allow`。
+   - **verify 紅** ⇒ 不 commit、不送審（以前會對髒樹送審；現在 `--require-clean` 下那只會被 council 拒審，紅樹也不可能當 land 證據）。收貨摘要印「🔴 未複審（verify 紅）」。commit 失敗（例如 hook 拒絕）⇒ index 還原成 HEAD、不送審、`summary.commitFailure` 記原因、run 回 3。
+2. **council 一律帶 `--require-clean`**，`--base` 是 merge-base 的完整 sha（不是 `main`：main 前進後 `git diff main` 會把別人的 commit 反向算進來）。
+3. **輪次目錄**：當前輪直接寫 `<票>/review-r<N>`（第 1 輪＝`review-r1`），不再使用 `review/`。舊結構（`review/` ＋ `review-r<N>`，舊流程的當前輪在 `review/`）仍可讀、可續輪：`review/` 視為最新一輪，續輪時改名成 `review-r<它的輪次>` 保存。`--prior-out` 照舊逐一傳前面各輪；council 自己的「去掉 `-r<N>` 找同前綴前輪」推導現在也找得到前輪。
+4. **收貨摘要多印一行可複製的 land 指令**（只印不執行）：`node tools/land.mjs --branch <br> --name <n> --msg-file <票目錄>/land-msg.txt --review <各輪目錄，逐輪一個 --review，相對 repo 根> --coordinator <統整者>`；`--msg-file` 指到的檔要自己先寫好。沒有複審（`review: null`）不印。
+5. **`summary.json` 新增** `commits: [{round, sha}]`（含前幾輪；讀上一份 summary、同分支才採信）與 `reviewDirs: [...]`（所有輪次目錄，相對 repo 根，輪次升冪）；越界／commit 失敗時另有 `outOfScope`／`commitFailure`。`ticket publish` 對新流程的票（`summary.commits` 非空）綁定受審 SHA：工作樹必須乾淨、目前 HEAD 必須等於最新一輪複審 `input.json.head`，任一不符 ⇒ 拒絕（exit 2、不 add／commit／push；受審後 amend、reset 再 commit 都會被擋）；符合時不再 add／commit，push 與開 PR 照走。舊流程（summary 無 `commits`）照舊由 publish 自己 add／commit。
+   - 陽性對照：`ticket.test.mjs`「1.26.0 ticket」(a)–(i)——拿掉送審前 commit、越界判定、verify 紅的閘、`add -f`、當前輪改回寫 `review/`、舊結構判讀、land 指令、publish 對 `summary.commits` 的處理、`--require-clean`、`--base` 改回分支名，各自 ⇒ 對應測試紅（逐條重放見 WBS 4.7.31 A2 T2b 收貨）。
+   - 停止條件：council 改為自己對 commit 重審（不信任 ticket 的 commit）、或 land 改收未提交工作樹的證據時，本段可拆。
 
 ## 三種統整者 profiles（config schema v2）
 
@@ -46,9 +114,9 @@ description: 當統整者要把一張葉子票交給便宜模型寫、兩位以�
 
 `ticket run`／`council plan|review`／`setup --check` 都**必帶 `--coordinator <claude|agy|codex>`**（或設 env `LLM_TEAM_COORDINATOR`）；缺或不在 profiles ⇒ exit 2 並列出可用 profiles。
 summary.json 是 `schemaVersion: 2`，帶 `coordinator`（profile 名）與 `reviewers`（該票的**預期**名單，含 harness/model/quotaBucket）。
-**實際名單只認 council 寫的 `review/members.json`**（每位實際跑的成員：`{name, harness, model, quotaBucket, overall, q, empty, timedOut, invalid, exit, signal, ms}`）：`ticket run` 從它取 `review.members`（不再按預期檔名讀文字、自貼身分），
+**實際名單只認 council 寫的 `members.json`（最新一輪的複審目錄 `review-r<N>/`；1.26.0 前是 `review/`，舊結構仍讀得到）**（每位實際跑的成員：`{name, harness, model, quotaBucket, overall, q, empty, timedOut, invalid, exit, signal, ms}`）：`ticket run` 從它取 `review.members`（不再按預期檔名讀文字、自貼身分），
 與預期名單比**身分三元組 harness+model+quotaBucket**（不比 name——`agy/gemini` 同短名可以是 pro-high 也可以是 pro-low）；少一位／多一位／同 name 不同 model ⇒ `rosterMismatch: true`（附 `rosterDiff`）、run 回 3。
-publish 對舊 summary（≠ 2）直接擋，要求名單**全員到齊**（三元組多重集合相等；一般票名單只有 1 位也算齊），且回頭讀 `review/members.json`——缺檔、與 `summary.reviewers` 不符、`rosterMismatch: true` 都擋。
+publish 對舊 summary（≠ 2）直接擋，要求名單**全員到齊**（三元組多重集合相等；一般票名單只有 1 位也算齊），且回頭讀最新一輪的 `members.json`——缺檔、與 `summary.reviewers` 不符、`rosterMismatch: true` 都擋。
 
 各 harness 的統整者啟動姿態（一句）：
 - Claude Code：互動 session（就是你現在這個）。
@@ -86,7 +154,7 @@ brief 五段：①目標（含使用者真實踩到的情境）②只准動的�
 - **規則**（票內的 context 節食五條在快照 `prompts/07-ticket.md`〈六〉，這裡不重複）：
   - ⓪ **複審者到底看了什麼，收貨摘要會講**（1.12.0）：diff 超過完整送審上限（預設 120000 字元）⇒ council 不呼叫複審者、回 6、摘要印「🔴 沒有複審」——拆票，或確認後 `ticket run --diff-cap N`（N 入帳、摘要印 ⚠）。diff 不再截斷：截斷的 diff 上「簽」不是整份簽核。agy 的 prompt 走 stream-json stdin，沒有命令列長度上限。
   - ① **不輪詢**：長任務背景跑、用通知或 until-loop 一次等完。
-  - ② **收貨固定步驟**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）→ `node .agents/skills/llm-team/ticket.mjs accept --name <票> --caliber <口徑> --q6 "<收據>"` → `node .agents/skills/llm-team/ticket.mjs land --name <票> --msg-file <檔>`（land 做 add→commit→ff-only；land 前先驗 review.reviewedTree（複審後又改 ⇒ exit 7）；main 前進時不相交 ⇒ 自動 rebase 並以 git diff --binary 逐 byte 相等證明後才 ff（summary 記 landedAfterRebase），相交 ⇒ exit 8 印三個 sha 與人工指令。）。**accept 不需要跑 usage.mjs**（見下方「量測（usage.mode）」）。
+  - ② **收貨固定步驟**：`node .agents/skills/llm-team/batch.mjs '<驗收 1>' '<驗收 2>' …`（一次跑完所有 Q6 親驗）→ `node .agents/skills/llm-team/ticket.mjs accept --name <票> --caliber <口徑> --q6 "<收據>"` → 合併走唯一入口 `node tools/land.mjs --branch <分支> --name <票> --msg-file <檔>`（1.24.0 起 `ticket.mjs land` 一律 exit 2，不再自行 merge）。**accept 不需要跑 usage.mjs**（見下方「量測（usage.mode）」）。
   - ③ **merge 點一次呼叫**：各專案自訂：guards＋收據＋push 合成一支腳本，llm-team 不提供。
   - ④ **假省清單**：砍複審輪數、跳過親驗、把 guards 改成只跑子集、關掉截斷保留行——這些讓數字變小但票變差，不算省；把大票拆成很多小票灌低單票中位數（要看專案總呼叫數有沒有反而漲）；難票錯標／漏標口徑（漏標＝不納，等於把難票藏起來）。
   - ⑤ **修尺停損（尺預算；2026-09-16 WAS 實證後三專案共用）**：「尺」＝量 repo 自己一不一致的守門／台帳／登記表（產物 vs 台帳、env 有沒有登記、產生區塊有沒有重產、文件引用有沒有指到）。實證：WAS 一個 session 37 次 merge 點 ship 紅 8 次，**8 次全是尺的自我維護、0 次產品缺陷**；每把尺都要一本台帳、每張功能票都要餵一次，尺壞了再造一把尺是補不完的洞。規則（各專案在自己的 DISPATCH／AGENTS 寫到期日與覆寫）：
@@ -160,8 +228,9 @@ node home/skills/llm-team/export.mjs --all
    後者給不屬任何 WBS 的票（如守門修補）用，理由必填非空。兩者都沒給 ⇒ run 拒開（exit 2）。寫進 `summary.json`
    的 `wbsIds`／`wbsExempt` 與 lifecycle 的 `run-start`／`landed` 事件；既有收據不回填。*
    *P5：寫手 exit 非 0（2＝守門擋下、3＝被拒／越界／逾時）⇒ 不跑 `--test`、不開 council，**一律寫 summary.json**（`review: null`）並印收貨摘要；exit 2 且本次新建的空 worktree 照舊清掉、run 回 2；逾時另有 `writeTimedOut: true`（來自 `OUTDIR/write/run-K/timeout.json`，只看本次 run）。1.6 (i) 起 write 產物在 `OUTDIR/write/run-K/`（K＝lifecycle 第幾個 run-start），每次 run 隔離、不覆寫；`summary.run`。*
-   *`--review-only`：何時用：複審者因寫手回報空白不簽、名單覆寫後重審；前置：worktree 存在且乾淨、HEAD 領先 base；效果：不派寫手、`--round-start`＝merge-base、舊 q6Receipt／dispositions 作廢、`summary.changed`＝merge-base..HEAD 已提交改動檔，可直接 `accept`／`land`；複審 prompt 標明無寫手回報、Q3 只判設計、證據看 Q6。*
+   *`--review-only`：何時用：複審者因寫手回報空白不簽、名單覆寫後重審；前置：worktree 存在且乾淨、HEAD 領先 base；效果：不派寫手、`--round-start`＝merge-base、舊 q6Receipt／dispositions 作廢、`summary.changed`＝merge-base..HEAD 已提交改動檔，可直接 `accept` 後走 `tools/land.mjs`；複審 prompt 標明無寫手回報、Q3 只判設計、證據看 Q6。*
    *`--write-timeout-ms <ms>`（預設 25 分＝1,500,000；config `writer.timeoutMs`（陣列時是選中那席的）可設專案預設；CLI 覆蓋 config）。*
+   *`--review-timeout-ms <ms>`（1.24.0）：複審者逾時，傳給 council `--timeout-ms`（預設 8 分）；正整數、無效值 exit 2。*
    *`--writer-harness <name>`：選寫手鏈的哪一席（預設第 0 席）；收貨摘要印「下一席」時才需要帶它重跑。*
 3. **收貨與坐實：**
    - 複審者並行、8 分鐘 timeout、心跳（每 60 秒印進度，超時以「不簽（timeout）」計）；名單＝一般票 `reviewers`、block 票 `blockReviewers`、postreview 複查 `postReviewers`（用途＝已 merge 的一批 commit 的批次複查，名單來自 `postReviewers`，一定要搭配 `--review-only` 旗標）。
@@ -176,16 +245,16 @@ node home/skills/llm-team/export.mjs --all
      [--caliber <docs|tool|feature>] \
      [--disposition <member>:<Qn|overall>=<rejected|confirmed-fixed>:"<note>"]...
    ```
-   *`--q6` 永遠必填。`--caliber` 依 config 的 `usage.mode` 決定：`off`（真源預設）時選填、`record`／`cohort` 時必填（缺 ⇒ exit 2）；`--disposition` 用來處置複審者的「不簽」。accept 成功後才能 `publish`／`land`（兩者都認 `q6Receipt`，缺 ⇒ 擋）。*
+   *`--q6` 永遠必填。`--caliber` 依 config 的 `usage.mode` 決定：`off`（真源預設）時選填、`record`／`cohort` 時必填（缺 ⇒ exit 2）；`--disposition` 用來處置複審者的「不簽」。accept 成功後才能 `publish`（認 `q6Receipt`，缺 ⇒ 擋）；合併走 `tools/land.mjs`。*
 5. **發布 Draft PR 或落地：**
    ```bash
    node .agents/skills/llm-team/ticket.mjs publish --name <ticket-id> [--title "<title>"]
    ```
-   或（統整者自己 land）：
+   或（統整者自己合併）：在 main 執行唯一合併入口
    ```bash
-   node .agents/skills/llm-team/ticket.mjs land --name <ticket-id> --msg-file <commit-msg-file>
+   node tools/land.mjs --branch <分支> --name <ticket-id> --msg-file <commit-msg-file>
    ```
-   *注意：本流程永不自動 merge，最終合併留給人或統整者明確核准。*
+   *1.24.0：`ticket.mjs land` 已停用（exit 2、不碰 git）。注意：本流程永不自動 merge，最終合併留給人或統整者明確核准。*
 
 ## codex 破壞性指令閘（codex 當統整者時）
 
