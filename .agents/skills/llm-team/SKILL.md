@@ -62,6 +62,13 @@ description: 當統整者要把一張葉子票交給便宜模型寫、兩位以�
 - 陽性對照：`llm-team.test.mjs`「1.27.0」——拿掉盲化 ⇒ (a1) 紅；拿掉雜湊比對 ⇒ (b1)(b1b)(b3)(b4) 紅；拿掉 delta 記錄 ⇒ (b2)(b3)(b5) 紅；拿掉輪次過濾 ⇒ (c3) 紅。應放行：(a3)(c1)(c2)(c3)(c4)。
 - 停止條件：審查 brief 改由程式產生、或寫手自述改走 Q6 專用通道時，旗標與查重可撤。自述詞警告：出現事故（寫手自述造成誤簽）再議升級為擋，無事故前只報告。
 
+## 前輪輪次以 input.json.round 為準（1.27.1，《Loop × Harness》課程整合票 1 殘留）
+
+- 事故（統整者坐實）：前輪輸出 `input.json.round=2`，目錄被搬到名稱含 `-r3` 的路徑再以 `--prior-out` 傳給第 3 輪；1.27.0 優先採目錄名 ⇒ 被當同輪各段跳過，跨輪同 brief 不警告、不入帳。
+- 規則：前輪輪次取 `input.json.round`（有效正整數）；缺欄位或無效（0／負／小數／字串）才回退目錄名 `-r<N>`；兩者都沒有 ⇒ 輪次不明、照比。兩者衝突 ⇒ `briefDedup.priorRoundConflicts` 記 `[{dir, parsedFromDirName, treatedAs}]`（`treatedAs`＝採用的 metadata 輪次）＋stdout 警告，只報告不擋；沒有衝突時不出現此欄位。
+- 陽性對照：`llm-team.test.mjs`「(f1)」把優先序改回目錄名 ⇒ 紅；「(f2)」反向（目錄 -r1、metadata 3）同理；拿掉 `inp.round >= 1` 有效性檢查 ⇒ (f4) 紅。應放行：(f3) 舊產物沒有 round 欄位照目錄名；(f4) metadata 無效回退；(f5) 目錄名與 metadata 一致、同輪 `--segment` 各段不比。
+- 停止條件：council 改為由程式維護前輪清單（不再靠 `--prior-out` 目錄）時，本比對可撤。
+
 ## summary／複審目錄／受審 head 同一代、publish 閘的停止條件（1.26.2，WBS 4.7.31 A2 T2b-v2 r2）
 
 - 事故（codex r1）：r1 已 accept；r2 已 commit、council 已寫出新的 input／members，但 summary 重寫前中斷 ⇒ 磁碟上是 r1「已 accept」的 summary；HEAD、分支 ref、最新 input.json.head 三者都等於 r2，1.26.1 的檢查全過，publish 會用 r1 的 dispositions／Q6 把 r2 的新 commit 推出去。

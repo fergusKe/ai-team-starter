@@ -21,6 +21,8 @@
 //      明給 --prior-out 時本輪至少 2；目錄名解析出 r0／r1 與之矛盾 ⇒ 記 roundConflict、以 ≥2 處理。
 //      為什麼只報告：本 repo 目前沒有「重送同一份 brief」的真實事故，MAINTENANCE「寫不出事故就先只報告不擋」。
 //      停止條件／升級條件：累積到第一次真實重送事故（r2 重送 r1 brief 造成空轉或誤簽）後，把查重與缺 delta 升為 exit 2（並補逃生旗標）。
+//   🔴 1.27.1 前輪輪次以 input.json.round（有效正整數）為準，缺欄位或無效才回退目錄名 -r<N>（目錄會被搬／改名，名字不是證據）；
+//      兩者衝突 ⇒ briefDedup.priorRoundConflicts 記 [{dir,parsedFromDirName,treatedAs}]、stdout 警告，只報告不擋。陽性對照 llm-team.test.mjs (f1)(f2)；應放行 (f3)(f4)(f5)。
 //   3. 自述詞警告：brief 含「寫手宣稱／寫手說／作者表示／寫手回報」⇒ 只印警告、記 input.json.selfReportWarning，不擋（無事故前只報告）。
 //   陽性對照（llm-team.test.mjs「1.27.0」）：拿掉盲化 ⇒ (a1) 紅；拿掉查重／缺 delta 記錄 ⇒ (b1)(b1b)(b2)(b4)(b5) 紅；應放行 (c1)–(c4)。
 //   停止條件：統整者的審查 brief 改由程式產生（不再手寫）、或寫手自述改走 Q6 專用通道時，本節盲化旗標與查重可撤。
@@ -189,9 +191,10 @@ export const findSelfReportTerms = (briefText) => SELF_REPORT_TERMS.filter((t) =
 /**
  * 跨輪查重：本輪 brief 的（原文或正規化）雜湊 ⇒ 與前輪目錄 input.json 的 briefSha256／briefNormSha256 比。
  * 前輪 input.json 沒有 briefNormSha256（1.27.0 前）時只能比原文雜湊（位元組相同才擋）。
+ * 前輪輪次：input.json.round（有效正整數）優先，缺或無效才回退目錄名；兩者衝突記入 conflicts。
  * 輪次 ≥ currentRound 的前輪目錄（同輪 segment 各段、後輪）不比；輪次認不出的（明給 --prior-out）視為前輪，\n * 但若兩邊都帶 --segment 且 segment.of 相同，視為同輪各段、不比。
  */
-export function findSameBriefDirs(briefText, priorDirs, currentRound) {
+export function findSameBriefDirs(briefText, priorDirs, currentRound, conflicts = null) {
   const raw = sha256(briefText)
   const norm = sha256(normalizeBrief(briefText))
   const same = []
@@ -202,8 +205,12 @@ export function findSameBriefDirs(briefText, priorDirs, currentRound) {
     } catch {
       continue
     }
-    // 前輪輪次：目錄名 -r<N> 優先，認不出才用該輪 input.json.round（同一次 council 呼叫寫下的 metadata）；都沒有 ⇒ 輪次不明、照比。
-    const r = roundOfDirName(dir) ?? (Number.isInteger(inp && inp.round) ? inp.round : null)
+    // 前輪輪次（1.27.1）：input.json.round（同一次 council 呼叫寫下的 metadata，有效正整數）優先；缺欄位或無效才回退目錄名 -r<N>；都沒有 ⇒ 輪次不明、照比。
+    //   目錄會被搬／改名，名字不是證據；兩者衝突時記入 conflicts（只報告不擋）。
+    const nameRound = roundOfDirName(dir)
+    const metaRound = inp && Number.isInteger(inp.round) && inp.round >= 1 ? inp.round : null
+    const r = metaRound ?? nameRound
+    if (metaRound !== null && nameRound !== null && metaRound !== nameRound && Array.isArray(conflicts)) conflicts.push({ dir, parsedFromDirName: nameRound, treatedAs: metaRound })
     if (r !== null && currentRound !== null && r >= currentRound) continue
     if (inp && (inp.briefSha256 === raw || inp.briefSha256 === norm || inp.briefNormSha256 === norm || inp.briefNormSha256 === raw)) same.push(dir)
   }
@@ -574,9 +581,11 @@ export async function main(argv, deps = {}) {
     const isLaterRound = currentRound !== null && currentRound > 1
     let briefDedup = { checked: false, round: currentRound, roundConflict, sameAs: [], hasRoundDelta: null, roundDeltaMissing: false }
     if (isLaterRound) {
-      const sameAs = findSameBriefDirs(briefText, priorDirs, currentRound)
+      const priorRoundConflicts = []
+      const sameAs = findSameBriefDirs(briefText, priorDirs, currentRound, priorRoundConflicts)
       const hasRoundDelta = hasNonEmptyRoundDelta(briefText)
-      briefDedup = { checked: true, round: currentRound, roundConflict, sameAs, hasRoundDelta, roundDeltaMissing: !hasRoundDelta }
+      briefDedup = { checked: true, round: currentRound, roundConflict, sameAs, hasRoundDelta, roundDeltaMissing: !hasRoundDelta, ...(priorRoundConflicts.length ? { priorRoundConflicts } : {}) }
+      for (const c of priorRoundConflicts) console.log(`⚠️ 前輪目錄 ${c.dir} 的名稱輪次 r${c.parsedFromDirName} 與其 input.json.round=${c.treatedAs} 不一致：以 input.json.round 為準，已入帳。`)
       if (roundConflict) console.log(`⚠️ --prior-out 已給（本輪至少第 2 輪），但 --out 目錄名解析出 r${roundConflict.parsedFromOutDir}：以第 2 輪處理，已入帳。`)
       if (sameAs.length > 0) console.log(`⚠️ 第 ${currentRound} 輪 brief 與前輪相同（雜湊一致）：${sameAs.join('、')}。r2 起 brief 用 TEMPLATES §6.1 格式，不重送同一份。僅警告，已入 input.json.briefDedup.sameAs。`)
       if (!hasRoundDelta) console.log(`⚠️ 第 ${currentRound} 輪 brief 沒有非空的 this_round_delta 欄位（TEMPLATES §6.1）。僅警告，已入 input.json.briefDedup.roundDeltaMissing。`)
