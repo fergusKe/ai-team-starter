@@ -6079,6 +6079,64 @@ describe('1.27.0 council：第 2 輪 brief 查重（只報告）＋this_round_de
     assert.equal(second.code, 0); assert.deepEqual(second.input.briefDedup.sameAs, []); assert.doesNotMatch(second.outs, /⚠️/)
   })
 
+  // ── 1.27.1 前輪輪次判斷：input.json.round 優先、目錄名只是回退（殘留點：目錄被搬走改名後被當同輪跳過）──
+  const movedPrior = async (ctx, { dirName, round, brief }) => {
+    // 先在 -r2 目錄跑出前輪（input.json.round=2），再改名成 dirName
+    const orig = path.join(ctx.parent, 'council-x-r2')
+    assert.equal((await run(ctx.repo, brief, orig)).code, 0)
+    if (round === 'delete') { const f = path.join(orig, 'input.json'); const j = JSON.parse(fs.readFileSync(f, 'utf8')); delete j.round; fs.writeFileSync(f, JSON.stringify(j)) }
+    else if (round !== undefined) { const f = path.join(orig, 'input.json'); const j = JSON.parse(fs.readFileSync(f, 'utf8')); j.round = round; fs.writeFileSync(f, JSON.stringify(j)) }
+    const moved = path.join(ctx.parent, dirName)
+    fs.renameSync(orig, moved)
+    return moved
+  }
+
+  test('(f1) 陽性：前輪目錄被搬到 -r3、input.json.round=2、本輪 r3、同 brief ⇒ 以 metadata 為準，sameAs 非空且警告；priorRoundConflicts 入帳', async () => {
+    const ctx = setup(); const b = ctx.writeBrief('b.md', B1 + DELTA)
+    const moved = await movedPrior(ctx, { dirName: 'moved-r3', brief: b })
+    const r3 = await run(ctx.repo, b, path.join(ctx.parent, 'council-x-r3'), ['--prior-out', moved])
+    assert.equal(r3.code, 0); assert.equal(r3.calls, 2)
+    assert.deepEqual(r3.input.briefDedup.sameAs, [moved]); assert.match(r3.outs, SAME_WARN)
+    assert.deepEqual(r3.input.briefDedup.priorRoundConflicts, [{ dir: moved, parsedFromDirName: 3, treatedAs: 2 }])
+  })
+
+  test('(f2) 陽性（反向）：目錄名 -r1 但 input.json.round=3、本輪 r3 ⇒ 以 metadata（3≥3）為準，不比；conflict 入帳', async () => {
+    const ctx = setup(); const b = ctx.writeBrief('b.md', B1 + DELTA)
+    const moved = await movedPrior(ctx, { dirName: 'moved-r1', round: 3, brief: b })
+    const r3 = await run(ctx.repo, b, path.join(ctx.parent, 'council-x-r3'), ['--prior-out', moved])
+    assert.equal(r3.code, 0); assert.deepEqual(r3.input.briefDedup.sameAs, [])
+    assert.deepEqual(r3.input.briefDedup.priorRoundConflicts, [{ dir: moved, parsedFromDirName: 1, treatedAs: 3 }])
+  })
+
+  test('(f3) 應放行（舊產物沒有 round 欄位）：回退目錄名 -r3、本輪 r3 ⇒ 不比（與 1.27.0 行為相同）；無 conflict 欄位', async () => {
+    const ctx = setup(); const b = ctx.writeBrief('b.md', B1 + DELTA)
+    const moved = await movedPrior(ctx, { dirName: 'moved-r3', round: 'delete', brief: b })
+    const r3 = await run(ctx.repo, b, path.join(ctx.parent, 'council-x-r3'), ['--prior-out', moved])
+    assert.equal(r3.code, 0); assert.deepEqual(r3.input.briefDedup.sameAs, []); assert.doesNotMatch(r3.outs, SAME_WARN)
+    assert.equal('priorRoundConflicts' in r3.input.briefDedup, false)
+  })
+
+  test('(f4) 應放行（metadata 無效才回退）：input.json.round 為 0／負數／小數／字串 ⇒ 回退目錄名（-r3 ⇒ 不比）', async () => {
+    for (const bad of [0, -1, 2.5, '2']) {
+      const ctx = setup(); const b = ctx.writeBrief('b.md', B1 + DELTA)
+      const moved = await movedPrior(ctx, { dirName: 'moved-r3', round: bad, brief: b })
+      const r3 = await run(ctx.repo, b, path.join(ctx.parent, 'council-x-r3'), ['--prior-out', moved])
+      assert.equal(r3.code, 0, String(bad)); assert.deepEqual(r3.input.briefDedup.sameAs, [], String(bad))
+    }
+  })
+
+  test('(f5) 應放行（近鄰，目錄名與 metadata 一致）：-r2 且 round=2、本輪 r3 ⇒ 照比、無 conflict；同輪 --segment 各段（round 相同）⇒ 不比', async () => {
+    const ctx = setup(); const b = ctx.writeBrief('b.md', B1 + DELTA)
+    const prior = await movedPrior(ctx, { dirName: 'keep-r2', brief: b })
+    const r3 = await run(ctx.repo, b, path.join(ctx.parent, 'council-x-r3'), ['--prior-out', prior])
+    assert.deepEqual(r3.input.briefDedup.sameAs, [prior]); assert.equal('priorRoundConflicts' in r3.input.briefDedup, false)
+    const s1 = path.join(ctx.parent, 'council-y-r2-s1'); const s2 = path.join(ctx.parent, 'council-y-r2-s2')
+    assert.equal((await run(ctx.repo, b, s1, ['--segment', '1/2', '--prior-out', prior])).code, 0)
+    const seg = await run(ctx.repo, b, s2, ['--segment', '2/2', '--prior-out', prior, '--prior-out', s1])
+    assert.deepEqual(seg.input.briefDedup.sameAs, []) // keep-r2 與本段同為第 2 輪（metadata=2）⇒ 同輪不比
+    assert.equal('priorRoundConflicts' in seg.input.briefDedup, false)
+  })
+
   test('(d1) 自述詞警告：brief 含「寫手宣稱／寫手說／作者表示／寫手回報」⇒ 只警告、不擋，input.json.selfReportWarning 記詞；乾淨 brief ⇒ null', async () => {
     const { repo, parent, writeBrief } = setup()
     const dirty = await run(repo, writeBrief('d.md', B1 + '寫手宣稱已修好；作者表示測試會紅\n'), path.join(parent, 'plain-1'))
