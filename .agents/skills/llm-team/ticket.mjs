@@ -14,6 +14,15 @@
 //   實際 ≠ 預期 ⇒ summary.rosterMismatch: true、run 回 3；publish 比對三元組並回頭讀 members.json，缺檔／不符 ⇒ 擋。
 // 🔴 P5（2026-09-14）：任何 writeExit !== 0（含 2）⇒ 不跑 --test、不開 council、仍寫 summary（review = null）（以前 exit 3 會拿半成品去複審、exit 2 沒 summary）。
 //
+// 🔴 1.26.0（WBS 4.7.31 A2 T2b）：送審前先 commit、輪次目錄對齊 land。
+//   · verify 通過（exit 0）後、送 council 前，ticket 先把寫手【實際改動且落在 --allow 內】的檔 commit（訊息 `<票名> r<N>: <brief 標題>（<寫手 harness/model> 寫）`）；
+//     --allow 外有改動／untracked ⇒ 不 commit、不送審（沿用 write.mjs G4 越界規則：不修、不還原、回統整者）；commit 後工作樹必須乾淨，否則不送審。
+//     verify 紅 ⇒ 不 commit、不送審（舊流程會對髒樹送審；--require-clean 下那只會被 council 拒審）。
+//   · council 一律帶 `--require-clean`，`--base` 為 merge-base（不是 main 名稱：main 前進後 `git diff main` 會把別人的 commit 反向算進來）。
+//   · 輪次目錄：當前輪直接寫 `review-r<N>`（第 1 輪＝review-r1），不再使用 `review/`；舊結構（`review/` ＋ `review-r<N>`）仍可讀、可續輪——
+//     `review/` 視為最新一輪、續輪時改名成 review-r<N>。與 WAS tools/land-core.mjs roundOfDir（只認 -r<N> 結尾）對得上。
+//   · summary.json 新增 `commits:[{round, sha}]`（含前幾輪）、`reviewDirs:[…]`（相對 repo 根）；收貨摘要多印一行可複製的 land 指令（只印不執行）。
+//
 // 🔴 2026-09-13 三方共識：
 //   · ticket 預設停在「已複審的 worktree＋收貨摘要」；ticket publish 才 commit、push、開 draft PR；永不自動 merge。
 //   · P4：G1–G6 是寫手 wrapper 的自我約束，不是 repo 的門；門仍是 GitHub ruleset＋PR review。
@@ -21,6 +30,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import {
   loadConfig,
@@ -31,6 +41,7 @@ import {
   memberFileName,
   git,
   changedFiles,
+  outOfScope,
   parseArgs,
   CLEAN_GIT_ENV,
   agySettingsPath,
@@ -41,6 +52,8 @@ import {
   preflightBriefCommands,
   writeTreeOf,
   MEASUREMENT_SCHEMA_VERSION,
+  matchRiskPaths,
+  crossFamilyStatus,
 } from './lib.mjs'
 import { getHarness } from './harnesses/index.mjs'
 import { main as writeMain } from './write.mjs'
@@ -57,6 +70,11 @@ function formatReviewerSummary(m) {
   const lines = []
   const overall = m.empty ? '🔴 零輸出' : m.overall || '?'
   lines.push(`[${m.name} (${m.model})] 整份: ${overall}`)
+  if (m.substitutedFor) {
+    lines.push(`  ↻ 換席：原席 ${m.substitutedFor.harness}/${m.substitutedFor.model}〔${m.substitutedFor.quotaBucket}〕→ 本席（原因 ${m.substituteReason || '?'}）`)
+  } else if (Array.isArray(m.attempts) && m.attempts.length > 0) {
+    lines.push(`  🔴 額度／憑證用盡且 fallbacks 全失敗：${m.attempts.map((x) => `${x.harness}/${x.model}:${x.kind}`).join('、')}`)
+  }
   if (m.empty) return lines
 
   const uncitedSet = new Set(Array.isArray(m.uncited) ? m.uncited : (parseVerdicts(m.text || '').uncited || []))
@@ -234,8 +252,9 @@ export function collectContextForAllow(allowPaths, repoRoot) {
 }
 
 /** 找出 content 中最長一串連續反引號的長度；fence 長度取 max(3, 最長串+1)，確保 fence 不會被內容自己的反引號提早關閉（4.7.20 第 3 輪 Q2b）。 */
-function backtickFence(content) {
-  const runs = content.match(/`+/g) || []
+export function backtickFence(content) {
+  // 🔴 1.26.1：不用 regex 字面值——mutation-receipt 的註解掃描器不認 regex 字面值，`+ 會讓它把其後整檔判成「不確定」（所有錨點 invalid）。
+  const runs = content.match(new RegExp('`+', 'g')) || []
   const longest = runs.reduce((m, run) => Math.max(m, run.length), 0)
   return '`'.repeat(Math.max(3, longest + 1))
 }
@@ -268,6 +287,199 @@ export function writerQuotaHintLine(summary) {
   return `🔴 寫手額度用盡：下一席 ${next.harness}/${next.model}，重跑加 --writer-harness ${next.harness}`
 }
 
+// ─────────────────── 1.26.0：複審輪次目錄（review-r<N>）、送審前 commit、land 指令 ───────────────────
+
+/**
+ * 列出 <outDir> 下的複審輪次目錄，輪次升冪：`review-r<N>`（N＝輪次）＋舊結構的 `review/`（若存在且是目錄）。
+ * 舊結構的 `review/` 一律視為「最新一輪」（舊流程把當前輪放在 review/、前輪改名成 review-r<N>），輪次記為 max(N)+1、legacy:true。
+ * 回 [{ name, round, path, legacy }]。
+ */
+export function listReviewDirs(outDir) {
+  let names = []
+  try {
+    names = fs.readdirSync(outDir)
+  } catch {
+    return []
+  }
+  const dirs = []
+  for (const name of names) {
+    const m = name.match(/^review-r(\d+)$/)
+    if (!m) continue
+    try {
+      if (!fs.statSync(path.join(outDir, name)).isDirectory()) continue
+    } catch {
+      continue
+    }
+    dirs.push({ name, round: Number(m[1]), path: path.join(outDir, name), legacy: false })
+  }
+  dirs.sort((x, y) => x.round - y.round)
+  const legacyPath = path.join(outDir, 'review')
+  try {
+    if (fs.statSync(legacyPath).isDirectory()) {
+      const max = dirs.length ? dirs[dirs.length - 1].round : 0
+      dirs.push({ name: 'review', round: max + 1, path: legacyPath, legacy: true })
+    }
+  } catch {
+    /* 沒有舊結構 */
+  }
+  return dirs
+}
+
+/** 最新一輪的複審目錄（絕對路徑）；一輪都沒有 ⇒ null。讀 members.json／各席 txt 的地方都走這支（相容舊結構）。 */
+/**
+ * 🔴 1.26.2（T2b-v2 r2，codex R1）：新一輪開始、commit 之前，先把上一份 summary.json 的「acceptance」原子清掉（寫暫存檔再 rename）。
+ * 事故情境：新一輪在重寫 summary 前中斷（council 之後、summary 寫入之前拋錯）⇒ 磁碟上留著舊輪「已 accept」的 summary
+ * （q6Receipt／dispositions／acceptedAt），publish 會拿舊輪的 verdict／Q6 配最新 review-r<N> 的 input／members，把新 commit 推出去。
+ * 清掉後 summary 不再是「已 accept」，且 reviewDir／reviewedHead 歸 null（publish 的 generation 綁定會直接拒）。
+ * 陽性對照 ticket.test.mjs「1.26.2 R1」。停止條件：publish 退役（land.mjs 成為唯一推送入口）時一併移除（見 SKILL.md 1.26.1 節）。
+ */
+export function invalidatePriorAcceptance(summaryPath, now = () => new Date().toISOString()) {
+  if (!fs.existsSync(summaryPath)) return
+  let next
+  try {
+    const prior = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+    // eslint-disable-next-line no-unused-vars
+    const { acceptedAt, q6Receipt, dispositions, caliber, caliberBy, measurementSchemaVersion, reviewDir, reviewedHead, ...rest } = prior
+    next = { ...rest, reviewDir: null, reviewedHead: null, acceptanceClearedAt: now() }
+  } catch {
+    next = { schemaVersion: 2, invalid: true, reviewDir: null, reviewedHead: null, acceptanceClearedAt: now() }
+  }
+  const tmp = `${summaryPath}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2))
+  fs.renameSync(tmp, summaryPath)
+}
+
+export function latestReviewDir(outDir) {
+  const dirs = listReviewDirs(outDir)
+  return dirs.length ? dirs[dirs.length - 1].path : null
+}
+
+const toPosix = (p) => String(p).split(path.sep).join('/')
+
+/** shell 單引號保護：只含安全字元就原樣，否則包單引號。 */
+function shellQuote(s) {
+  const t = String(s)
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(t) ? t : `'${t.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * 收貨摘要的 land 指令（只印、不執行）。條件：summary 有複審（review 非 null）且 reviewDirs 非空。
+ * `--review` 一個旗標只收一個目錄（land parseArgs 的 val()），所以每輪各帶一次。msg-file 給固定位置（reviewDirs 同層的 land-msg.txt）。
+ * 本行不含任何驗證宣稱字樣（land 會拒絕含「全綠」等字眼的訊息；這裡也不示範）。
+ */
+export function landCommandLine(summary) {
+  if (!summary || !summary.review) return null
+  const dirs = Array.isArray(summary.reviewDirs) ? summary.reviewDirs.filter((d) => typeof d === 'string' && d) : []
+  if (dirs.length === 0 || !summary.branch || !summary.ticket || !summary.coordinator) return null
+  const msgFile = path.posix.join(path.posix.dirname(dirs[0]), 'land-msg.txt')
+  return [
+    'node tools/land.mjs',
+    '--branch',
+    shellQuote(summary.branch),
+    '--name',
+    shellQuote(summary.ticket),
+    '--msg-file',
+    shellQuote(msgFile),
+    ...dirs.flatMap((d) => ['--review', shellQuote(d)]),
+    '--coordinator',
+    shellQuote(summary.coordinator),
+  ].join(' ')
+}
+
+/** brief 的標題（第一行非空、非 HTML 註解，去掉開頭 #）；沒有 ⇒ null。 */
+function briefTitle(briefContent) {
+  const first = String(briefContent || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('<!--'))
+  const t = first ? first.replace(/^#+\s*/, '').trim() : ''
+  return t || null
+}
+
+const sha256OfFile = (file) => {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 寫手跑之前，記下「--allow 內、被 .gitignore 擋掉、且是單一檔案」的路徑的內容 sha256（不存在 ⇒ null）。
+ * 這種檔不會出現在 `git status`，要 commit 只能 `add -f`；跑完比對 sha 才知道是不是寫手實際動過。
+ * allow 的目錄項（以 / 結尾）不處理：`add -f <目錄>` 會把整棵被忽略的東西（node_modules…）一起加進去。
+ * check-ignore 失敗（含假 git）⇒ 視為沒被忽略。
+ */
+function snapshotIgnoredAllow(worktree, allow, gitFn) {
+  const snap = new Map()
+  for (const f of allow) {
+    if (typeof f !== 'string' || !f || f.endsWith('/') || path.isAbsolute(f) || f.split('/').includes('..')) continue
+    let ignored = false
+    try {
+      gitFn(worktree, ['check-ignore', '-q', '--', f])
+      ignored = true
+    } catch {
+      ignored = false
+    }
+    if (ignored) snap.set(f, sha256OfFile(path.join(worktree, f)))
+  }
+  return snap
+}
+
+/**
+ * 送審前 commit：只 add `changed`（呼叫端已確認都在 --allow 內）＋寫手實際動過的 gitignored allow 檔（`add -f`）。
+ * 回 { ok:true, sha } 或 { ok:false, reason }。失敗不留半截 index（reset -q）。
+ */
+function commitBeforeReview({ worktree, changed, allow, ignoredTouched, message, gitFn, changedFilesFn }) {
+  try {
+    if (changed.length > 0) gitFn(worktree, ['add', '-A', '--', ...changed])
+    for (const f of ignoredTouched) gitFn(worktree, ['add', '-f', '--', f])
+    const staged = gitFn(worktree, ['diff', '--cached', '--name-only', '--no-renames']).split('\n').map((x) => x.trim()).filter(Boolean)
+    if (staged.length === 0) {
+      return { ok: false, reason: '沒有任何可 commit 的改動（add 之後 index 為空）' }
+    }
+    const strays = outOfScope(staged, allow)
+    if (strays.length > 0) {
+      try {
+        gitFn(worktree, ['reset', '-q'])
+      } catch {
+        /* 盡力還原 index */
+      }
+      return { ok: false, reason: `index 內有 --allow 外的檔，不 commit：${strays.join(', ')}` }
+    }
+    const preHead = gitFn(worktree, ['rev-parse', 'HEAD'])
+    gitFn(worktree, ['commit', '-q', '-m', message])
+    // 🔴 1.26.0 r2（codex R1）：commit 之後重驗【commit 實際範圍】。pre-commit hook 可能在執行期間 stage 了 allow 外的檔，
+    //   上面的 staged 檢查看不到；`--name-status --no-renames` 讓 rename 兩端都列出。有任何檔在 --allow 外 ⇒ 撤回這個 commit
+    //   （reset --soft 回 commit 前的 HEAD、再把 index 還原），HEAD 不前進。這個 commit 還沒送審，撤回不是複審後 rebase。
+    //   陽性對照 ticket.test.mjs「1.26.0 r2 R1」（拿掉本段 ⇒ hook 塞進去的檔被 commit、council 被呼叫）。
+    const committed = gitFn(worktree, ['diff', '--name-status', '--no-renames', preHead, 'HEAD'])
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => l.split('\t').slice(1).join('\t'))
+    const committedStrays = outOfScope(committed, allow)
+    if (committedStrays.length > 0) {
+      gitFn(worktree, ['reset', '-q', '--soft', preHead])
+      gitFn(worktree, ['reset', '-q'])
+      return { ok: false, reason: `commit 實際範圍含 --allow 外的檔，已撤回 commit：${committedStrays.join(', ')}`, strays: committedStrays }
+    }
+    const left = changedFilesFn(worktree).filter((f) => !f.startsWith('.agy-write/'))
+    if (left.length > 0) {
+      return { ok: false, reason: `commit 後工作樹仍不乾淨：${left.join(', ')}` }
+    }
+    return { ok: true, sha: gitFn(worktree, ['rev-parse', 'HEAD']) }
+  } catch (e) {
+    // commit 失敗（hook 拒絕等）：index 還原成 HEAD，不留半截 staged（工作樹內容不動，統整者可看到寫手改了什麼）。
+    try {
+      gitFn(worktree, ['reset', '-q'])
+    } catch {
+      /* 盡力還原 index */
+    }
+    return { ok: false, reason: e.message }
+  }
+}
+
 function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
   const harness = summary.harness || 'unknown'
   const q6 = summary.q6Receipt ? '有' : '無'
@@ -292,11 +504,17 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
     if (summary.reviewOnly) {
       lines.push('🔴 未複審（review-only：verify 紅）')
     } else {
-      lines.push(
-        summary.writeExit !== 0
-          ? '🔴 未複審（write 非 0，P5：不跑 --test、不開 council）'
-          : '🟡 未複審（寫手沒有改動任何檔）'
-      )
+      if (summary.writeExit !== 0) {
+        lines.push('🔴 未複審（write 非 0，P5：不跑 --test、不開 council）')
+      } else if (Array.isArray(summary.outOfScope) && summary.outOfScope.length > 0) {
+        lines.push(`🔴 未複審（--allow 外有改動／untracked，不 commit、不送審：${summary.outOfScope.join(', ')}）`)
+      } else if (summary.commitFailure) {
+        lines.push(`🔴 未複審（送審前 commit 失敗：${summary.commitFailure}）`)
+      } else if (summary.verifyExit !== null && summary.verifyExit !== undefined && summary.verifyExit !== 0) {
+        lines.push('🔴 未複審（verify 紅：未 commit、未送審）')
+      } else {
+        lines.push('🟡 未複審（寫手沒有改動任何檔）')
+      }
     }
   }
   // 1.16.0 寫手鏈：額度用盡只【提示】下一席（統整者自己決定要不要重跑；council 09-22 第 4 題：fallback 不自動）。
@@ -305,6 +523,16 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
 
   if (summary.tierEscalatedBy && summary.tierEscalatedBy.length > 0) {
     lines.push(`tierEscalatedBy: ${summary.tierEscalatedBy.join(', ')}`)
+  }
+
+  if (Array.isArray(summary.tierEscalatedByPaths) && summary.tierEscalatedByPaths.length > 0) {
+    lines.push(`tierEscalatedByPaths: ${summary.tierEscalatedByPaths.map((h) => `${h.file}（${h.glob}）`).join(', ')}`)
+  }
+  if (summary.review?.duplicateModel === true) {
+    lines.push('⚠ duplicateModel：換席後 block 名單有兩席是同一個模型（盲點相關，不算兩位獨立複審者）')
+  }
+  if (summary.review?.crossFamily === 'degraded') {
+    lines.push('⚠ crossFamily: degraded（block 跨家族席因 quota／auth 換成同家族成員）——待事後審')
   }
 
   if (summary.rosterMismatch === true) {
@@ -333,6 +561,9 @@ function buildReceiptSummaryLines(summary, reviewMembers, summaryPath) {
   for (const m of reviewMembers) {
     lines.push(...formatReviewerSummary(m))
   }
+
+  const landLine = landCommandLine(summary)
+  if (landLine) lines.push(landLine)
 
   lines.push(`summary.json: ${summaryPath}`)
   return lines
@@ -399,7 +630,9 @@ function loadAndGateSummary({
   }
 
   const currentFiles = changedFilesFn(worktree).filter((f) => !isIgnored(f))
-  if (currentFiles.length === 0 && !allowNoChanges) {
+  // 1.26.0：run 已在送審前 commit（summary.commits 非空）⇒ 工作樹乾淨是預期狀態，不算「無任何改動」。
+  const alreadyCommitted = Array.isArray(summary.commits) && summary.commits.length > 0
+  if (currentFiles.length === 0 && !allowNoChanges && !alreadyCommitted) {
     console.error(`🔴 worktree 無任何改動：${worktree}`)
     return { ok: false, code: 2 }
   }
@@ -459,7 +692,7 @@ function loadAndGateSummary({
     console.error(`🔴 ${sub}：run 已判 rosterMismatch（council 實際名單 ≠ profile 預期名單），不得${action}`)
     return { ok: false, code: 2 }
   }
-  const membersFile = path.join(outDir, 'review', 'members.json')
+  const membersFile = path.join(latestReviewDir(outDir) || path.join(outDir, 'review'), 'members.json')
   const actualOnDisk = readMembersJson(membersFile)
   if (!actualOnDisk) {
     console.error(`🔴 ${sub}：缺 council 的實際名單（或格式不合法）：${membersFile}，無法證明全員簽署，不得${action}`)
@@ -575,7 +808,7 @@ export async function main(argv, deps = {}) {
       return 2
     }
     const RUN_USAGE =
-      '用法：run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" (--wbs <id[,id...]>|--wbs-exempt "<理由>") [--tier standard|block] [--base main] [--review-only] [--write-timeout-ms <ms>] [--writer-harness <name>]'
+      '用法：run --coordinator <claude|agy|codex> --name <n> --brief <file> --branch <prefix/name> --allow <path>… --test "<cmd>" (--wbs <id[,id...]>|--wbs-exempt "<理由>") [--tier standard|block] [--base main] [--review-only] [--write-timeout-ms <ms>] [--review-timeout-ms <ms>] [--writer-harness <name>]'
     if (!a.name || !a.brief || !a.branch || !a.allow || a.allow.length === 0 || !a.test) {
       console.error(RUN_USAGE)
       return 2
@@ -621,6 +854,21 @@ export async function main(argv, deps = {}) {
         return 2
       }
       writeTimeoutMs = n
+    }
+
+    // 🔴 1.24.0：--review-timeout-ms passthrough 給 council（council 預設 8 分鐘；block 票／大 diff 的複審者可能要更久）。
+    //   驗法與 --write-timeout-ms 相同（正整數、fail-closed）：無效值若放行，council 以前會把 NaN 靜默帶進 spawn 逾時。
+    //   陽性對照 ticket.test.mjs「1.24.0 --review-timeout-ms」（abc／0／-5／裸旗標 ⇒ 回 2 且 writeMain 0 次；合法值 ⇒ councilArgs 帶 --timeout-ms）。
+    //   停止條件：council 自己驗 --timeout-ms（1.24.0 已驗）且 ticket 不再需要在開 worktree 前就擋時，可拆本段。
+    let reviewTimeoutMs = null
+    if (a['review-timeout-ms'] !== undefined) {
+      const raw = a['review-timeout-ms']
+      const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN
+      if (!Number.isInteger(n) || n <= 0) {
+        console.error('🔴 --review-timeout-ms 必須是正整數（毫秒），實際為 ' + JSON.stringify(raw))
+        return 2
+      }
+      reviewTimeoutMs = n
     }
 
     // 🔴 --coordinator 必帶（或 env LLM_TEAM_COORDINATOR）：缺或不在 profiles ⇒ exit 2 並列出可用 profiles
@@ -768,7 +1016,6 @@ export async function main(argv, deps = {}) {
     const worktree = path.resolve(repoRoot, worktreeRoot, a.name)
     const outBaseDir = config.outDir || '.local/llm-team'
     const outDir = path.resolve(repoRoot, outBaseDir, a.name)
-    const reviewOutDir = path.join(outDir, 'review')
 
     // a. worktree 管理
     let createdWorktree = false
@@ -889,11 +1136,14 @@ export async function main(argv, deps = {}) {
     let writeExit = null
     let writeTimedOut = false
     let changed = []
+    let ignoredSnapshot = new Map()
 
     if (reviewOnly) {
       // 🔴 2026-09-16 事故：review-only 在乾淨樹上 changed=[] ⇒ land :169 擋；改為 mergeBase..HEAD 已提交改動檔，與複審 --round-start 範圍一致；陽性對照 T78
       changed = gitFn(worktree, ['diff', '--name-only', mergeBase, 'HEAD']).split('\n').map((s) => s.trim()).filter(Boolean)
     } else {
+      // 1.26.0：先記下 --allow 內被 .gitignore 擋掉的單檔內容（寫手後比對，才知道要不要 add -f）。
+      ignoredSnapshot = snapshotIgnoredAllow(worktree, a.allow, gitFn)
       const writeMainFn = deps.writeMain || writeMain
       const writeArgs = [
         '--worktree',
@@ -941,25 +1191,120 @@ export async function main(argv, deps = {}) {
       }
     }
 
+    // 🔴 1.24.0 路徑命中升 block（fable 10-03 重判 a-①）：diff 檔案命中 config.riskPaths 任一 glob ⇒ 票升 block，
+    //   與 riskDomains 關鍵字並存。riskDomains 只看 brief／--allow 文字，寫手實際改到 trust-root（llm-team 快照、收據、land、hooks）
+    //   而 brief 沒提時抓不到；這裡看的是【實際 diff 檔案】（寫手路徑 ＝ 本輪 changed；review-only ＝ merge-base..HEAD）。
+    //   陽性對照 ticket.test.mjs「1.24.0 riskPaths 命中 ⇒ block」（拿掉本段 ⇒ councilArgs 的 --tier 仍是 standard、summary.reviewers 不含 block 名單）。
+    //   停止條件：riskPaths 改由 CODEOWNERS／ruleset 在合併點強制時，本段可降為提示。
+    let tierEscalatedByPaths = null
+    //   🔴 rename：`changedFiles`（git status --porcelain）與 `git diff --name-only`（預設偵測 rename）都只回【新路徑】，
+    //   風險路徑檔 rename 到安全路徑會躲過比對。所以再加一份 `git diff --name-only --no-renames <merge-base>`（舊路徑以刪除列出、
+    //   新路徑以新增列出；工作樹對 merge-base，涵蓋已 commit、已 stage、未 stage 與前幾輪累計），與 changed 取聯集再比。
+    //   git 失敗 ⇒ fail-closed 升 block（不是當作沒命中）。只在 config.riskPaths 非空時才多跑這一次 git。
+    //   陽性對照 ticket.test.mjs「1.24.0 riskPaths rename」（只看新路徑 ⇒ 寫手路徑與 review-only 兩條都紅）。
+    const riskGlobs = Array.isArray(config.riskPaths) ? config.riskPaths : []
+    let riskCandidates = changed
+    let riskGitFailed = false
+    if (riskGlobs.length > 0) {
+      try {
+        const names = gitFn(worktree, ['diff', '--name-only', '--no-renames', mergeBase]).split('\n').map((s) => s.trim()).filter(Boolean)
+        riskCandidates = Array.from(new Set([...changed, ...names]))
+      } catch (e) {
+        riskGitFailed = true
+        console.error(`⚠️ riskPaths：git diff 失敗（${e.message}），fail-closed 升 block`)
+      }
+    }
+    const riskPathHits = riskGitFailed
+      ? [{ file: '(git diff 失敗)', glob: '*' }]
+      : matchRiskPaths(riskCandidates, riskGlobs)
+    if (riskPathHits.length > 0) {
+      tierEscalatedByPaths = riskPathHits
+      if (tier !== 'block') tier = 'block'
+    }
+
     let verifyExit = null
     let councilExit = null
+    let reviewOutDir = null
+    let commitRecord = null
+    let commitFailure = null
+    let outOfScopeFiles = []
     if (reviewOnly) {
       const t = testFn(a.test, worktree)
       verifyExit = t.exit
       fs.writeFileSync(path.join(outDir, 'verify.txt'), t.out || '')
     }
     const writeFailed = writeExit !== 0
-    const doReview = reviewOnly ? verifyExit === 0 : (!writeFailed && changed.length > 0)
+    if (!reviewOnly && !writeFailed && changed.length > 0) {
+      const t = testFn(a.test, worktree)
+      verifyExit = t.exit
+      fs.writeFileSync(path.join(outDir, 'verify.txt'), t.out || '')
+    }
+    // 🔴 1.26.0：verify 紅 ⇒ 不 commit、不送審（--require-clean 下髒樹只會被 council 拒審；紅樹也不可能當 land 證據）。
+    let doReview = reviewOnly ? verifyExit === 0 : !writeFailed && changed.length > 0 && verifyExit === 0
+
+    // 🔴 1.26.2：要開新一輪（會有新 commit／新 review-r<N>）⇒ 先清舊 acceptance（commit 之前、council 之前）。
+    if (doReview) invalidatePriorAcceptance(path.join(outDir, 'summary.json'))
+
+    // 本輪輪次號：現有輪次目錄（含舊結構 review/ ＝最新一輪）之後的下一號。commit 訊息的 r<N> 與複審目錄 review-r<N> 同號。
+    const existingReviewDirs = listReviewDirs(outDir)
+    const reviewRound = existingReviewDirs.length ? existingReviewDirs[existingReviewDirs.length - 1].round + 1 : 1
+
+    // 🔴 1.26.0（WBS 4.7.31 A2 T2b）：verify 通過後、送 council 前先 commit。
+    //   事故：2026-10-04 p4733sa2fp 用 ticket 的 review 目錄跑 land ⇒ exit 2（[binding]／[dirty]／[diff-sha]）——ticket 對【未提交工作樹】送審，
+    //   land 只收 dirty=false、untracked=[]、範圍正好是 mergeBase..branchHead 的輪次，經 ticket 審過的分支一律過不了 land。
+    //   只 add 寫手實際改動且在 --allow 內的檔；--allow 外有改動 ⇒ 不 commit、不送審（G4 越界規則）；commit 後工作樹必須乾淨。
+    //   陽性對照 ticket.test.mjs「1.26.0 ticket 送審前 commit」(a)（拿掉本段 ⇒ council 收到 dirty 樹、HEAD 仍是 roundStartSha）、(b)（拿掉越界判定 ⇒ councilMain 被呼叫）。
+    //   停止條件：council 改為自己對 commit 重審（不信任 ticket 的 commit）時可拆。
+    if (doReview && !reviewOnly) {
+      const stray = outOfScope(changed, a.allow)
+      if (stray.length > 0) {
+        outOfScopeFiles = stray
+        doReview = false
+        console.error(`🔴 --allow 外有改動／untracked，不 commit、不送審：${stray.join(', ')}`)
+      } else {
+        const ignoredTouched = []
+        for (const [f, before] of ignoredSnapshot) {
+          if (sha256OfFile(path.join(worktree, f)) !== before && !changed.includes(f)) ignoredTouched.push(f)
+        }
+        const title = briefTitle(briefContent) || a.name
+        const writerLabel = `${writer.harness}/${a.model || writer.model}`
+        const c = commitBeforeReview({
+          worktree,
+          changed,
+          allow: a.allow,
+          ignoredTouched,
+          message: `${a.name} r${reviewRound}: ${title}（${writerLabel} 寫）`,
+          gitFn,
+          changedFilesFn,
+        })
+        if (c.ok) {
+          commitRecord = { round: reviewRound, sha: c.sha }
+        } else {
+          doReview = false
+          if (c.strays) {
+            outOfScopeFiles = c.strays
+            console.error(`🔴 ${c.reason}`)
+          } else {
+            commitFailure = c.reason
+            console.error(`🔴 送審前 commit 失敗：${c.reason}`)
+          }
+        }
+      }
+    }
 
     if (doReview) {
-      if (!reviewOnly) {
-        const t = testFn(a.test, worktree)
-        verifyExit = t.exit
-        fs.writeFileSync(path.join(outDir, 'verify.txt'), t.out || '')
+      // 🔴 1.26.0：當前輪直接寫 review-r<N>（第 1 輪＝review-r1），與 land-core roundOfDir（只認 -r<N> 結尾）對齊。
+      //   舊結構的 review/（舊流程的當前輪）改名成 review-r<它的輪次> 保存，讓舊票可以續輪。
+      //   council 的「brief 不得內嵌前輪推理」比對靠前輪輸出：下面逐一用 --prior-out 傳入（1.23.0，不依賴 council 的命名推導）。
+      //   陽性對照 ticket.test.mjs「1.26.0 ticket 輪次目錄」「1.23.0 ticket 連跑兩輪」。
+      for (const d of existingReviewDirs) {
+        if (d.legacy) fs.renameSync(d.path, path.join(outDir, `review-r${d.round}`))
       }
-
-      fs.rmSync(reviewOutDir, { recursive: true, force: true })
+      reviewOutDir = path.join(outDir, `review-r${reviewRound}`)
       fs.mkdirSync(reviewOutDir, { recursive: true })
+      const priorReviewDirs = listReviewDirs(outDir)
+        .filter((d) => d.path !== reviewOutDir)
+        .map((d) => d.path)
 
       let writerReportPath = null
       if (fs.existsSync(writeOutDir)) {
@@ -982,7 +1327,7 @@ export async function main(argv, deps = {}) {
         '--worktree',
         worktree,
         '--base',
-        base,
+        mergeBase,
         '--round-start',
         reviewOnly ? mergeBase : roundStartSha,
         '--brief',
@@ -993,18 +1338,30 @@ export async function main(argv, deps = {}) {
         tier,
         '--coordinator',
         coordinatorProfile,
+        '--require-clean',
       ]
       if (reviewOnly) councilArgs.push('--review-only')
+      for (const d of priorReviewDirs) councilArgs.push('--prior-out', d)
       if (writerReportPath && !reviewOnly) councilArgs.push('--writer-report', writerReportPath)
       if (configFile) councilArgs.push('--config', configFile)
       if (a['diff-cap'] !== undefined) councilArgs.push('--diff-cap', String(a['diff-cap']))
+      if (reviewTimeoutMs !== null) councilArgs.push('--timeout-ms', String(reviewTimeoutMs))
       councilExit = await councilMainFn(councilArgs, deps)
     }
 
     // 預期名單直接來自 profile（一般票 reviewers、block 票 blockReviewers）。
     // 陽性對照 ticket.test.mjs「T36 block 票收 blockReviewers（含 codex）、standard 票收 reviewers；codex 不簽則 publish 擋下」
+    //   1.24.0：席位帶 fallbacks（三元組）進 summary.reviewers，compareRoster 才認得「宣告過的換席」。
     const expectedReviewers = (tier === 'block' ? models.blockReviewers : models.reviewers).map(
-      ({ name, harness, model, quotaBucket }) => ({ name, harness, model, quotaBucket })
+      ({ name, harness, model, quotaBucket, fallbacks }) => ({
+        name,
+        harness,
+        model,
+        quotaBucket,
+        ...(Array.isArray(fallbacks) && fallbacks.length > 0
+          ? { fallbacks: fallbacks.map((f) => ({ harness: f.harness, model: f.model, quotaBucket: f.quotaBucket })) }
+          : {}),
+      })
     )
 
     // 🔴 實際名單只從 council 寫的 review/members.json 取（codex 複審 Q5-IDENTITY）：不再按預期檔名讀文字、自貼預期身分。
@@ -1034,6 +1391,8 @@ export async function main(argv, deps = {}) {
             harness: m.harness,
             model: m.model,
             quotaBucket: m.quotaBucket,
+            ...(m.substitutedFor ? { substitutedFor: m.substitutedFor, substituteReason: m.substituteReason } : {}),
+            ...(Array.isArray(m.attempts) ? { attempts: m.attempts } : {}),
             overall: m.overall !== undefined ? m.overall : v.overall,
             q: m.q && typeof m.q === 'object' ? m.q : v.q,
             uncited,
@@ -1071,10 +1430,23 @@ export async function main(argv, deps = {}) {
     if (doReview) {
       reviewObj = {
         tier,
-        members: reviewMembers.map(({ name, harness, model, quotaBucket, overall, q, empty, timedOut, uncited }) => ({ name, harness, model, quotaBucket, overall, q, empty, timedOut, uncited })),
+        members: reviewMembers.map(({ text, ...rest }) => rest),
         anyEmpty,
-        membersSource: 'review/members.json',
+        membersSource: `${path.basename(reviewOutDir)}/members.json`,
         reviewedTree: writeTreeOfFn(worktree),
+      }
+      // 🔴 1.24.0 block 跨家族席降級：原本與統整者不同 quotaBucket 的席因 quota／auth 換成同家族成員 ⇒ crossFamily:'degraded'，
+      //   並標 postReviewPending（收貨摘要印「待事後審」；本 repo 沒有事後審佇列檔，補審由統整者手動跑
+      //   `council review --tier postreview --review-only`，名單來自 profile 的 postReviewers）。不擋 publish——降級是額度事實，不是簽核失敗。
+      //   陽性對照 ticket.test.mjs「1.24.0 block 票跨家族席換成同家族 ⇒ summary.review.crossFamily degraded」。
+      if (tier === 'block') {
+        const cf = crossFamilyStatus(models.coordinator.quotaBucket, reviewMembers)
+        reviewObj.crossFamily = cf.status
+        if (cf.duplicateModel) reviewObj.duplicateModel = true
+        if (cf.status === 'degraded') {
+          reviewObj.postReviewPending = true
+          reviewObj.crossFamilyDegraded = cf.degraded
+        }
       }
       if (councilExit !== null && councilExit !== 0 && councilExit !== 3) {
         reviewObj.exit = councilExit
@@ -1091,6 +1463,22 @@ export async function main(argv, deps = {}) {
         }
       }
     }
+
+    // 1.26.0：commits 帶前幾輪（讀上一份 summary.json，同分支才採信），reviewDirs＝所有輪次目錄（相對 repo 根、輪次升冪，含舊結構 review/）。
+    const summaryPath = path.join(outDir, 'summary.json')
+    let priorCommits = []
+    if (fs.existsSync(summaryPath)) {
+      try {
+        const prior = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+        if (prior && prior.branch === a.branch && Array.isArray(prior.commits)) {
+          priorCommits = prior.commits.filter((c) => c && Number.isInteger(c.round) && typeof c.sha === 'string' && c.sha)
+        }
+      } catch {
+        /* 上一份壞掉 ⇒ 不帶前輪 commits */
+      }
+    }
+    const commits = commitRecord ? [...priorCommits.filter((c) => c.round !== commitRecord.round), commitRecord] : priorCommits
+    const reviewDirs = listReviewDirs(outDir).map((d) => toPosix(path.relative(repoRoot, d.path)))
 
     const summary = {
       schemaVersion: 2,
@@ -1119,7 +1507,15 @@ export async function main(argv, deps = {}) {
       verifyExit,
       verifyLog: 'verify.txt',
       ...(tierEscalatedBy ? { tierEscalatedBy } : {}),
+      ...(tierEscalatedByPaths ? { tierEscalatedByPaths } : {}),
       review: reviewObj,
+      commits,
+      reviewDirs,
+      // 🔴 1.26.2：summary、複審目錄、受審 head 綁成同一代（generation）；publish 只認「summary.reviewDir＝最新 review-r<N>、summary.reviewedHead＝該目錄 input.json.head」。
+      reviewDir: doReview ? toPosix(path.relative(repoRoot, reviewOutDir)) : null,
+      reviewedHead: doReview ? (reviewObj?.input?.head ?? null) : null,
+      ...(commitFailure ? { commitFailure } : {}),
+      ...(outOfScopeFiles.length > 0 ? { outOfScope: outOfScopeFiles } : {}),
       rosterMismatch,
       ...(rosterDiff ? { rosterDiff } : {}),
       coordinatorTurns: null,
@@ -1130,7 +1526,6 @@ export async function main(argv, deps = {}) {
       finishedAt: new Date().toISOString(),
     }
 
-    const summaryPath = path.join(outDir, 'summary.json')
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2))
 
     // e. stdout 只印一張收貨摘要（≤ 25 行）
@@ -1145,6 +1540,8 @@ export async function main(argv, deps = {}) {
     }
     // 🔴 2026-09-13 事故：模板票 verify 紅（exit 1）run 仍 exit 0 假綠；陽性對照 ticket.test.mjs「T20 changed 非空、runTest 回 exit 1 ⇒ run 回 3」；停止條件：run 流程改為事件驅動狀態機且能原生傳播驗收 exit code 時重審
     if (verifyExit !== null && verifyExit !== 0) return 3
+    // 1.26.0：越界檔／送審前 commit 失敗 ⇒ 沒有複審、也不能 land ⇒ 3（陽性對照 ticket.test.mjs「1.26.0 ticket 送審前 commit」(b)）。
+    if (outOfScopeFiles.length > 0 || commitFailure) return 3
     if (councilExit !== null && councilExit !== 0 && councilExit !== 3) return councilExit
     // 🔴 實際名單 ≠ 預期名單 ⇒ 3（陽性對照 ticket.test.mjs「Q5 run：…⇒ run 回 3」）
     if (rosterMismatch) return 3
@@ -1195,15 +1592,68 @@ export async function main(argv, deps = {}) {
       title = firstLine ? firstLine.replace(/^#+\s*/, '').trim() : `feat: ${a.name}`
     }
 
-    // git add -- <summary.changed 逐一>
-    gitFn(worktree, ['add', '--', ...summaryChanged])
-    // git commit
-    gitFn(worktree, ['commit', '-m', title])
+    // 🔴 1.26.0 r2（codex R2／agy R3）：新流程（summary.commits 非空，run 已在送審前 commit）publish 綁定受審的 SHA——
+    //   工作樹必須乾淨、目前 HEAD 必須等於最新一輪複審 input.json 的 head，任一不符 ⇒ 拒絕（exit 2）、不 add／commit／push。
+    //   （以前用 currentFiles.length > 0 判斷走舊流程，新流程工作樹髒了會默默 commit 未審內容；amend／reset 後再 commit 也會被當成已審。）
+    //   舊流程（summary 無 commits）照舊：publish 自己 add／commit。
+    //   陽性對照 ticket.test.mjs「1.26.0 r2 R2／R3」（拿掉 ⇒ amend 後、弄髒後 publish 仍走到 push／commit）。
+    const newFlow = Array.isArray(summary.commits) && summary.commits.length > 0
+    if (newFlow) {
+      if (gate.currentFiles.length > 0) {
+        console.error(`🔴 publish：送審後工作樹不乾淨，拒絕（不 commit、不 push）：${gate.currentFiles.join(', ')}`)
+        return 2
+      }
+      const latest = latestReviewDir(outDir)
+      let reviewedHead = null
+      try {
+        reviewedHead = latest ? JSON.parse(fs.readFileSync(path.join(latest, 'input.json'), 'utf8')).head : null
+      } catch {
+        reviewedHead = null
+      }
+      let curHead = null
+      try {
+        curHead = gitFn(worktree, ['rev-parse', 'HEAD'])
+      } catch {
+        curHead = null
+      }
+      if (!reviewedHead || !curHead || curHead !== reviewedHead) {
+        console.error(`🔴 publish：HEAD（${curHead}）≠ 最新一輪複審的 input.json.head（${reviewedHead}），拒絕（受審之後被 amend／reset／再 commit？）`)
+        return 2
+      }
+      // 🔴 1.26.1（T2b-v2，codex r2）：HEAD 對了還不夠——受審後可以在分支上再 commit 一個未審的 U，再 detached checkout 回受審的 R，
+      //   HEAD 檢查會過，但 `git push origin <branch>` 推的是指向 U 的分支 ref。所以同時要求【分支 ref】等於受審 head；推送也只推 HEAD（見下）。
+      //   陽性對照 ticket.test.mjs「1.26.1 R2」（拿掉本段 ⇒ 分支指向 U、HEAD 在 R 時 publish 仍會往下走）。
+      let branchSha = null
+      try {
+        branchSha = gitFn(worktree, ['rev-parse', `refs/heads/${summary.branch}`])
+      } catch {
+        branchSha = null
+      }
+      if (!branchSha || branchSha !== reviewedHead) {
+        console.error(`🔴 publish：分支 refs/heads/${summary.branch}（${branchSha}）≠ 最新一輪複審的 input.json.head（${reviewedHead}），拒絕（受審之後分支被推進／改指？）`)
+        return 2
+      }
+      // 🔴 1.26.2（T2b-v2 r2，codex R1）：summary 必須和最新一輪複審是【同一代】——summary.reviewDir＝最新 review-r<N>、summary.reviewedHead＝該目錄 input.json.head。
+      //   （新一輪在重寫 summary 前中斷時，磁碟上的 summary 是舊輪的：舊 verdict／Q6／dispositions 不得配新輪的 input／members 推出新 commit。）
+      //   陽性對照 ticket.test.mjs「1.26.2 R1」（拿掉本段 ⇒ 手放回舊輪已 accept 的 summary 時 publish 仍往下走）。
+      const latestRel = latest ? toPosix(path.relative(repoRoot, latest)) : null
+      if (!summary.reviewDir || summary.reviewDir !== latestRel || !summary.reviewedHead || summary.reviewedHead !== reviewedHead) {
+        console.error(`🔴 publish：summary 不是最新一輪複審的同一代（summary.reviewDir=${summary.reviewDir ?? 'null'}、最新=${latestRel}；summary.reviewedHead=${summary.reviewedHead ?? 'null'}、input.json.head=${reviewedHead}），拒絕（上一輪被中斷？重跑 run 並重新 accept）`)
+        return 2
+      }
+    }
+    if (!newFlow) {
+      // git add -- <summary.changed 逐一>
+      gitFn(worktree, ['add', '--', ...summaryChanged])
+      // git commit
+      gitFn(worktree, ['commit', '-m', title])
+    }
     // git push
-    gitFn(worktree, ['push', '-u', 'origin', summary.branch])
+    // 🔴 1.26.1：明確的 refspec——只推 HEAD（新流程已驗 HEAD＝分支 ref＝受審 head），不依賴「分支名」去解析成哪個 commit。
+    gitFn(worktree, ['push', '-u', 'origin', `HEAD:refs/heads/${summary.branch}`])
 
     // 組 pr-body.md
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = latestReviewDir(outDir) || path.join(outDir, 'review')
     const reviewMembers = (summary.review?.members || []).map((m) => {
       const txtFile = path.join(reviewOutDir, `${memberFileName(m.name)}.txt`)
       const text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : ''
@@ -1256,232 +1706,15 @@ export async function main(argv, deps = {}) {
   }
 
   if (sub === 'land') {
-    const a = parseArgs(rest)
-    if (!a.name || !a['msg-file']) {
-      console.error('用法：land --name <n> --msg-file <path>')
-      return 2
-    }
-
-    const msgFile = path.resolve(a['msg-file'])
-    if (!fs.existsSync(msgFile)) {
-      console.error(`🔴 msg-file 不存在：${msgFile}`)
-      return 2
-    }
-
-    let mainBranch
-    try {
-      mainBranch = gitFn(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])
-    } catch (e) {
-      console.error(`🔴 無法取得主 checkout 分支：${e.message}`)
-      return 2
-    }
-    // 🔴 事故：無事故；先例＝WAS tools/ticket-land.sh 2026-09-15 同一條 exit 2（git merge --ff-only 對 HEAD 生效不對 main，所以不在 main 時 ff 會把票併進別的分支）
-    //    陽性對照：測試「主 checkout 不在 main ⇒ 2 且無 add／merge」
-    //    停止條件：config 引入 mainBranch 欄且 land 改讀它時重審這行
-    if (mainBranch !== 'main') {
-      console.error(`🔴 主 checkout 必須在 main 分支（目前為 ${mainBranch}）`)
-      return 2
-    }
-
-    const worktreeRoot = config.worktreeRoot || '.claude/worktrees'
-    const worktree = path.resolve(repoRoot, worktreeRoot, a.name)
-    const outBaseDir = config.outDir || '.local/llm-team'
-    const outDir = path.resolve(repoRoot, outBaseDir, a.name)
-    const summaryPath = path.join(outDir, 'summary.json')
-
-    // 閘 A 複審綁定（add 之前，失敗時保證 worktree 完全未動）
-    // 🔴 事故：2026-09-15 config repo 三票 land exit 6 手動 rebase 三次，rebase 後零檢查
-    //    陽性對照：ticket.test.mjs T57（reviewedTree 缺 ⇒ 7）、T58（reviewedTree 不符 ⇒ 7）
-    //    停止條件：summary 改為不可篡改簽章或工作樹改為唯讀沙盒時重審
-    if (fs.existsSync(summaryPath)) {
-      try {
-        const pre = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-        if (!pre || !pre.review || !pre.review.reviewedTree) {
-          console.error('🔴 summary 沒有 review.reviewedTree（舊 summary 或寫手失敗），重跑 ticket.mjs run')
-          return 7
-        }
-      } catch {}
-    }
-
-    const gate = loadAndGateSummary({
-      sub: 'land',
-      worktree,
-      outDir,
-      summaryPath,
-      allowNoChanges: true,
-      changedFilesFn,
-      outBaseDir,
-      gitFn,
-    })
-    if (!gate.ok) return gate.code
-
-    const summary = gate.summary
-    const summaryChanged = gate.summaryChanged
-
-    // 🔴 4.7.20：land 前跑一次 `tools/product-wbs.mjs --status --json`（觀測，不擋票）並寫回 summary.json（wbsStatusAtLand）。
-    const wbsStatusAtLand = (deps.runWbsStatus || runWbsStatus)(repoRoot, deps)
-    try {
-      const disk = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-      disk.wbsStatusAtLand = wbsStatusAtLand
-      fs.writeFileSync(summaryPath, JSON.stringify(disk, null, 2))
-    } catch (e) {
-      console.error(`⚠️ 寫入 wbsStatusAtLand 失敗（不擋票）：${e.message}`)
-    }
-    summary.wbsStatusAtLand = wbsStatusAtLand
-
-    const nowTree = writeTreeOfFn(worktree)
-    if (nowTree !== summary.review.reviewedTree) {
-      console.error(`🔴 複審後工作樹又變了（reviewed: ${summary.review.reviewedTree}, now: ${nowTree}）；重跑 ticket.mjs run 重新複審`)
-      return 7
-    }
-
-    // ⑤ git add -- <changed 逐檔>，任一失敗 ⇒ 4
-    // 🔴 事故：2026-09-17 WAS review-only 多輪票（寫手已 commit）＋整個目錄被刪（`scripts/__tests__/` 連同
-    //    `spec-lint-corpus.test.mjs` 一起消失）：對「已經 commit 在分支上、工作樹與索引都沒有這個檔」的路徑
-    //    無條件呼叫 `git add -- f` 會回 `fatal: pathspec … did not match any files`，land 永遠卡在 exit 4，
-    //    走不到 ⑥「分支已領先 main，視為已 commit 過」。
-    //    改法：add 失敗時才問 `git status --porcelain --ignored -- f`（不對每檔都先問一次，保持原本「有變更
-    //    就 add」的快樂路徑不變、也不用改動任何既有測試的 fake git）——加 `--ignored` 是為了不誤放真正被
-    //    gitignore 擋下的既存檔（那種失敗要照樣冒出來，不能被本檢查靜默吃掉）；空 ⇒ 這個檔在工作樹與索引都
-    //    沒有東西要處理（含已 commit 的刪除／搬移），原本的 add 失敗只是「pathspec 不存在」，不是真失敗，跳過；
-    //    非空 ⇒ add 是真的失敗，仍回 4，不准用 `--ignore-errors` 或 `2>/dev/null` 蓋過去。
-    //    陽性對照：ticket.test.mjs「(a) 分支上已 commit 刪除一檔且該檔在 summary.changed ⇒ land 走到 ff 成功」
-    //             「(b) 工作樹有未 commit 修改的檔 ⇒ 仍被 add 進 commit」「(c) add 真失敗 ⇒ 仍 exit 4」
-    //    停止條件：`git add` 本身把「pathspec 不存在」與「其他失敗」分成不同 exit code 時，改回直接判 exit code。
-    for (const f of summaryChanged) {
-      try {
-        gitFn(worktree, ['add', '--', f])
-      } catch (e) {
-        let statusOut
-        try {
-          statusOut = gitFn(worktree, ['status', '--porcelain', '--ignored', '--', f])
-        } catch {
-          console.error(`🔴 git add 失敗（${f}）：${e.message}`)
-          return 4
-        }
-        if (statusOut.trim()) {
-          console.error(`🔴 git add 失敗（${f}）：${e.message}`)
-          return 4
-        }
-        // 空 ⇒ 這個檔對工作樹／索引無事可做（含已 commit 的刪除／搬移）；add 失敗只是「pathspec 不存在」，跳過。
-      }
-    }
-
-    // ⑥ diff --cached --name-only 判斷是否有 staged
-    const staged = gitFn(worktree, ['diff', '--cached', '--name-only'])
-    const hasStaged = staged.length > 0
-
-    if (!hasStaged) {
-      const worktreeHead = gitFn(worktree, ['rev-parse', 'HEAD'])
-      const mainHead = gitFn(repoRoot, ['rev-parse', 'HEAD'])
-      // 🔴 事故：WAS commit 8b56d2a20（2026-09-15）「tools/ticket-land 第 3 輪：git add 改成不經 pipe 的 while（子殼吞錯 ⇒ 空 commit／假 LANDED，Gemini 第 2 輪 Q1）」
-      //    陽性對照：測試 (e)
-      //    停止條件：git 若能對空 commit 直接拒絕（commit 無 --allow-empty 本來就會拒）且我們改為依賴那個拒絕時可拆
-      if (worktreeHead === mainHead) {
-        console.error('🔴 沒東西可落地')
-        return 5
-      }
-      console.log('分支已領先 main，視為已 commit 過')
-    } else {
-      try {
-        gitFn(worktree, ['commit', '-F', msgFile])
-      } catch (e) {
-        console.error(`🔴 git commit 失敗：${e.message}`)
-        return 5
-      }
-    }
-
-    // 閘 B target 前進處置（commit 之後、ff-only 之前）
-    // 🔴 事故：2026-09-15 config repo 三票 land exit 6 手動 rebase 三次，rebase 後零檢查
-    // 🔴 事故 2：2026-09-15 1.6 ① 多輪票——main 在 r1 與 r2 之間前進，r2 run 把 targetTipSha 覆寫成新 tip ⇒ 閘 B 判「沒前進」⇒ exit 6；參考點改 merge-base
-    //    陽性對照：ticket.test.mjs T59（不相交自動 rebase）、T60（相交拒絕）、T61（逐 byte 比較）
-    //    停止條件：git 提供伺服端原子 rebase-and-ff 時重審
-    let landedAfterRebase = null
-    const currentTarget = gitFn(repoRoot, ['rev-parse', summary.base])
-    if (currentTarget !== summary.mergeBase) {
-      const advancedRaw = gitFn(repoRoot, ['diff', '--name-only', summary.mergeBase, currentTarget])
-      const advanced = advancedRaw.split('\n').map((l) => l.trim()).filter(Boolean)
-      const ticketFilesRaw = gitFn(worktree, ['diff', '--name-only', summary.mergeBase, 'HEAD'])
-      const ticketFiles = ticketFilesRaw.split('\n').map((l) => l.trim()).filter(Boolean)
-      const ticketFileSet = new Set(ticketFiles)
-      const intersection = advanced.filter((f) => ticketFileSet.has(f))
-
-      if (intersection.length > 0) {
-        const ticketHead = gitFn(worktree, ['rev-parse', 'HEAD'])
-        console.error(`🔴 target 已前進且與本票相交：target ${summary.mergeBase}→${currentTarget}、ticket HEAD ${ticketHead}、merge-base ${summary.mergeBase}、targetTipAtRun ${summary.targetTipSha}`)
-        for (const f of intersection) {
-          console.error(`  ${f}`)
-        }
-        console.error(`人工處理：git -C ${worktree} rebase ${summary.base}  →  重跑 ticket.mjs run（重新複審）  →  再 land`)
-        return 8
-      }
-
-      const before = gitFn(worktree, ['diff', '--binary', '--full-index', '--no-renames', summary.mergeBase, 'HEAD'])
-      try {
-        gitFn(worktree, ['rebase', currentTarget])
-      } catch (e) {
-        try {
-          gitFn(worktree, ['rebase', '--abort'])
-        } catch {}
-        console.error(`🔴 git rebase 失敗：${e.message}`)
-        return 8
-      }
-      const after = gitFn(worktree, ['diff', '--binary', '--full-index', '--no-renames', currentTarget, 'HEAD'])
-      if (before !== after) {
-        console.error(`🔴 rebase 後變更與複審時不逐 byte 相同（長度 ${before.length} vs ${after.length}），不落地；worktree 已在 rebase 後狀態，重跑 ticket.mjs run 重新複審`)
-        return 8
-      }
-
-      landedAfterRebase = {
-        from: summary.mergeBase,
-        to: currentTarget,
-        advancedFiles: advanced,
-        targetTipAtRun: summary.targetTipSha,
-      }
-      try {
-        const disk = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
-        disk.landedAfterRebase = landedAfterRebase
-        fs.writeFileSync(summaryPath, JSON.stringify(disk, null, 2))
-      } catch (e) {
-        console.error(`🔴 summary.json 寫回 landedAfterRebase 失敗：${e.message}；worktree 已 rebase，未落地`)
-        return 8
-      }
-      console.log(`↻ target 前進（不相交）：已 rebase ${summary.mergeBase}→${currentTarget}，變更逐 byte 相同`)
-    }
-
-    // ⑦ 主 checkout git merge --ff-only <branch>（失敗 ⇒ 6，訊息印 main 與 branch 的 sha）
-    // 🔴 2026-09-15 llm-team 1.5 ③：target 前進時若不相交已於閘 B 自動 rebase 並逐 byte 驗證；若走到此處仍 ff 失敗（例如併發推進）則 exit 6
-    //    陽性對照：測試 (g)
-    //    停止條件：引入伺服端三方原子落地機制時重審
-    try {
-      gitFn(repoRoot, ['merge', '--ff-only', summary.branch])
-    } catch (e) {
-      let mainSha = 'unknown'
-      let branchSha = 'unknown'
-      try {
-        mainSha = gitFn(repoRoot, ['rev-parse', 'HEAD'])
-      } catch {}
-      try {
-        branchSha = gitFn(repoRoot, ['rev-parse', summary.branch])
-      } catch {}
-      console.error(`🔴 git merge --ff-only 失敗（main: ${mainSha}, ${summary.branch}: ${branchSha}）：${e.message}`)
-      return 6
-    }
-
-    // ⑧ 最後一行 LANDED <ticket> <branch> <new main sha>
-    const newMainSha = gitFn(repoRoot, ['rev-parse', 'HEAD'])
-    const landedEntry = {
-      event: 'landed',
-      ticket: a.name,
-      branch: summary.branch,
-      sha: newMainSha,
-      wbsIds: Array.isArray(summary.wbsIds) ? summary.wbsIds : [],
-      ...(summary.wbsExempt ? { wbsExempt: summary.wbsExempt } : {}),
-      ...(landedAfterRebase ? { landedAfterRebase } : {}),
-    }
-    appendLifecycle(outDir, landedEntry, env)
-    console.log(`LANDED ${a.name} ${summary.branch} ${newMainSha}`)
-    return 0
+    // 🔴 1.24.0（fable 10-03 重判 N2）：合併只剩一個入口。以前 ticket land 自己 add／commit／rebase／merge --ff-only，
+    //   與 WAS 的 tools/land.mjs（唯一合併口，帶收據與環境守門）並存兩條路，繞過後者的檢查只要選這條。
+    //   現在 land 一律 exit 2、不碰任何 git（main 不動）；要合併走 `node tools/land.mjs --branch … --name … --msg-file …`。
+    //   陽性對照 ticket.test.mjs「1.24.0 land ⇒ 2、main HEAD 不變、無任何 git 寫入」（把這段換回舊實作 ⇒ 該測試紅）。
+    //   停止條件：沒有 tools/land.mjs 的專案（無唯一合併口）若要用 ticket 自行合併，需另開票設計，不是恢復這段。
+    console.error(
+      '🔴 ticket.mjs land 已停用（llm-team 1.24.0）：合併唯一入口＝在 main 執行 node tools/land.mjs --branch <分支> --name <票名> --msg-file <commit 訊息檔>；ticket 不再自行 merge。'
+    )
+    return 2
   }
 
   if (sub === 'summary') {
@@ -1507,7 +1740,7 @@ export async function main(argv, deps = {}) {
       return 2
     }
 
-    const reviewOutDir = path.join(outDir, 'review')
+    const reviewOutDir = latestReviewDir(outDir) || path.join(outDir, 'review')
     const reviewMembers = (summary.review?.members || []).map((m) => {
       const txtFile = path.join(reviewOutDir, `${memberFileName(m.name)}.txt`)
       const text = fs.existsSync(txtFile) ? fs.readFileSync(txtFile, 'utf8') : ''

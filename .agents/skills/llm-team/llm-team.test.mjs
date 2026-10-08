@@ -69,7 +69,7 @@ import {
   runGeminiAsync,
 } from './lib.mjs'
 import { main as writeMain, buildWriterPrompt } from './write.mjs'
-import { main as councilMain, parseVerdicts, buildReviewPrompt, buildReviewQuestions, REFUTE_SENTENCE } from './council.mjs'
+import { main as councilMain, extractPriorFragments, parseVerdicts, buildReviewPrompt, buildReviewQuestions, REFUTE_SENTENCE, hasNonEmptyRoundDelta, normalizeBrief, roundOfDirName } from './council.mjs'
 import {
   main as setupMain,
   matcherCovers,
@@ -1523,6 +1523,7 @@ describe('council.mjs：複審與三方會議', () => {
         '--out', outDirWithReport,
         '--tier', 'standard',
         '--writer-report', reportFile,
+        '--include-writer-report',
       ], deps)
 
       // 2. 不帶 --writer-report
@@ -1590,6 +1591,7 @@ describe('council.mjs：複審與三方會議', () => {
         '--out', outDir,
         '--tier', 'standard',
         '--writer-report', emptyReportFile,
+        '--include-writer-report',
       ], deps)
 
       const promptText = fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8')
@@ -1736,6 +1738,7 @@ describe('council.mjs：複審與三方會議', () => {
         '--out', outDir,
         '--tier', 'standard',
         '--writer-report', longReportFile,
+        '--include-writer-report',
       ], deps)
     } finally {
       console.log = origLog
@@ -4399,7 +4402,7 @@ describe('1.12.0 council：diff 不截斷；超過 --diff-cap 停在複審者之
   test('(i) --writer-report 超過 20000 字元 ⇒ input.json.writerReportTruncated 記原長與 cap（複審者仍被呼叫）', async () => {
     const { repo, brief } = reviewRepo(100)
     const report = path.join(tmpdir('report-'), 'r.md'); fs.writeFileSync(report, 'r'.repeat(25000))
-    const r = await run(['--writer-report', report], repo, brief)
+    const r = await run(['--writer-report', report, '--include-writer-report'], repo, brief)
     assert.equal(r.code, 0); assert.equal(r.calls, 2)
     assert.deepEqual(r.input.writerReportTruncated, { originalLength: 25000, cap: 20000 })
   })
@@ -5144,5 +5147,966 @@ describe('1.19.0 gemini 複審預設不加 NO_EXEC_HEADER（agy 仍加）', () =
 
     // 兩席拿到的是同一份正文，差別只有那個 header——排除「gemini 少拿了什麼別的東西」。
     assert.equal(gPrompt, aEvent.message.content.slice(NO_EXEC_HEADER.length), '兩席正文逐字相同，唯一差別是 agy 多了 NO_EXEC_HEADER')
+  })
+})
+
+describe('1.23.0 brief 不得內嵌前輪推理（4.7.29d）', () => {
+  // 事故＝2026-10-03 4.7.29a／29b 第二輪 brief 把 codex 第一輪不簽理由與修法摘要後附上送審（fable C5／Q6）。
+  const REASON = '測試只驗了成功路徑，沒有驗失敗路徑的錯誤碼回傳值是否正確，所以改壞也不會紅'
+  const FIX = '把失敗路徑的斷言補進 foo.test.mjs，並驗 exit code 為 2 且 stderr 含錯誤訊息'
+  const R1_TEXT = [
+    `Q1：簽｜｜｜`,
+    `Q3：不簽｜${REASON}｜${FIX}｜foo.test.mjs:42`,
+    `整份：不簽`,
+  ].join('\n')
+
+  function setup() {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt'); repo.g('commit', '-m', 'A')
+    repo.g('checkout', '-b', 'feat/prior-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'changed\n')
+    const parent = tmpdir('prior-parent-')
+    const r1 = path.join(parent, 'council-x-r1')
+    fs.mkdirSync(r1, { recursive: true })
+    fs.writeFileSync(path.join(r1, 'codex.txt'), R1_TEXT)
+    const briefDir = tmpdir('brief-')
+    // 1.27.0：-r2 起 brief 要有非空 this_round_delta（本 describe 測的是前輪引用，不是查重，統一補一段）。
+    const writeBrief = (body) => { const f = path.join(briefDir, 'brief.md'); fs.writeFileSync(f, body + '\nthis_round_delta: 本輪改了 foo.mjs 一處\n'); return f }
+    return { repo, parent, r1, writeBrief }
+  }
+  async function run(repo, brief, outDir, extra = []) {
+    let calls = 0
+    const deps = { runOne: (name, model) => { calls++; return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' } } }
+    const origLog = console.log; const origErr = console.error; const errs = []
+    console.log = () => {}; console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await councilMain(['review', '--coordinator', 'claude', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--out', outDir, '--tier', 'standard', ...extra], deps)
+    } finally { console.log = origLog; console.error = origErr }
+    const readJson = (f) => (fs.existsSync(path.join(outDir, f)) ? JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8')) : null)
+    const ledger = fs.existsSync(path.join(outDir, 'ledger.ndjson'))
+      ? fs.readFileSync(path.join(outDir, 'ledger.ndjson'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []
+    const prompt = fs.existsSync(path.join(outDir, 'prompt.md')) ? fs.readFileSync(path.join(outDir, 'prompt.md'), 'utf8') : ''
+    return { code, calls, errs: errs.join('\n'), input: readJson('input.json'), members: readJson('members.json'), ledger, prompt }
+  }
+
+  test('(a) brief 含前輪不簽「理由」或「必要修改」的 ≥30 字元連續片段 ⇒ exit 2、不呼叫複審者、訊息列片段（≤80 字）＋來源檔＋指引', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const out = path.join(parent, 'council-x-r2')
+    for (const leak of [REASON, FIX]) {
+      const brief = writeBrief(`# 第二輪\n上輪說：${leak}，請驗證。\n`)
+      const r = await run(repo, brief, out)
+      assert.equal(r.code, 2, `應回 2，實際 ${r.code}`)
+      assert.equal(r.calls, 0)
+      assert.ok(r.errs.includes(path.join(r1, 'codex.txt')), '訊息要列來源檔')
+      assert.ok(r.errs.includes(leak.slice(0, 30)), '訊息要列命中片段')
+      assert.ok(leak.length >= 30 && leak.length <= 80, '測試資料自身長度要在 30–80 之間')
+      assert.match(r.errs, /finding ID＋證據 path:line＋預期的決定性檢查/)
+    }
+  })
+
+  test('(a2) 空白差異不影響比對（正規化空白後比）；命中片段超過 80 字被截', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const longReason = '甲'.repeat(120)
+    fs.writeFileSync(path.join(r1, 'codex.txt'), `Q2：不簽｜${longReason}｜x｜a.mjs:1\n`)
+    const out = path.join(parent, 'council-x-r2')
+    const r = await run(repo, writeBrief(`前   輪\n\n${longReason}\n`), out)
+    assert.equal(r.code, 2)
+    assert.ok(r.errs.includes('甲'.repeat(80) + '…') && !r.errs.includes('甲'.repeat(81)))
+    const sp = path.join(r1, 'codex.txt')
+    fs.writeFileSync(sp, `Q2：不簽｜${REASON.slice(0, 15)}  ${REASON.slice(15)}｜x｜a.mjs:1\n`)
+    const r2 = await run(repo, writeBrief(`${REASON.slice(0, 15)}\n\n${REASON.slice(15)}\n`), out)
+    assert.equal(r2.code, 2, '前輪輸出的空格（兩格）與 brief 的換行，正規化後相同 ⇒ 要命中')
+  })
+
+  test('(b) brief 只含 finding ID＋path:line＋預期檢查 ⇒ 通過，input.json 記 checkedDirs／hits 0', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const out = path.join(parent, 'council-x-r2')
+    const r = await run(repo, writeBrief('# 第二輪\nF1 foo.test.mjs:42 預期檢查：node foo.test.mjs 退出碼 0\n'), out)
+    assert.equal(r.code, 0); assert.equal(r.calls, 2)
+    assert.deepEqual(r.input.priorQuote, { checkedDirs: [r1], hits: 0, allowed: false })
+    assert.ok(r.members.every((m) => !('allowPriorQuote' in m)), '沒用覆寫旗標 ⇒ members.json 沒有該欄')
+  })
+
+  test('(c) 自動找前輪：--out 以 -r2 結尾 ⇒ 找到同父目錄 -r1（含 -r3 之類其他輪、排除自己、排除不同前綴）；--out 不含 -r<N> ⇒ 不檢查', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const r3 = path.join(parent, 'council-x-r3'); fs.mkdirSync(r3)
+    const other = path.join(parent, 'council-y-r1'); fs.mkdirSync(other)
+    const clean = writeBrief('# b\n')
+    const r = await run(repo, clean, path.join(parent, 'council-x-r2'))
+    assert.deepEqual(r.input.priorQuote.checkedDirs, [r1, r3])
+    const none = await run(repo, writeBrief(`${REASON}\n`), path.join(parent, 'plain-out'))
+    assert.equal(none.code, 0, '沒有 -r<N> 尾碼 ⇒ 不自動比對')
+    assert.deepEqual(none.input.priorQuote.checkedDirs, [])
+  })
+
+  test('(c2) --prior-out 可重複、明給時取代自動找；指到不存在的目錄 ⇒ exit 2（不靜默略過）', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const brief = writeBrief(`${REASON}\n`)
+    const blocked = await run(repo, brief, path.join(parent, 'plain-out'), ['--prior-out', r1])
+    assert.equal(blocked.code, 2)
+    const two = await run(repo, writeBrief('# b\n'), path.join(parent, 'plain-out2'), ['--prior-out', r1, '--prior-out', parent])
+    assert.deepEqual(two.input.priorQuote.checkedDirs, [r1, parent])
+    const missing = await run(repo, writeBrief('# b\n'), path.join(parent, 'plain-out3'), ['--prior-out', path.join(parent, 'nope')])
+    assert.equal(missing.code, 2); assert.equal(missing.calls, 0); assert.match(missing.errs, /--prior-out 不是目錄/)
+  })
+
+  test('(d) --allow-prior-quote ⇒ 放行，但 input.json／ledger／members.json 都留痕（allowPriorQuote、命中數）', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const r = await run(repo, writeBrief(`${REASON}\n`), path.join(parent, 'council-x-r2'), ['--allow-prior-quote'])
+    assert.equal(r.code, 0); assert.equal(r.calls, 2)
+    assert.equal(r.input.priorQuote.allowed, true); assert.equal(r.input.priorQuote.hits, 1)
+    assert.ok(r.members.length === 2 && r.members.every((m) => m.allowPriorQuote === true && m.priorQuoteHits === 1))
+    assert.ok(r.ledger.length === 2 && r.ledger.every((l) => l.allowPriorQuote === true && l.priorQuoteHits === 1))
+  })
+
+  test('(e) 短於 30 字元的共同片段不誤擋（path:line、檔名、整段 29 字的理由）；剛好 30 字 ⇒ 擋', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const out = path.join(parent, 'council-x-r2')
+    const r29 = '甲'.repeat(29); const r30 = '乙'.repeat(30)
+    fs.writeFileSync(path.join(r1, 'codex.txt'), `Q2：不簽｜${r29}｜改 foo.test.mjs:42｜foo.test.mjs:42\n`)
+    const ok = await run(repo, writeBrief(`${r29} foo.test.mjs:42 改 foo.test.mjs:42\n`), out)
+    assert.equal(ok.code, 0, `29 字與 path:line 不該擋：${ok.errs}`)
+    fs.writeFileSync(path.join(r1, 'codex.txt'), `Q2：不簽｜${r30}｜x｜a.mjs:1\n`)
+    const bad = await run(repo, writeBrief(`${r30}\n`), out)
+    assert.equal(bad.code, 2)
+  })
+
+  test('(f) 只比不簽行的第 2、3 欄：簽行的理由、引用欄、*.stderr.txt 裡的字都不算', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const out = path.join(parent, 'council-x-r2')
+    const signed = '這一行是簽的題目所以理由欄不應該被拿來比對喔喔喔喔喔喔'
+    fs.writeFileSync(path.join(r1, 'codex.txt'), `Q1：簽｜${signed}｜無｜\nQ3：不簽｜短理由｜短修法｜${'丙'.repeat(40)}\n`)
+    fs.writeFileSync(path.join(r1, 'codex.stderr.txt'), `Q3：不簽｜${REASON}｜${FIX}｜a.mjs:1\n`)
+    const r = await run(repo, writeBrief(`${signed}\n${'丙'.repeat(40)}\n${REASON}\n${FIX}\n`), out)
+    assert.equal(r.code, 0, `不該擋：${r.errs}`)
+  })
+
+  test('(h) 理由欄內含 ASCII | 不得錯切欄：只以全形 ｜ 切欄；修法欄原樣進 brief ⇒ exit 2、複審者 0 次', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const fix = '改成先過濾空值再合併兩份清單，並補一條涵蓋空輸入的斷言到 foo.test.mjs'
+    const line = `Q3：不簽｜先跑 A | B | C 會漏資料｜${fix}｜foo.test.mjs:42`
+    const frags = extractPriorFragments(line)
+    assert.ok(frags.some((f) => f.col === 3 && f.text === fix), '修法欄要完整回傳')
+    assert.ok(frags.every((f) => f.col === 2 || f.col === 3))
+    fs.writeFileSync(path.join(r1, 'codex.txt'), line + '\n整份：不簽\n')
+    const r = await run(repo, writeBrief(`# 第二輪\n${fix}\n`), path.join(parent, 'council-x-r2'))
+    assert.equal(r.code, 2); assert.equal(r.calls, 0)
+  })
+
+  test('(g) 第二輪 prompt 不含前輪輸出的任何 Q 行（--round-start 路徑只帶 diff 範圍資訊）', async () => {
+    const { repo, parent, r1, writeBrief } = setup()
+    const base = repo.g('rev-parse', 'main')
+    const r = await run(repo, writeBrief('# 第二輪 F1 foo.test.mjs:42\n'), path.join(parent, 'council-x-r2'), ['--round-start', String(base).trim()])
+    assert.equal(r.code, 0)
+    for (const line of R1_TEXT.split('\n').filter((l) => /^Q\d+：/.test(l))) {
+      assert.ok(!r.prompt.includes(line), `prompt 不得含前輪行：${line}`)
+    }
+    assert.ok(!r.prompt.includes(REASON) && !r.prompt.includes(FIX))
+    assert.ok(r.prompt.includes('【本輪範圍】'), '確認走的是 round-start 分支')
+  })
+})
+
+
+// ═══════════════════ 1.24.0：額度換席／block 跨家族降級／riskPaths glob／--timeout-ms（WBS 4.7.31 B3） ═══════════════════
+// 🔴 事故（業主 2026-10-04）：「如果某個 LLM 額度沒有了怎麼辦／這樣就不能做了，這不合理」——council 一席 quota 失敗，整份就算不簽。
+// 全部用注入的假 runOne 模擬 quota／auth，不呼叫任何真 CLI、不耗任何額度。
+import { globToRegExp, matchRiskPaths, crossFamilyStatus, FALLBACK_FAILURE_KINDS } from './lib.mjs'
+
+describe('1.24.0 council 額度換席', () => {
+  const CLAUDE_OPUS = { harness: 'claude', model: 'claude-opus-5-5', quotaBucket: 'anthropic' }
+  const quotaFail = (code = '429') => ({ kind: 'quota', retryable: true, code })
+  const SIGNED = '整份：簽'
+
+  /** 假 runOne：behave(member, callIndex) ⇒ 'ok' ｜ failure 物件（kind quota／auth／timeout…）。 */
+  function makeRunOne(behave, calls) {
+    return (name, model, prompt, cwd, out, timeoutMs, member) => {
+      calls.push({ name, harness: member.harness, model, prompt, timeoutMs })
+      const b = behave(member, calls.length - 1)
+      if (b === 'ok') return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: SIGNED, failure: null }
+      return { name, model, exit: 1, ms: 1, empty: true, denied: [], text: '', failure: b }
+    }
+  }
+
+  async function runPlan({ profile, behave, tier = 'standard', extra = [] }) {
+    const repo = makeRepo({ profiles: v2Profiles({ claude: profile }) })
+    const promptFile = path.join(tmpdir('plan-'), 'plan.md')
+    fs.writeFileSync(promptFile, '規劃\n')
+    const outDir = path.join(repo.dir, '.plan')
+    const calls = []
+    const outs = []
+    const origLog = console.log
+    const origErr = console.error
+    console.log = (m) => outs.push(String(m))
+    console.error = () => {}
+    let code
+    try {
+      code = await councilMain(['plan', '--worktree', repo.dir, '--prompt', promptFile, '--out', outDir, '--tier', tier, ...extra], { runOne: makeRunOne(behave, calls) })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const mf = path.join(outDir, 'members.json')
+    const members = fs.existsSync(mf) ? JSON.parse(fs.readFileSync(mf, 'utf8')) : null
+    return { code, calls, members, outs: outs.join('\n'), outDir }
+  }
+
+  const seatProfile = (seat, extra = {}) => ({ reviewers: [seat], blockReviewers: [seat], ...extra })
+
+  test('(a) 某席 quota ⇒ 自動改跑 fallback（全新行程、同一份 prompt）；members.json 記實際成員＋substitutedFor／substituteReason', async () => {
+    const r = await runPlan({
+      profile: seatProfile({ ...M.agyOpus, fallbacks: [M.codexSol] }),
+      behave: (m) => (m.harness === 'agy' ? quotaFail() : 'ok'),
+    })
+    assert.equal(r.code, 0, r.outs)
+    assert.deepEqual(r.calls.map((c) => c.harness), ['agy', 'codex'], '先跑原席，quota 後才跑 fallback')
+    assert.equal(r.calls[0].prompt, r.calls[1].prompt, 'fallback 收到同一份 prompt')
+    assert.equal(r.members.length, 1, '一席仍只有一筆 members.json')
+    const m = r.members[0]
+    assert.equal(m.harness, 'codex')
+    assert.equal(m.model, 'gpt-5.6-sol')
+    assert.equal(m.quotaBucket, 'openai')
+    assert.deepEqual(m.substitutedFor, { harness: 'agy', model: 'claude-opus-4-6-thinking', quotaBucket: 'agy-claude' })
+    assert.equal(m.substituteReason, 'quota')
+    assert.equal(m.overall, '簽')
+    assert.equal(m.empty, false)
+    assert.match(r.outs, /換席/)
+    assert.equal(m.attempts.length, 1, 'attempts 記下失敗的原席')
+    assert.equal(m.attempts[0].kind, 'quota')
+  })
+
+  test('(a2) auth（缺憑證）也換席；多個 fallbacks 依序試，第一個成功者勝出，後面的不跑', async () => {
+    const r = await runPlan({
+      profile: seatProfile({ ...M.agyOpus, fallbacks: [M.geminiPro, M.codexSol] }),
+      behave: (m) => (m.harness === 'agy' ? { kind: 'auth', retryable: false } : m.harness === 'gemini' ? quotaFail('RESOURCE_EXHAUSTED') : 'ok'),
+    })
+    assert.equal(r.code, 0)
+    assert.deepEqual(r.calls.map((c) => c.harness), ['agy', 'gemini', 'codex'])
+    assert.equal(r.members[0].harness, 'codex')
+    assert.equal(r.members[0].substituteReason, 'auth', 'substituteReason 是原席的 failure.kind')
+    assert.deepEqual(r.members[0].attempts.map((x) => x.kind), ['auth', 'quota'])
+    // 第一個 fallback 就成功 ⇒ 第二個不跑
+    const r2 = await runPlan({
+      profile: seatProfile({ ...M.agyOpus, fallbacks: [M.geminiPro, M.codexSol] }),
+      behave: (m) => (m.harness === 'agy' ? quotaFail() : 'ok'),
+    })
+    assert.deepEqual(r2.calls.map((c) => c.harness), ['agy', 'gemini'])
+  })
+
+  test('(b) 全部 fallback 都 quota／auth 失敗 ⇒ 該席失敗（原席身分、empty、exit 3），不是靜默通過', async () => {
+    const r = await runPlan({
+      profile: seatProfile({ ...M.agyOpus, fallbacks: [M.geminiPro, M.codexSol] }),
+      behave: () => quotaFail(),
+    })
+    assert.equal(r.code, 3, '零輸出 ⇒ exit 3')
+    assert.equal(r.calls.length, 3)
+    const m = r.members[0]
+    assert.equal(m.harness, 'agy', '全失敗時 members.json 仍是原席身分')
+    assert.equal(m.empty, true)
+    assert.equal(m.substitutedFor, undefined)
+    assert.deepEqual(m.attempts.map((x) => `${x.harness}:${x.kind}`), ['agy:quota', 'gemini:quota', 'codex:quota'])
+    assert.match(r.outs, /fallbacks 全失敗/)
+  })
+
+  test('(c) 非 quota／auth 的失敗（timeout／process）不換席；沒有 fallbacks 的席 quota 也只跑一次', async () => {
+    for (const kind of ['timeout', 'process', 'policy', 'protocol']) {
+      const r = await runPlan({
+        profile: seatProfile({ ...M.agyOpus, fallbacks: [M.codexSol] }),
+        behave: () => ({ kind, retryable: false }),
+      })
+      assert.equal(r.calls.length, 1, `${kind} 不該換席`)
+      assert.equal(r.members[0].substitutedFor, undefined)
+    }
+    const r2 = await runPlan({ profile: seatProfile({ ...M.agyOpus }), behave: () => quotaFail() })
+    assert.equal(r2.calls.length, 1)
+    assert.equal(r2.code, 3)
+    assert.deepEqual(FALLBACK_FAILURE_KINDS, ['quota', 'auth'])
+  })
+
+  test('(d) 原席成功 ⇒ fallback 一律不跑、members.json 沒有 substitutedFor', async () => {
+    const r = await runPlan({ profile: seatProfile({ ...M.agyOpus, fallbacks: [M.codexSol] }), behave: () => 'ok' })
+    assert.equal(r.calls.length, 1)
+    assert.equal(r.members[0].substitutedFor, undefined)
+    assert.equal(r.members[0].attempts, undefined)
+  })
+
+  test('(e) block 名單：跨家族席（openai）quota ⇒ 換成同家族（anthropic）成員 ⇒ council 印 crossFamily: degraded；跨家族換跨家族不算降級', async () => {
+    const blockProfile = {
+      reviewers: [{ ...CLAUDE_OPUS }],
+      blockReviewers: [{ ...CLAUDE_OPUS, fallbacks: [M.codexSol] }, { ...M.codexSol, fallbacks: [CLAUDE_OPUS] }],
+    }
+    const r = await runPlan({ profile: blockProfile, tier: 'block', behave: (m) => (m.harness === 'codex' ? quotaFail() : 'ok') })
+    assert.equal(r.code, 0, r.outs)
+    assert.match(r.outs, /crossFamily: degraded/)
+    assert.match(r.outs, /待事後審/)
+    const subs = r.members.filter((m) => m.substitutedFor)
+    assert.equal(subs.length, 1)
+    assert.equal(subs[0].harness, 'claude')
+    assert.equal(subs[0].substitutedFor.harness, 'codex')
+    assert.equal(subs[0].name !== r.members.find((m) => !m.substitutedFor).name, true, '替補與同名的原席成員要有不同 name（輸出檔不撞）')
+    // 一般票（standard）不印 crossFamily
+    const r2 = await runPlan({ profile: blockProfile, tier: 'standard', behave: () => 'ok' })
+    assert.doesNotMatch(r2.outs, /crossFamily/)
+  })
+
+  test('(f) 已交出合法「整份：不簽」判定的席即使 failure 是 quota 也不換席：fallback 0 次、members.json 保留不簽（不被洗成簽）；text 空才換', async () => {
+    const calls = []
+    const withText = (name, model, prompt, cwd, out, t, member) => {
+      calls.push(member.harness)
+      if (member.harness === 'agy') return { name, model, exit: 1, ms: 1, empty: false, denied: [], text: 'Q3：不簽｜有 fail-open｜改｜a.mjs:1\n整份：不簽', failure: quotaFail() }
+      return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: SIGNED, failure: null }
+    }
+    const repo = makeRepo({ profiles: v2Profiles({ claude: seatProfile({ ...M.agyOpus, fallbacks: [M.codexSol] }) }) })
+    const promptFile = path.join(tmpdir('plan-'), 'plan.md')
+    fs.writeFileSync(promptFile, 'p\n')
+    const outDir = path.join(repo.dir, '.plan')
+    const origLog = console.log
+    console.log = () => {}
+    let code
+    try {
+      code = await councilMain(['plan', '--worktree', repo.dir, '--prompt', promptFile, '--out', outDir, '--tier', 'standard'], { runOne: withText })
+    } finally {
+      console.log = origLog
+    }
+    const members = JSON.parse(fs.readFileSync(path.join(outDir, 'members.json'), 'utf8'))
+    assert.equal(code, 0)
+    assert.deepEqual(calls, ['agy'], 'fallback 0 次')
+    assert.equal(members[0].overall, '不簽')
+    assert.equal(members[0].substitutedFor, undefined)
+    assert.equal(members[0].harness, 'agy')
+  })
+
+  test('crossFamilyStatus：degraded／ok／無換席（純函式）', () => {
+    const codexSeat = { harness: 'codex', model: 'gpt-5.6-sol', quotaBucket: 'openai' }
+    const sub = (from, to) => ({ name: 'x', ...to, substitutedFor: from })
+    assert.equal(crossFamilyStatus('anthropic', [sub(codexSeat, CLAUDE_OPUS)]).status, 'degraded')
+    assert.equal(crossFamilyStatus('anthropic', [sub(codexSeat, M.geminiPro)]).status, 'ok', '換成另一家（非統整者同家族）仍是跨家族')
+    assert.equal(crossFamilyStatus('anthropic', [sub(CLAUDE_OPUS, M.codexSol)]).status, 'ok', '同家族席換成跨家族不算降級')
+    assert.equal(crossFamilyStatus('anthropic', [{ name: 'x', ...codexSeat }]).status, 'ok')
+    assert.equal(crossFamilyStatus('anthropic', []).degraded.length, 0)
+    // R5 duplicateModel：替補與同名單另一席同 harness／model ⇒ 標記（不影響 status）
+    const dupe = crossFamilyStatus('anthropic', [{ name: 'claude/opus', ...CLAUDE_OPUS }, sub(codexSeat, CLAUDE_OPUS)])
+    assert.equal(dupe.duplicateModel, true)
+    assert.equal(dupe.status, 'degraded')
+    assert.equal(crossFamilyStatus('anthropic', [{ name: 'claude/opus', ...CLAUDE_OPUS }, sub(codexSeat, M.geminiPro)]).duplicateModel, false)
+    assert.equal(crossFamilyStatus('anthropic', [{ name: 'claude/opus', ...CLAUDE_OPUS }, { name: 'codex', ...codexSeat }]).duplicateModel, false)
+  })
+
+  test('council --timeout-ms：非正整數／裸旗標 ⇒ exit 2、複審者 0 次；合法值傳到 runOne', async () => {
+    for (const bad of ['abc', '0', '-5', '1.5', '']) {
+      const r = await runPlan({ profile: seatProfile({ ...M.agyOpus }), behave: () => 'ok', extra: ['--timeout-ms', bad] })
+      assert.equal(r.code, 2, `--timeout-ms ${JSON.stringify(bad)} 應 exit 2`)
+      assert.equal(r.calls.length, 0, '複審者 0 次')
+      assert.equal(r.members, null, '開跑前就拒，沒有 members.json')
+    }
+    const r = await runPlan({ profile: seatProfile({ ...M.agyOpus }), behave: () => 'ok', extra: ['--timeout-ms', '7777'] })
+    assert.equal(r.calls[0].timeoutMs, 7777)
+  })
+})
+
+describe('1.24.0 config：fallbacks／riskPaths 驗證、compareRoster 換席、glob', () => {
+  const CLAUDE_OPUS = { harness: 'claude', model: 'claude-opus-5-5', quotaBucket: 'anthropic' }
+  const cfgWith = (claudeOverride) => v2Config({ profiles: v2Profiles({ claude: claudeOverride }) })
+
+  test('loadConfig：合法 fallbacks 通過；coordinator／adjudicator 帶 fallbacks、空陣列、巢狀、等於原席、重複、等於統整者 ⇒ 全拒', () => {
+    const dir = tmpdir('cfg-')
+    const load = (claudeOverride, extra = {}) => {
+      fs.writeFileSync(path.join(dir, 'llm-team.config.json'), JSON.stringify({ ...cfgWith(claudeOverride), ...extra }))
+      return loadConfig(dir)
+    }
+    const ok = load({ reviewers: [{ ...M.agyOpus, fallbacks: [M.codexSol] }], blockReviewers: [{ ...M.codexSol, fallbacks: [CLAUDE_OPUS, M.geminiPro] }] })
+    assert.equal(ok.profiles.claude.reviewers[0].fallbacks.length, 1)
+    assert.throws(() => load({ coordinator: { ...M.claudeCode, fallbacks: [M.codexSol] } }), /fallbacks 只准出現在/)
+    assert.throws(() => load({ adjudicator: { ...M.codexSol, fallbacks: [M.geminiPro] } }), /fallbacks 只准出現在/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [] }] }), /非空陣列/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [{ ...M.codexSol, fallbacks: [M.geminiPro] }] }] }), /fallbacks 只准出現在/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [M.agyOpus] }] }), /就是原席/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [M.codexSol, M.codexSol] }] }), /重複/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [M.claudeCode] }] }), /統整者本人/)
+    assert.throws(() => load({ reviewers: [{ ...M.agyOpus, fallbacks: [{ harness: 'nope', model: 'x', quotaBucket: 'openai' }] }] }), /harness 未知/)
+  })
+
+  test('loadConfig：riskPaths 預設 []；非字串陣列／空字串 ⇒ 拒', () => {
+    const dir = tmpdir('cfg-rp-')
+    const load = (extra) => {
+      fs.writeFileSync(path.join(dir, 'llm-team.config.json'), JSON.stringify({ ...v2Config(), ...extra }))
+      return loadConfig(dir)
+    }
+    assert.deepEqual(load({}).riskPaths, [])
+    assert.deepEqual(load({ riskPaths: ['tools/land*'] }).riskPaths, ['tools/land*'])
+    assert.throws(() => load({ riskPaths: 'tools/**' }), /riskPaths 不合法/)
+    assert.throws(() => load({ riskPaths: [''] }), /riskPaths 不合法/)
+    assert.throws(() => load({ riskPaths: [1] }), /riskPaths 不合法/)
+  })
+
+  test('compareRoster 換席：宣告過的換席算到齊；未宣告的換席／原席不對／冒充別席 ⇒ mismatch', () => {
+    const T = (m) => ({ harness: m.harness, model: m.model, quotaBucket: m.quotaBucket })
+    const seat1 = { name: 'claude/opus', ...T(CLAUDE_OPUS), fallbacks: [T(M.codexSol)] }
+    const seat2 = { name: 'codex/gpt-5-6-sol', ...T(M.codexSol), fallbacks: [T(CLAUDE_OPUS)] }
+    const expected = [seat1, seat2]
+    const actualOk = [
+      { name: 'claude/opus', ...T(CLAUDE_OPUS) },
+      { name: 'codex/gpt-5-6-sol', ...T(M.codexSol) },
+    ]
+    assert.equal(compareRoster(expected, actualOk).mismatch, false, '沒換席＝舊行為')
+    // seat1（claude）quota ⇒ codex 替補；seat2 的 codex 照常 ⇒ 兩個 codex、到齊
+    const substituted = [
+      { name: 'codex/gpt-5-6-sol-2', ...T(M.codexSol), substitutedFor: T(CLAUDE_OPUS), substituteReason: 'quota' },
+      { name: 'codex/gpt-5-6-sol', ...T(M.codexSol) },
+    ]
+    assert.equal(compareRoster(expected, substituted).mismatch, false, '宣告過的換席（兩個 codex 都在）算到齊')
+    // 🔴 R2：substituteReason 只准 quota／auth；缺或其他值（timeout）⇒ mismatch
+    assert.equal(compareRoster(expected, [{ ...substituted[0], substituteReason: 'auth' }, substituted[1]]).mismatch, false)
+    for (const bad of ['timeout', 'process', '', undefined]) {
+      const row = { ...substituted[0], substituteReason: bad }
+      if (bad === undefined) delete row.substituteReason
+      assert.equal(compareRoster(expected, [row, substituted[1]]).mismatch, true, `substituteReason ${JSON.stringify(bad)} 不算合法換席`)
+    }
+    // 替補不在 fallbacks 內
+    const undeclared = [
+      { name: 'agy/gemini', ...T(M.agyGemini), substitutedFor: T(CLAUDE_OPUS) },
+      { name: 'codex/gpt-5-6-sol', ...T(M.codexSol) },
+    ]
+    const d1 = compareRoster(expected, undeclared)
+    assert.equal(d1.mismatch, true)
+    assert.equal(d1.missing.length, 1)
+    // substitutedFor 指到錯的原席（名單上沒有）
+    const wrongSeat = [
+      { name: 'x', ...T(M.codexSol), substitutedFor: T(M.geminiPro) },
+      { name: 'codex/gpt-5-6-sol', ...T(M.codexSol) },
+    ]
+    assert.equal(compareRoster(expected, wrongSeat).mismatch, true)
+    // 換席成員不能冒充「另一個本來就在名單上的席」：seat1 缺席、只有 seat2 的 codex ＋ 一個 substitutedFor 的 codex（它替的是 seat1，合法），
+    // 但若只有一個 codex 且帶 substitutedFor ⇒ seat2 沒人
+    const impersonate = [
+      { name: 'claude/opus', ...T(CLAUDE_OPUS) },
+      { name: 'codex/gpt-5-6-sol', ...T(M.codexSol), substitutedFor: T(CLAUDE_OPUS) },
+    ]
+    assert.equal(compareRoster(expected, impersonate).mismatch, true, '帶 substitutedFor 的成員不能充當別席的原席成員')
+    // 沒 fallbacks 的預期席 + 實際帶 substitutedFor ⇒ mismatch
+    assert.equal(compareRoster([{ name: 'a', ...T(CLAUDE_OPUS) }], [{ name: 'b', ...T(M.codexSol), substitutedFor: T(CLAUDE_OPUS) }]).mismatch, true)
+  })
+
+  test('isRosterEntry／readMembersJson：substitutedFor 形狀不完整 ⇒ 整份當無法證明（null）', () => {
+    const base = { name: 'a', harness: 'codex', model: 'm', quotaBucket: 'openai' }
+    assert.equal(isRosterEntry({ ...base, substitutedFor: { harness: 'claude', model: 'x', quotaBucket: 'anthropic' } }), true)
+    assert.equal(isRosterEntry({ ...base, substitutedFor: { harness: 'claude' } }), false)
+    assert.equal(isRosterEntry({ ...base, substitutedFor: 'claude' }), false)
+    const f = path.join(tmpdir('rm-'), 'members.json')
+    fs.writeFileSync(f, JSON.stringify([{ ...base, substitutedFor: { harness: 'claude' } }]))
+    assert.equal(readMembersJson(f), null)
+  })
+
+  test('riskPaths glob：** 跨目錄、* 不跨 /、? 單字元；WAS 五條實際樣式', () => {
+    const was = ['.agents/skills/llm-team/**', 'tools/*receipt*', 'tools/land*', 'tools/env-allowlist*', '.githooks/**', 'llm-team.config.json']
+    const hit = (file) => matchRiskPaths([file], was).map((h) => h.glob)[0] || null
+    assert.equal(hit('.agents/skills/llm-team/lib.mjs'), '.agents/skills/llm-team/**')
+    assert.equal(hit('.agents/skills/llm-team/harnesses/codex.mjs'), '.agents/skills/llm-team/**', '** 跨目錄')
+    assert.equal(hit('.agents/skills/llm-teamX/a.mjs'), null, '前綴相似但不同目錄不算')
+    assert.equal(hit('.agents/skills/other/a.mjs'), null)
+    assert.equal(hit('tools/ticket-receipt.mjs'), 'tools/*receipt*')
+    assert.equal(hit('tools/receipt-lib.mjs'), 'tools/*receipt*')
+    assert.equal(hit('tools/sub/x-receipt.mjs'), null, '* 不跨 /')
+    assert.equal(hit('tools/land.mjs'), 'tools/land*')
+    assert.equal(hit('tools/land.test.mjs'), 'tools/land*')
+    assert.equal(hit('tools/handland.mjs'), null)
+    assert.equal(hit('tools/env-allowlist.mjs'), 'tools/env-allowlist*')
+    assert.equal(hit('.githooks/pre-commit'), '.githooks/**')
+    assert.equal(hit('./.githooks/pre-commit'), '.githooks/**', '前導 ./ 正規化')
+    assert.equal(hit('src/githooks/x'), null)
+    assert.equal(hit('llm-team.config.json'), 'llm-team.config.json', 'WAS 自己的 config 也是 trust-root')
+    assert.equal(hit('sub/llm-team.config.json'), null)
+    assert.equal(hit('README.md'), null)
+    assert.ok(globToRegExp('a?c').test('abc') && !globToRegExp('a?c').test('a/c'))
+    assert.ok(globToRegExp('a.b').test('a.b') && !globToRegExp('a.b').test('axb'), '. 是字面')
+    assert.deepEqual(matchRiskPaths(['a'], []), [])
+    assert.deepEqual(matchRiskPaths([], ['**']), [])
+  })
+})
+
+describe('1.24.0 setup：fallbacks 的 harness 也要在 --check 就驗', () => {
+  test('harnessRoles：fallbacks 的 harness 列入角色表（缺 binary／key 在 --check 就紅，不是額度用完才發現）', () => {
+    const dir = tmpdir('cfg-hr-')
+    const CLAUDE_OPUS = { harness: 'claude', model: 'claude-opus-5-5', quotaBucket: 'anthropic' }
+    fs.writeFileSync(
+      path.join(dir, 'llm-team.config.json'),
+      JSON.stringify(v2Config({ profiles: v2Profiles({ claude: { reviewers: [{ ...CLAUDE_OPUS, fallbacks: [M.geminiPro] }] } }) }))
+    )
+    const models = modelsFrom(loadConfig(dir), {}, 'claude')
+    const roles = harnessRoles(models)
+    assert.ok(roles.get('gemini').some((r) => /fallbacks/.test(r)), JSON.stringify([...roles]))
+  })
+})
+
+// ─────────────────── 1.25.0 council input.json v2（WBS 4.7.31 A2 T0） ───────────────────
+// 事故：fable 10-03 重判 A2——land 合併前不驗複審證據；council 的 input.json 只記 diffLength／cap，diff 又是對【工作樹】算的
+//   （含未提交與 untracked），事後無法證明複審者審的是哪個 commit。v2 記 head／tree／base／dirty／untracked／diffSha256…，T1–T3 的 land 才有東西可比對。
+// 陽性對照（逐條已重放，見收貨）：拿掉 head／tree／diffSha256 計算 ⇒ (a) 紅；dirty 恆 false ⇒ (b) 紅；untracked 恆 [] ⇒ (c) 紅；
+//   拿掉 --require-clean 檢查 ⇒ (d) 紅（假 harness 被呼叫）；segment 不驗／不寫 ⇒ (e) 紅；刪掉舊欄位 ⇒ (f) 紅。
+// 停止條件：land 改為自己對 commit 重新送審（不信任 council 的紀錄）時，本紀錄降為提示。
+describe('1.25.0 council input.json v2', () => {
+  const sha256 = (t) => crypto.createHash('sha256').update(t, 'utf8').digest('hex')
+  const SIGNED_TEXT = 'Q1：簽｜ok｜無｜\n整份：簽'
+
+  /** 乾淨起點：init commit ＋ 分支上再 commit 一次改動（head ≠ base）。回 {repo, base, brief}。 */
+  function setup() {
+    const repo = makeRepo()
+    const base = repo.g('rev-parse', 'HEAD').trim()
+    fs.writeFileSync(path.join(repo.dir, 'add.mjs'), 'export function add(a, b) { return a + b + 1 }\n')
+    repo.g('commit', '-qam', 'change')
+    const brief = path.join(tmpdir('brief-'), 'brief.md')
+    fs.writeFileSync(brief, 'BRIEF-1.25')
+    return { repo, base, brief }
+  }
+
+  async function review({ repo, base, brief, extra = [], out }) {
+    const outDir = out || path.join(tmpdir('v2out-'), 'r')
+    const calls = []
+    const runOne = (name, model, prompt, cwd, o, timeoutMs, member) => {
+      calls.push({ name, harness: member.harness })
+      return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: SIGNED_TEXT, failure: null }
+    }
+    const origLog = console.log
+    const origErr = console.error
+    const errs = []
+    console.log = () => {}
+    console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await councilMain(['review', '--worktree', repo.dir, '--base', base, '--brief', brief, '--out', outDir, '--tier', 'standard', ...extra], { runOne })
+    } finally {
+      console.log = origLog
+      console.error = origErr
+    }
+    const rd = (f) => (fs.existsSync(path.join(outDir, f)) ? JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8')) : null)
+    return { code, calls, errs: errs.join('\n'), outDir, input: rd('input.json'), members: rd('members.json') }
+  }
+
+  test('(a) 乾淨 worktree：head／tree／base／diffSha256／changedFiles 與 git 重算一致，members.json 同值', async () => {
+    const s = setup()
+    const r = await review(s)
+    assert.equal(r.code, 0, r.errs)
+    const i = r.input
+    assert.equal(i.schema, 2)
+    assert.equal(i.head, s.repo.g('rev-parse', 'HEAD').trim())
+    assert.equal(i.tree, s.repo.g('rev-parse', 'HEAD^{tree}').trim())
+    assert.equal(i.base, s.base)
+    assert.match(i.base, /^[0-9a-f]{40}$/)
+    assert.equal(i.diffSha256, sha256(s.repo.g('diff', s.base).trim()), 'diffSha256 ＝ git diff <base> 原文（git() 去尾端空白）的 sha256')
+    assert.deepEqual(i.changedFiles, ['add.mjs'])
+    assert.equal(i.dirty, false)
+    assert.deepEqual(i.untracked, [])
+    assert.equal(i.tier, 'standard')
+    assert.equal(i.coordinator, 'claude')
+    assert.equal(i.briefSha256, sha256('BRIEF-1.25'))
+    assert.equal(i.promptSha256, sha256(fs.readFileSync(path.join(r.outDir, 'prompt.md'), 'utf8')))
+    assert.equal(i.segment, null)
+    assert.equal(new Date(i.roundStart).toISOString(), i.roundStart, 'roundStart 是 ISO 時間')
+    assert.ok(r.members.length > 0)
+    for (const m of r.members) {
+      assert.equal(m.head, i.head, 'members.json 每席帶 head')
+      assert.equal(m.diffSha256, i.diffSha256, 'members.json 每席帶 diffSha256')
+    }
+  })
+
+  test('(b) tracked 檔改了沒 commit ⇒ dirty=true，diffSha256 跟著變（含未提交內容）', async () => {
+    const clean = await review(setup())
+    const s = setup()
+    fs.writeFileSync(path.join(s.repo.dir, 'add.mjs'), 'export function add(a, b) { return a + b + 2 }\n')
+    const r = await review(s)
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(r.input.dirty, true)
+    assert.equal(r.input.head, s.repo.g('rev-parse', 'HEAD').trim(), 'head 仍是 HEAD（審的不只是 head）')
+    assert.notEqual(r.input.diffSha256, clean.input.diffSha256)
+  })
+
+  test('(c) 新增未追蹤檔 ⇒ untracked 含該路徑；--out 事先存在且含檔（stale.txt）也算 untracked；.agy-write/ 不算', async () => {
+    const s = setup()
+    fs.writeFileSync(path.join(s.repo.dir, 'new-file.mjs'), 'export const n = 1\n')
+    fs.mkdirSync(path.join(s.repo.dir, '.agy-write'))
+    fs.writeFileSync(path.join(s.repo.dir, '.agy-write', 'x.txt'), 'x')
+    const out = path.join(s.repo.dir, '.review-v2')
+    fs.mkdirSync(out)
+    fs.writeFileSync(path.join(out, 'stale.txt'), 'stale')
+    const r = await review({ ...s, out })
+    assert.equal(r.code, 0, r.errs)
+    assert.deepEqual(r.input.untracked.slice().sort(), ['.review-v2/stale.txt', 'new-file.mjs'])
+    assert.equal(r.input.dirty, false, 'untracked 不是 tracked 改動')
+    // 本輪才建的 --out（事先不存在）不算：它不在清單裡
+    const s2 = setup()
+    const r2 = await review({ ...s2, out: path.join(s2.repo.dir, '.fresh-out') })
+    assert.equal(r2.code, 0, r2.errs)
+    assert.deepEqual(r2.input.untracked, [])
+  })
+
+  test('(d) --require-clean：dirty ⇒ exit 2 且假 harness 沒被呼叫；untracked 同；乾淨 ⇒ 照常跑；預設（不帶）不擋', async () => {
+    const s = setup()
+    fs.writeFileSync(path.join(s.repo.dir, 'add.mjs'), 'export function add(a, b) { return a + b + 2 }\n')
+    const r = await review({ ...s, extra: ['--require-clean'] })
+    assert.equal(r.code, 2)
+    assert.equal(r.calls.length, 0, 'dirty ⇒ 複審者一次都沒被呼叫')
+    assert.match(r.errs, /require-clean/)
+    assert.equal(r.input, null, '拒審不寫 input.json（不留看似有審過的紀錄）')
+    assert.equal(fs.existsSync(r.outDir), false, 'exit 2 時 --out 目錄不得被建立')
+
+    // --out 在 worktree 內、事先存在且含檔 ⇒ 算 untracked ⇒ --require-clean 拒審
+    const sh = setup()
+    const hide = path.join(sh.repo.dir, '.hide')
+    fs.mkdirSync(hide)
+    fs.writeFileSync(path.join(hide, 'hidden.mjs'), 'export const h = 1\n')
+    const rh = await review({ ...sh, out: hide, extra: ['--require-clean'] })
+    assert.equal(rh.code, 2, '藏在 --out 裡的檔不得繞過 --require-clean')
+    assert.equal(rh.calls.length, 0)
+
+    const s2 = setup()
+    fs.writeFileSync(path.join(s2.repo.dir, 'new-file.mjs'), 'export const n = 1\n')
+    const r2 = await review({ ...s2, extra: ['--require-clean'] })
+    assert.equal(r2.code, 2)
+    assert.equal(r2.calls.length, 0)
+
+    const r3 = await review({ ...setup(), extra: ['--require-clean'] })
+    assert.equal(r3.code, 0, r3.errs)
+    assert.ok(r3.calls.length > 0)
+
+    const r4 = await review(s) // 預設關：dirty＋untracked 仍照審
+    assert.equal(r4.code, 0, r4.errs)
+    assert.equal(r4.input.dirty, true)
+  })
+
+  test('(e) --segment i/n ⇒ segment={index,of}；0/3、4/3、x、2/0、1.5/3、裸旗標 ⇒ exit 2 且不呼叫複審者', async () => {
+    const r = await review({ ...setup(), extra: ['--segment', '2/3'] })
+    assert.equal(r.code, 0, r.errs)
+    assert.deepEqual(r.input.segment, { index: 2, of: 3 })
+    for (const bad of ['0/3', '4/3', 'x', '2/0', '1.5/3', '-1/3']) {
+      const rb = await review({ ...setup(), extra: ['--segment', bad] })
+      assert.equal(rb.code, 2, `--segment ${bad} 應 exit 2`)
+      assert.equal(rb.calls.length, 0)
+      assert.match(rb.errs, /--segment/)
+    }
+    const bare = await review({ ...setup(), extra: ['--segment'] })
+    assert.equal(bare.code, 2, '裸 --segment ⇒ exit 2')
+  })
+
+  test('(f) 舊欄位仍在（舊讀者不壞）：schemaVersion、diffLength、diffCap、capOverridden、reviewInvoked、status、priorQuote…', async () => {
+    const s = setup()
+    const r = await review(s)
+    const i = r.input
+    assert.equal(i.schemaVersion, 1)
+    assert.equal(i.diffLength, s.repo.g('diff', s.base).trim().length)
+    assert.equal(i.diffCap, 120000)
+    assert.equal(i.defaultDiffCap, 120000)
+    assert.equal(i.capOverridden, false)
+    assert.equal(i.reviewInvoked, true)
+    assert.equal(i.status, 'ok')
+    assert.ok('writerReportTruncated' in i && 'priorQuote' in i)
+    // 超過 cap：回 6、input.json 仍有 v2 紀錄（promptSha256 為 null：沒有組 prompt）
+    const over = await review({ ...setup(), extra: ['--diff-cap', '10'] })
+    assert.equal(over.code, 6)
+    assert.equal(over.input.status, 'diff_over_cap')
+    assert.equal(over.input.schema, 2)
+    assert.equal(over.input.promptSha256, null)
+    assert.match(over.input.diffSha256, /^[0-9a-f]{64}$/)
+  })
+
+  test('(g) submodule 內有未提交改動（即使 diff.ignoreSubmodules=all）⇒ dirty=true', async () => {
+    const s = setup()
+    const sub = tmpdir('subsrc-')
+    const sg = (...args) => execFileSync('git', ['-C', sub, ...args], { env: CLEAN_GIT_ENV, encoding: 'utf8' })
+    sg('init', '-q', '-b', 'main')
+    sg('config', 'user.email', 't@example.com')
+    sg('config', 'user.name', 't')
+    fs.writeFileSync(path.join(sub, 'f.txt'), 'one\n')
+    sg('add', '-A')
+    sg('commit', '-qm', 'sub init')
+    s.repo.g('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'subm')
+    s.repo.g('commit', '-qm', 'add submodule')
+    s.repo.g('config', 'diff.ignoreSubmodules', 'all')
+    const clean = await review(s)
+    assert.equal(clean.input.dirty, false, '子模組乾淨 ⇒ dirty=false')
+    fs.writeFileSync(path.join(s.repo.dir, 'subm', 'f.txt'), 'two\n')
+    const r = await review(s)
+    assert.equal(r.code, 0, r.errs)
+    assert.equal(r.input.dirty, true, '子模組髒不得被 diff.ignoreSubmodules=all 蓋掉')
+  })
+
+  test('(h) --round-start 先解析成完整 sha：傳分支名 ⇒ roundStartSha 是 40 字 sha 且 prompt 用 sha；不存在的 ref／裸旗標 ⇒ exit 2 且不呼叫複審者', async () => {
+    const s = setup()
+    s.repo.g('branch', 'rs-branch', s.base)
+    const r = await review({ ...s, extra: ['--round-start', 'rs-branch'] })
+    assert.equal(r.code, 0, r.errs)
+    assert.match(r.input.roundStartSha, /^[0-9a-f]{40}$/)
+    assert.equal(r.input.roundStartSha, s.base)
+    const prompt = fs.readFileSync(path.join(r.outDir, 'prompt.md'), 'utf8')
+    assert.ok(prompt.includes(`本輪 diff 起點 ${s.base}`), 'prompt 的起點用解析後的 sha')
+    assert.ok(!prompt.includes('rs-branch'), 'prompt 不含原始 ref 名')
+    for (const bad of [['--round-start', 'no-such-ref'], ['--round-start']]) {
+      const rb = await review({ ...setup(), extra: bad })
+      assert.equal(rb.code, 2, JSON.stringify(bad))
+      assert.equal(rb.calls.length, 0)
+      assert.match(rb.errs, /--round-start/)
+    }
+  })
+})
+
+
+// ═══════════════════ 1.27.0：送審包盲化＋第 2 輪 brief 查重（《Loop × Harness》課程整合票 1） ═══════════════════
+// 依據：課程 p195；GPT、Gemini 兩家諮詢各自獨立提出；fable 10-09 裁定（docs/consultations/2026-10-09-loop-harness/ruling.md「fable 裁定」第 5、3 點）。
+// 陽性對照：拿掉盲化 ⇒ (a1) 紅；拿掉查重／缺 delta 記錄 ⇒ (b1)(b1b)(b2)(b4)(b5) 紅；應放行 (c1)–(c4)。r2 查重只報告不擋（r2 裁定：無真實重送事故）；升級條件見 council.mjs 檔頭 §1.27.0。
+describe('1.27.0 council：送審包盲化（writer-report 預設不進 prompt）', () => {
+  const REPORT = 'WRITER-SECRET-CLAIM 我跑過陽性對照，紅在 ticket.test.mjs:3516'
+  function setup() {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt'); repo.g('commit', '-m', 'A')
+    repo.g('checkout', '-b', 'feat/blind-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'changed\n')
+    const dir = tmpdir('blind-')
+    const brief = path.join(dir, 'brief.md'); fs.writeFileSync(brief, '# brief\n做 X\n')
+    const report = path.join(dir, 'report.md'); fs.writeFileSync(report, REPORT)
+    return { repo, dir, brief, report }
+  }
+  async function run(repo, brief, out, extra = []) {
+    const deps = { runOne: (name, model) => ({ name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' }) }
+    const oL = console.log; const oE = console.error; const errs = []
+    console.log = () => {}; console.error = (m) => errs.push(String(m))
+    let code
+    try {
+      code = await councilMain(['review', '--coordinator', 'claude', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--out', out, '--tier', 'standard', ...extra], deps)
+    } finally { console.log = oL; console.error = oE }
+    const rd = (f) => (fs.existsSync(path.join(out, f)) ? fs.readFileSync(path.join(out, f), 'utf8') : null)
+    return { code, errs: errs.join('\n'), prompt: rd('prompt.md'), input: rd('input.json') ? JSON.parse(rd('input.json')) : null, copied: rd('writer-report.md') }
+  }
+
+  test('(a1) 預設：帶 --writer-report ⇒ prompt 不含報告內容與【寫手最後回報】；改用 review-only 的 Q3 句；檔案原文複製到 <out>/writer-report.md；input.json 記 included:false', async () => {
+    const { repo, dir, brief, report } = setup()
+    const r = await run(repo, brief, path.join(dir, 'out'), ['--writer-report', report])
+    assert.equal(r.code, 0)
+    assert.ok(!r.prompt.includes('WRITER-SECRET-CLAIM'), 'prompt 不得含寫手報告內容')
+    assert.ok(!r.prompt.includes('【寫手最後回報'), 'prompt 不得含寫手回報區塊')
+    assert.ok(r.prompt.includes('「作者沒交陽性對照證據」不構成不簽理由'), 'Q3 要用 review-only 那句')
+    assert.equal(r.copied, REPORT, '原文複製進 review 目錄供 Q6')
+    assert.equal(r.input.includeWriterReport, false)
+    assert.equal(r.input.writerReport.provided, true); assert.equal(r.input.writerReport.included, false)
+    assert.equal(r.input.writerReport.sha256, crypto.createHash('sha256').update(REPORT, 'utf8').digest('hex'))
+    assert.equal(r.input.writerReportTruncated, null)
+  })
+
+  test('(a2) 不帶 --writer-report 也一樣用盲化 Q3 句（一律）；沒有 writer-report.md', async () => {
+    const { repo, dir, brief } = setup()
+    const r = await run(repo, brief, path.join(dir, 'out'))
+    assert.equal(r.code, 0)
+    assert.ok(r.prompt.includes('「作者沒交陽性對照證據」不構成不簽理由'))
+    assert.equal(r.copied, null)
+    assert.deepEqual(r.input.writerReport, { provided: false, included: false, sha256: null, copiedTo: null })
+  })
+
+  test('(a3) 應放行：--include-writer-report ⇒ 舊行為（報告進 prompt、在 diff 區塊之後），input.json 記 includeWriterReport:true／included:true；檔案照樣複製', async () => {
+    const { repo, dir, brief, report } = setup()
+    const r = await run(repo, brief, path.join(dir, 'out'), ['--writer-report', report, '--include-writer-report'])
+    assert.equal(r.code, 0)
+    assert.ok(r.prompt.includes('WRITER-SECRET-CLAIM') && r.prompt.includes('【寫手最後回報（作者自述，不是證據）】'))
+    assert.ok(r.prompt.indexOf('【寫手最後回報') > r.prompt.lastIndexOf('```'.concat('\n')) - 1)
+    assert.equal(r.input.includeWriterReport, true); assert.equal(r.input.writerReport.included, true)
+    assert.equal(r.copied, REPORT)
+  })
+
+  test('(a4) --review-only ＋ --include-writer-report ⇒ prompt 仍不含報告（review-only 沒有寫手）；included:false', async () => {
+    const { repo, dir, brief, report } = setup()
+    const r = await run(repo, brief, path.join(dir, 'out'), ['--writer-report', report, '--include-writer-report', '--review-only'])
+    assert.equal(r.code, 0)
+    assert.ok(!r.prompt.includes('WRITER-SECRET-CLAIM'))
+    assert.equal(r.input.writerReport.included, false)
+  })
+
+  test('(a5) buildReviewPrompt 純函式：blind:true 即使給 writerReport 也不含報告；blind 省略＝舊行為', () => {
+    const base = { brief: 'B', diff: 'D', tier: 'standard', diffStat: 'S', writerModel: 'm' }
+    const blind = buildReviewPrompt({ ...base, writerReport: 'SECRET', blind: true })
+    assert.ok(!blind.includes('SECRET') && blind.includes('不構成不簽理由'))
+    const legacy = buildReviewPrompt({ ...base, writerReport: 'SECRET' })
+    assert.ok(legacy.includes('SECRET'))
+  })
+
+  test('(a6) ticket.mjs 呼叫 council 處預設不傳 --include-writer-report（仍傳 --writer-report 供複製）', () => {
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'ticket.mjs'), 'utf8')
+    assert.ok(!src.includes('include-writer-report'))
+    assert.ok(src.includes("'--writer-report', writerReportPath"))
+  })
+})
+
+describe('1.27.0 council：第 2 輪 brief 查重（只報告）＋this_round_delta＋自述詞警告', () => {
+  const DELTA = 'this_round_delta: 只改了 foo.mjs 的 retry 次數\n'
+  function setup() {
+    const repo = makeRepo()
+    repo.g('checkout', 'main')
+    fs.writeFileSync(path.join(repo.dir, 'f.txt'), 'line 1\n')
+    repo.g('add', 'f.txt'); repo.g('commit', '-m', 'A')
+    repo.g('checkout', '-b', 'feat/dedup-test')
+    fs.appendFileSync(path.join(repo.dir, 'f.txt'), 'changed\n')
+    const parent = tmpdir('dedup-')
+    const writeBrief = (name, body) => { const f = path.join(parent, name); fs.writeFileSync(f, body); return f }
+    return { repo, parent, writeBrief }
+  }
+  async function run(repo, brief, out, extra = []) {
+    let calls = 0
+    const deps = { runOne: (name, model) => { calls++; return { name, model, exit: 0, ms: 1, empty: false, denied: [], text: '整份：簽' } } }
+    const oL = console.log; const oE = console.error; const outs = []
+    console.log = (m) => outs.push(String(m)); console.error = (m) => outs.push(String(m))
+    let code
+    try {
+      code = await councilMain(['review', '--coordinator', 'claude', '--worktree', repo.dir, '--base', 'main', '--brief', brief, '--out', out, '--tier', 'standard', ...extra], deps)
+    } finally { console.log = oL; console.error = oE }
+    const f = path.join(out, 'input.json')
+    return { code, calls, outs: outs.join('\n'), input: fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null }
+  }
+  const B1 = '# 派工 brief\nF1 foo.test.mjs:42 預期 node foo.test.mjs 退出碼 0\n'
+  const SAME_WARN = /與前輪相同（雜湊一致）/
+  const DELTA_WARN = /沒有非空的 this_round_delta 欄位/
+
+  test('(b1) 陽性：r2 送與 r1 位元組相同的 brief ⇒ 有警告、input.json.briefDedup.sameAs 指向 r1；exit 0、審查席照常呼叫', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const r1 = path.join(parent, 'council-x-r1')
+    const b = writeBrief('b.md', B1 + DELTA)
+    assert.equal((await run(repo, b, r1)).code, 0)
+    const r2 = await run(repo, b, path.join(parent, 'council-x-r2'))
+    assert.equal(r2.code, 0); assert.equal(r2.calls, 2)
+    assert.match(r2.outs, SAME_WARN); assert.ok(r2.outs.includes(r1))
+    assert.deepEqual(r2.input.briefDedup.sameAs, [r1]); assert.equal(r2.input.briefDedup.checked, true)
+    assert.equal(r2.input.round, 2)
+  })
+
+  test('(b1b) 陽性：只差換行風格（CRLF）與頭尾空白 ⇒ 正規化後相同 ⇒ sameAs 非空', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const r1 = path.join(parent, 'council-x-r1')
+    assert.equal((await run(repo, writeBrief('b1.md', B1 + DELTA), r1)).code, 0)
+    const variant = '\n\n  ' + (B1 + DELTA).replace(/\n/g, '\r\n') + '\r\n\r\n   '
+    const r2 = await run(repo, writeBrief('b2.md', variant), path.join(parent, 'council-x-r2'))
+    assert.equal(r2.code, 0); assert.deepEqual(r2.input.briefDedup.sameAs, [r1])
+  })
+
+  test('(b2) 陽性：r2 brief 不同但沒有 this_round_delta 欄位 ⇒ 警告＋roundDeltaMissing:true（佔位值、空欄位後接別的欄位、空表格列同）；exit 0、審查席照常呼叫', async () => {
+    const { repo, parent, writeBrief } = setup()
+    assert.equal((await run(repo, writeBrief('b1.md', B1), path.join(parent, 'council-x-r1'))).code, 0)
+    for (const [i, body] of [
+      B1 + 'F2 bar.mjs:7\n',
+      B1 + 'F2 bar.mjs:7\nthis_round_delta: 無\n',
+      B1 + 'F2 bar.mjs:7\nthis_round_delta: TBD\n',
+      B1 + 'F2 bar.mjs:7\nthis_round_delta:\nallowed_files: foo.mjs\n',
+      B1 + 'F2 bar.mjs:7\n| this_round_delta |  |\n',
+    ].entries()) {
+      const r2 = await run(repo, writeBrief(`v${i}.md`, body), path.join(parent, 'council-x-r2'))
+      assert.equal(r2.code, 0, `第 ${i} 種`); assert.equal(r2.calls, 2)
+      assert.match(r2.outs, DELTA_WARN)
+      assert.equal(r2.input.briefDedup.roundDeltaMissing, true); assert.equal(r2.input.roundDeltaMissing, true)
+    }
+  })
+
+  test('(b3) GPT Q6 canary：同 brief、無 delta、--prior-out <r1>、--out review-r2-r1（目錄名與 r2 矛盾）⇒ roundConflict 入帳、以 r2 處理、sameAs＋roundDeltaMissing 都記、審查席照常呼叫', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const r1 = path.join(parent, 'review-r1')
+    const b = writeBrief('b.md', B1)
+    assert.equal((await run(repo, b, r1)).code, 0)
+    const r2 = await run(repo, b, path.join(parent, 'review-r2-r1'), ['--prior-out', r1])
+    assert.equal(r2.code, 0); assert.equal(r2.calls, 2)
+    assert.deepEqual(r2.input.briefDedup.roundConflict, { parsedFromOutDir: 1, treatedAs: 2 })
+    assert.equal(r2.input.briefDedup.round, 2); assert.equal(r2.input.round, 2)
+    assert.deepEqual(r2.input.briefDedup.sameAs, [r1]); assert.equal(r2.input.briefDedup.roundDeltaMissing, true)
+    assert.match(r2.outs, SAME_WARN); assert.match(r2.outs, DELTA_WARN); assert.match(r2.outs, /--prior-out 已給/)
+  })
+
+  test('(b4) 陽性：輪次不明的前輪（目錄名無 -r<N>、也無 input.json.round）＋雙方同 segment.of 的跨輪同 brief ⇒ 不得跳過，sameAs 記錄', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const b = writeBrief('b.md', B1 + DELTA)
+    const old = path.join(parent, 'seg-old')
+    assert.equal((await run(repo, b, old, ['--segment', '1/2'])).code, 0)
+    // 模擬 1.27.0 前的前輪：input.json 沒有 round metadata
+    const f = path.join(old, 'input.json'); const j = JSON.parse(fs.readFileSync(f, 'utf8')); delete j.round; fs.writeFileSync(f, JSON.stringify(j))
+    const next = await run(repo, b, path.join(parent, 'seg-new'), ['--segment', '1/2', '--prior-out', old])
+    assert.equal(next.code, 0)
+    assert.deepEqual(next.input.briefDedup.sameAs, [old], '輪次不明又只有 segment.of 相同，不構成同輪證據')
+    assert.match(next.outs, SAME_WARN)
+  })
+
+  test('(b5) 陽性：內文句子提到 this_round_delta 但沒有欄位 ⇒ roundDeltaMissing:true', async () => {
+    const { repo, parent, writeBrief } = setup()
+    assert.equal((await run(repo, writeBrief('b1.md', B1), path.join(parent, 'council-x-r1'))).code, 0)
+    const r2 = await run(repo, writeBrief('b2.md', B1 + 'F2 bar.mjs:7\n不要填 this_round_delta，下一輪再說\n另外 this_round_delta: 這句在行中間不算\n'), path.join(parent, 'council-x-r2'))
+    assert.equal(r2.code, 0); assert.equal(r2.input.briefDedup.roundDeltaMissing, true)
+  })
+
+  test('(c1) 應放行（近鄰）：r2 只改一行且有 this_round_delta 欄位 ⇒ 不警告；briefDedup 乾淨', async () => {
+    const { repo, parent, writeBrief } = setup()
+    assert.equal((await run(repo, writeBrief('b1.md', B1), path.join(parent, 'council-x-r1'))).code, 0)
+    const r2 = await run(repo, writeBrief('b2.md', B1.replace('退出碼 0', '退出碼 0 且 stderr 空') + DELTA), path.join(parent, 'council-x-r2'))
+    assert.equal(r2.code, 0, r2.outs); assert.equal(r2.calls, 2)
+    assert.doesNotMatch(r2.outs, /⚠️/)
+    assert.deepEqual({ ...r2.input.briefDedup }, { checked: true, round: 2, roundConflict: null, sameAs: [], hasRoundDelta: true, roundDeltaMissing: false })
+  })
+
+  test('(c2) 應放行：r1 不受查重影響（沒有 this_round_delta、輸出目錄不含 -r<N> 也不查，不警告）', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const b = writeBrief('b.md', B1)
+    const r1 = await run(repo, b, path.join(parent, 'council-x-r1'))
+    assert.equal(r1.code, 0); assert.equal(r1.input.briefDedup.checked, false); assert.doesNotMatch(r1.outs, /⚠️/)
+    const plain = await run(repo, b, path.join(parent, 'plain-out'))
+    assert.equal(plain.input.briefDedup.checked, false); assert.equal(plain.input.round, null)
+  })
+
+  test('(c3) 應放行（同輪各段）：r2 的 --segment 1/2、2/2 用同一份 brief ⇒ 第 2 段不警告 sameAs；陽性對照：同一份 brief 進 r3 ⇒ 警告', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const r1 = path.join(parent, 'council-x-r1')
+    assert.equal((await run(repo, writeBrief('b1.md', B1), r1)).code, 0)
+    const b2 = writeBrief('b2.md', B1 + 'F2 bar.mjs:7\n' + DELTA)
+    const s1 = path.join(parent, 'council-x-r2-s1'); const s2 = path.join(parent, 'council-x-r2-s2')
+    assert.equal((await run(repo, b2, s1, ['--segment', '1/2', '--prior-out', r1])).code, 0)
+    const b = await run(repo, b2, s2, ['--segment', '2/2', '--prior-out', r1, '--prior-out', s1])
+    assert.deepEqual(b.input.briefDedup.sameAs, []); assert.doesNotMatch(b.outs, /⚠️/)
+    const r3 = await run(repo, b2, path.join(parent, 'council-x-r3'), ['--prior-out', r1, '--prior-out', s1, '--prior-out', s2])
+    assert.match(r3.outs, SAME_WARN); assert.ok(r3.input.briefDedup.sameAs.includes(s1))
+  })
+
+  test('(c4) 應放行（同輪各段，目錄名無輪次但有 round metadata）：同一次拆審的兩段（input.json.round 相同）互相當 --prior-out ⇒ 不警告', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const b = writeBrief('b.md', B1 + DELTA)
+    const r1 = path.join(parent, 'council-x-r1')
+    assert.equal((await run(repo, writeBrief('b0.md', B1), r1)).code, 0)
+    const s1 = path.join(parent, 'seg-a'); const s2 = path.join(parent, 'seg-b')
+    const a1 = await run(repo, b, s1, ['--segment', '1/2', '--prior-out', r1])
+    assert.equal(a1.input.round, 2)
+    const second = await run(repo, b, s2, ['--segment', '2/2', '--prior-out', r1, '--prior-out', s1])
+    assert.equal(second.code, 0); assert.deepEqual(second.input.briefDedup.sameAs, []); assert.doesNotMatch(second.outs, /⚠️/)
+  })
+
+  test('(d1) 自述詞警告：brief 含「寫手宣稱／寫手說／作者表示／寫手回報」⇒ 只警告、不擋，input.json.selfReportWarning 記詞；乾淨 brief ⇒ null', async () => {
+    const { repo, parent, writeBrief } = setup()
+    const dirty = await run(repo, writeBrief('d.md', B1 + '寫手宣稱已修好；作者表示測試會紅\n'), path.join(parent, 'plain-1'))
+    assert.equal(dirty.code, 0); assert.equal(dirty.calls, 2)
+    assert.deepEqual(dirty.input.selfReportWarning, { terms: ['寫手宣稱', '作者表示'] })
+    assert.match(dirty.outs, /寫手自述詞/)
+    const clean = await run(repo, writeBrief('c.md', B1), path.join(parent, 'plain-2'))
+    assert.equal(clean.input.selfReportWarning, null)
+    for (const term of ['寫手說', '寫手回報']) {
+      const r = await run(repo, writeBrief('t.md', B1 + term + '\n'), path.join(parent, 'plain-3'))
+      assert.deepEqual(r.input.selfReportWarning, { terms: [term] })
+    }
+  })
+
+  test('(e) 純函式：hasNonEmptyRoundDelta（只認行首欄位格式）／normalizeBrief／roundOfDirName', () => {
+    assert.equal(hasNonEmptyRoundDelta('this_round_delta: 改了 X'), true)
+    assert.equal(hasNonEmptyRoundDelta('| `this_round_delta` | 改了 X |'), true)
+    assert.equal(hasNonEmptyRoundDelta('## this_round_delta\n\n改了 X\n'), true)
+    assert.equal(hasNonEmptyRoundDelta('- **this_round_delta**:\n  - 改了 X\n'), true)
+    assert.equal(hasNonEmptyRoundDelta('abc'), false)
+    assert.equal(hasNonEmptyRoundDelta('this_round_delta:\n'), false)
+    assert.equal(hasNonEmptyRoundDelta('this_round_delta: 無'), false)
+    assert.equal(hasNonEmptyRoundDelta('## this_round_delta\n## 下一節\n內容'), false)
+    assert.equal(hasNonEmptyRoundDelta('this_round_delta:\nprotected_areas: a.mjs\n'), false)
+    assert.equal(hasNonEmptyRoundDelta('不要填 this_round_delta，下一輪再說'), false)
+    assert.equal(hasNonEmptyRoundDelta('欄位 this_round_delta: 這句在行中間'), false)
+    assert.equal(normalizeBrief('\r\n  a\r\nb \r\n\r\n'), 'a\nb')
+    assert.equal(roundOfDirName('/x/review-r2'), 2); assert.equal(roundOfDirName('/x/c-r2-s1'), 2)
+    assert.equal(roundOfDirName('/x/plain'), null); assert.equal(roundOfDirName('/x/barrier'), null)
   })
 })

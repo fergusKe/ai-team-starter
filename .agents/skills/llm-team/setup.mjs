@@ -128,9 +128,16 @@ export function harnessRoles(models) {
   }
   add(models.coordinator.harness, '統整者')
   add(models.writer.harness, '寫手')
-  for (const r of models.reviewers) add(r.harness, `reviewers[${r.name}]`)
-  for (const r of models.blockReviewers) add(r.harness, `blockReviewers[${r.name}]`)
-  for (const r of (models.postReviewers || [])) add(r.harness, `postReviewers[${r.name}]`)
+  // 1.24.0：換席 fallbacks 也是會被派工的 harness（缺 binary／缺 key 要在 --check 就紅，不是等額度用完才發現）。
+  const addList = (listName, list) => {
+    for (const r of list || []) {
+      add(r.harness, `${listName}[${r.name}]`)
+      for (const f of r.fallbacks || []) add(f.harness, `${listName}[${r.name}].fallbacks[${f.harness}/${f.model}]`)
+    }
+  }
+  addList('reviewers', models.reviewers)
+  addList('blockReviewers', models.blockReviewers)
+  addList('postReviewers', models.postReviewers)
   if (models.adjudicator !== 'human') add(models.adjudicator.harness, `adjudicator[${models.adjudicator.name}]`)
   return m
 }
@@ -336,7 +343,8 @@ export function main(argv, deps = {}) {
     return 2
   }
   const coord = models.coordinator
-  const fmt = (m) => `${m.name || memberName(m)}〔${m.quotaBucket}〕`
+  const fmt = (m) =>
+    `${m.name || memberName(m)}〔${m.quotaBucket}〕${Array.isArray(m.fallbacks) && m.fallbacks.length > 0 ? `（額度用盡換席：${m.fallbacks.map((f) => `${memberName(f)}〔${f.quotaBucket}〕`).join('→')}）` : ''}`
   console.log(
     `[config] ✓ schema v2、profile ${coordinator}：統整者 ${memberName(coord)}〔${coord.quotaBucket}〕${coord.effort ? `（effort ${coord.effort}）` : ''}｜寫手 ${memberName(models.writer)}〔${models.writer.quotaBucket}〕｜一般票複審 ${models.reviewers.map(fmt).join('＋')}｜block 複審 ${models.blockReviewers.map(fmt).join('＋')}｜事後審 ${models.postReviewers && models.postReviewers.length > 0 ? models.postReviewers.map(fmt).join('＋') : '（未設）'}｜一般票裁決 ${models.adjudicator === 'human' ? 'human' : fmt(models.adjudicator)}｜block 未決 ${models.blockAdjudicator}`
   )

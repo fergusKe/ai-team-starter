@@ -57,6 +57,7 @@
   "installCommand": "",
   "maxRounds": 3,
   "riskDomains": [],
+  "riskPaths": [],
   "outDir": ".local/llm-team",
   "branchPrefixes": [
     "spec/",
