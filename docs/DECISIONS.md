@@ -1832,3 +1832,18 @@ GuildHub 遷〈跨項依賴〉時，第一版把舊表**原地**改成四欄、�
 **怎麼驗**：真源 `test.sh` 全綠（harnesses 109、llm-team 223）；7 個突變全殺（拿掉推翻句、拿掉 `--setting-sources`、prompt 不走 stdin、正文裡的「429」誤判成額度、`canReview` 翻回 false、拿掉「統整者本人」檢查、加回同桶檢查）。真跑 `claude-sonnet-5-5` 當複審者審一個埋了 `catch { return true }` 的 diff：整份不簽，Q2 自己推出反例 `canEdit({id:'stranger'},{ownerId:'owner'})` ⇒ `true`。
 
 **GuildHub 拿法**：跑 `node ~/.claude/skills/llm-team/export.mjs --to <GuildHub 根>`（不要 `--all`，它會碰 web-agency-system），再把自己 `llm-team.config.json` 的 `claude` profile 名單照上面改；本節逐字搬。
+
+
+## 2026-10-09　《Loop × Harness》課程借四點：應放行對照、送審盲化、修正輪固定欄位、寫手重試上限
+
+使用者給了一門 agent harness 課程（講「交辦即放手」的 loop 怎麼設計），問有什麼可以優化我們的系統、並要求跟 GPT、Fable 討論怎麼整合。GPT 與 Gemini 各自消化一輪後，Fable 裁定；使用者要求「讓別的專案也通用、模板也更新」。
+
+**採用**：
+1. **新閘門要有應放行對照**（〈新增流程閘門的門檻〉）：陽性對照只證明會擋，證明不了不誤擋。課程的守門範例都同時附「該擋」與「該放」的輸入。只套新閘門／正在改的閘門／有誤擋事故的閘門，不回補——回頭補每一條舊閘門就是本 repo 拒絕過的「免疫系統」。
+2. **送審包盲化**（llm-team 1.27.0，`council` 預設不放 writer-report）：兩家諮詢各自獨立挑出同一條最該補的——寫手自述會讓複審者先入為主。逃生口 `--include-writer-report` 記帳。
+3. **修正輪固定欄位＋r2 查重**（llm-team 1.27.0）：第 2 輪重送第 1 輪 brief，複審者等於再審一次舊題目、看不到這輪改了什麼。`council` 比對前輪 `briefSha256`、缺 `this_round_delta` 都只**報告不擋**（沒有事故前不升閘門）。
+4. **寫手重試上限 N=2＋`attempt_log`**：只是 brief 紀律。GPT 與 Gemini 都認為寫手的 Hard Stop 只能靠 brief 紀律、合併閘判不了 finding 的語意範圍；Fable 把「寫手錯誤計數 hook」列為不做。
+
+**不採**：審查席考題集進合併閘（只當換模型的證據，原專案先跑過再決定要不要抽成通用工具）、寫手錯誤計數 hook、合併時判 finding 語意範圍、AI 產文品質閘升 blocking（產品面，與模板無關）、failure_type 封閉枚舉。
+
+**怎麼驗**：llm-team 1.27.0 在原專案經兩輪 council（GPT＋Gemini）與兩題敏感突變收據（拿掉查重分支、拿掉 delta 欄位辨識，各自對應測試紅）；快照 `test.sh` 全綠、`setup --sync-check` 漂移 0。
